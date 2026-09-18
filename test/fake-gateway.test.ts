@@ -21,9 +21,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
+import {
+  Client,
+  LATEST_PROTOCOL_VERSION,
+  SdkError,
+  SdkErrorCode,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { ARCADE_USER_ID_HEADER, arcadeUserHeaders } from "../src/client/headers.ts";
 import { type FakeGateway, startFakeGateway } from "../src/fake-gateway/server.ts";
 import { type HookServer, startHookServer } from "../src/hook-server/server.ts";
@@ -81,6 +85,8 @@ interface Wire {
   url: string;
   method: string;
   headers: Record<string, string>;
+  /** The request body as sent, so a handshake can be read off the wire. */
+  body?: string;
 }
 
 /** A connected SDK client sending `userId` in the Arcade user header. */
@@ -90,7 +96,11 @@ async function connectedClient(fake: FakeGateway, userId: string) {
   return { client, wire };
 }
 
-function sdkClient(fake: FakeGateway, userId: string | undefined) {
+function sdkClient(
+  fake: FakeGateway,
+  userId: string | undefined,
+  clientOptions?: ConstructorParameters<typeof Client>[1],
+) {
   const wire: Wire[] = [];
   const transport = new StreamableHTTPClientTransport(new URL(fake.url), {
     requestInit: userId === undefined ? {} : { headers: arcadeUserHeaders(userId) },
@@ -99,11 +109,12 @@ function sdkClient(fake: FakeGateway, userId: string | undefined) {
         url: String(url),
         method: init?.method ?? "GET",
         headers: Object.fromEntries(new Headers(init?.headers).entries()),
+        body: typeof init?.body === "string" ? init.body : undefined,
       });
       return await fetch(url, init);
     },
   });
-  const client = new Client({ name: "fake-gateway-test-client", version: "0.1.0" });
+  const client = new Client({ name: "fake-gateway-test-client", version: "0.1.0" }, clientOptions);
   cleanups.push(async () => {
     await client.close().catch(() => {});
     await transport.close().catch(() => {});
@@ -298,6 +309,53 @@ describe("protocol version negotiation", () => {
       expect(entry.headers["mcp-protocol-version"]).toBe("2025-06-18");
     }
     expect(await count(hook, "u-version-ok")).toBe(1);
+  });
+});
+
+describe("protocol era", () => {
+  test("a client with default options lands on the legacy era and still sends initialize", async () => {
+    // DESIGN.md decision 15: `legacy` is the era that opens with the
+    // `initialize` handshake, and it is what this project measures today. The
+    // v2 SDK can also speak the modern era, so "we are still on legacy" has to
+    // be asserted rather than assumed after the migration.
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerInitialize: 1 });
+    const { client, wire } = await connectedClient(fake, "u-era-default");
+
+    expect(client.getProtocolEra()).toBe("legacy");
+    expect(client.getNegotiatedProtocolVersion()).toBe(LATEST_PROTOCOL_VERSION);
+    // An era label alone could be a default the client never tested. These are
+    // the handshake itself: the bytes the client put on the wire, and the
+    // gateway's own `initialize` handler running (it charged a hook call).
+    const methods = wire
+      .filter(entry => entry.body !== undefined)
+      .map(entry => parseJsonRpc(entry.body!).method);
+    expect(methods).toContain("initialize");
+    expect(methods).not.toContain("server/discover");
+    expect(fake.hookCalls.map(call => call.method)).toEqual(["initialize"]);
+  });
+
+  test("a client pinned to 2026-07-28 fails era negotiation against this legacy-only gateway", async () => {
+    // The door is open on the client side and shut on ours: `2026-07-28` is
+    // reachable through `versionNegotiation`, and the fake does not serve it.
+    // DESIGN.md decision 15 defers the modern era; this records where it stands
+    // rather than implementing it.
+    const hook = hookServer();
+    const fake = gateway(hook);
+    const { connect } = sdkClient(fake, "u-era-pinned", {
+      versionNegotiation: { mode: { pin: "2026-07-28" } },
+    });
+
+    const thrown: unknown = await connect().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+
+    expect(SdkError.isInstance(thrown)).toBe(true);
+    expect((thrown as SdkError).code).toBe(SdkErrorCode.EraNegotiationFailed);
+    expect((thrown as Error).message).toContain("2026-07-28");
+    // Pinning fails loudly instead of quietly downgrading: no era was adopted.
+    expect(fake.hookCalls).toEqual([]);
   });
 });
 

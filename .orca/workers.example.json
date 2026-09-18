@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to .orca/local/workers.json (gitignored). The driver re-reads it before EVERY dispatch, so editing it between waves switches harness/model without restarting the driver. Add a preset for a new harness (e.g. cursor) here; nothing else needs to change.",
+  "roles": {
+    "implementer": "claude-opus-high",
+    "reviewer": "codex-max"
+  },
+  "presets": {
+    "claude-opus-high":   { "agent": "claude", "model": "opus",         "effort": "high" },
+    "claude-opus-max":    { "agent": "claude", "model": "opus",         "effort": "max" },
+    "claude-sonnet-high": { "agent": "claude", "model": "sonnet",       "effort": "high" },
+    "codex-max":          { "agent": "codex",  "model": "gpt-5.6-luna", "effort": "max" },
+    "codex-high":         { "agent": "codex",  "model": "gpt-5.6-luna", "effort": "high" }
+  },
+  "_effort_levels": "low | medium | high | max  (this Orca build; xhigh is not valid)",
+  "_agents": "claude | codex today; cursor is accepted by worker-start --agent when you add a preset for it"
+}

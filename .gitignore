@@ -1,0 +1,20 @@
+# Per-worktree bindings written by scripts/orca-setup.sh
+.env
+.env.local
+.env.*.local
+
+# Orca — role prompts in .orca/ are committed and public-safe. Everything under
+# local/ is machine-specific: env.md holds the Orca repo UUID and Run ID,
+# human/ is the operator's gate briefs, state/ is the driver's journal and DAG.
+.orca/local/
+
+# Local-only agent config
+.claude/settings.local.json
+.claude/worktrees/
+.mcp.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

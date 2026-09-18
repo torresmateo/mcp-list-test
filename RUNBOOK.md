@@ -149,15 +149,28 @@ curl -s -X POST "$HOOK_PUBLIC_URL/access" \
 curl -s "http://127.0.0.1:$PORT_WEB/hits?user_id=runbook-tunnel-check"
 ```
 
-**You should see** `200`; then a body with the **Gmail toolkit removed** and
-Slack still present (that is the hook's fixed policy, `DESIGN.md` decision 6);
+**You should see** `200`; then the hook's **deny list** naming Gmail, exactly:
+
+```json
+{"deny":{"Gmail":{"tools":{"SendEmail":[{"version":"1.0.0"}]}}}}
+```
+
 then `"count": 1` with the hit recorded.
+
+That is the hook's fixed policy (`DESIGN.md` decision 6): it answers Arcade's
+`AccessHookResult` — `{ only?, deny? }` — naming what to deny, rather than
+echoing your request back with Gmail stripped out. `Slack` does **not** appear
+in the answer, and that is correct: anything not denied is allowed. A response
+carrying neither `only` nor `deny` would mean *no change*, which is why a bare
+`{}` is what you get when a request has no Gmail in it at all.
 
 **If you do not:**
 
 | What you got | What it means |
 | --- | --- |
 | `curl` cannot connect / DNS fails | ngrok is not running, or you typed a stale URL from an earlier session. |
+| `404` with `{"error":"not found"}` | You reached **this counter**, but on a path it does not serve. Almost always a **trailing slash** on `HOOK_PUBLIC_URL` (`https://x.ngrok.app/` makes `//healthz`), or a path already baked into the variable. Set it with no trailing slash and no path. Check with `echo "[$HOOK_PUBLIC_URL]"`. |
+| `404` with HTML, or an ngrok error page | You did **not** reach this counter. ngrok is forwarding to the wrong port, or something else is listening on `$PORT_WEB`. Confirm `curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$PORT_WEB/healthz"` is `200` locally first, then that ngrok's `Forwarding` line names that same port. |
 | HTML instead of JSON | You reached ngrok's browser interstitial rather than the counter. Re-check it is the `Forwarding` URL, not the web-inspector URL (`127.0.0.1:4040`). |
 | `401` | The token in the `Authorization` header is not `$HOOK_BEARER_TOKEN`. **A 401 is not counted** (`DESIGN.md` decision 7), so this failure is silent in the numbers. |
 | `200` but `"count": 0` | The request reached *something*, but not this counter. Check terminal 1 is still the server you are curling. |

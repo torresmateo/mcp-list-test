@@ -80,6 +80,54 @@ function gateway(
   return fake;
 }
 
+/**
+ * A stand-in hook that answers `POST /access` with a body a test chose.
+ *
+ * The real hook counter can only ever answer the one thing its policy says, so
+ * the *shape* of the answer is not a variable there. Here it is: these tests
+ * are about how the gateway reads an `AccessHookResult`, including the shapes
+ * a wrong hook would send.
+ */
+interface StubHook {
+  url: string;
+  /** Every body this stub received, parsed — proof the gateway really called it. */
+  readonly received: readonly Loose[];
+}
+
+function stubHook(answer: (request: Loose) => unknown): StubHook {
+  const received: Loose[] = [];
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname !== "/access" || request.method !== "POST") {
+        return new Response("not found", { status: 404 });
+      }
+      const body = (await request.json()) as Loose;
+      received.push(body);
+      return new Response(JSON.stringify(answer(body)), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  cleanups.push(() => server.stop(true));
+  return { url: `http://127.0.0.1:${server.port}`, received };
+}
+
+/** A fake gateway pointed at an arbitrary hook URL, torn down with the test. */
+function gatewayOn(hookUrl: string): FakeGateway {
+  const fake = startFakeGateway({ port: 0, hookUrl, hookToken: HOOK_TOKEN });
+  cleanups.push(() => fake.close());
+  return fake;
+}
+
+/** The tool names a client actually sees, which is the only evidence that counts. */
+async function listedTools(fake: FakeGateway, userId: string): Promise<string[]> {
+  const { client } = await connectedClient(fake, userId);
+  return (await client.listTools()).tools.map(tool => tool.name);
+}
+
 /** Every outbound HTTP request an SDK client made, for header-level evidence. */
 interface Wire {
   url: string;
@@ -406,5 +454,114 @@ describe("a missing user header", () => {
 
     expect(message.error.message).toContain(ARCADE_USER_ID_HEADER);
     expect(fake.hookCalls).toHaveLength(0);
+  });
+});
+
+describe("the fail-open trap: neither `only` nor `deny` means no change (issue #21)", () => {
+  /**
+   * The bug this slice fixes, pinned from the outside.
+   *
+   * The hook used to answer with the request body minus Gmail. To a human that
+   * reads like a deny. Per `AccessHookResult` it carries neither `only` nor
+   * `deny`, which the engine defines as *no change* — so every tool stayed
+   * allowed, Gmail included. It failed open, silently, and nothing crashed.
+   *
+   * The happy-path assertion ("Gmail is not listed") passed before this slice
+   * and passes after it, so it never protected anything. These tests are the
+   * ones that tell the two apart, and they run against the tool list a client
+   * is rendered, not against what the hook returned.
+   */
+  test("the old filtered-echo answer leaves Gmail listed — it expressed no deny at all", async () => {
+    const hook = stubHook(request => {
+      // Verbatim the pre-#21 hook: the request body with Gmail removed.
+      const toolkits = Object.fromEntries(
+        Object.entries(request.toolkits as Loose).filter(([name]) => !/^gmail$/i.test(name)),
+      );
+      return { ...request, toolkits };
+    });
+    const fake = gatewayOn(hook.url);
+
+    const listed = await listedTools(fake, "u-echo");
+
+    // The hook was called and it did answer 200 — this is not a silent no-op.
+    expect(hook.received).toHaveLength(1);
+    expect(Object.keys(hook.received[0]!.toolkits as Loose).sort()).toEqual(["Gmail", "Slack"]);
+    expect(fake.hookCalls.map(call => call.status)).toEqual([200]);
+    expect(fake.hookCalls.every(call => call.accepted)).toBe(true);
+    // And Gmail is still listed. That is the whole bug.
+    expect(listed).toEqual(["Gmail_SendEmail", "Gmail_ListEmails", "Slack_PostMessage"]);
+  });
+
+  test("an empty `{}` answer — criterion 2's no-Gmail case — also leaves every tool listed", async () => {
+    // Deliberate, and the reason the hook's empty answer is pinned by its own
+    // test: `{}` means "no opinion", and the gateway has to honour that rather
+    // than inventing a deny out of a blank.
+    const hook = stubHook(() => ({}));
+    const fake = gatewayOn(hook.url);
+
+    expect(await listedTools(fake, "u-empty")).toEqual([
+      "Gmail_SendEmail",
+      "Gmail_ListEmails",
+      "Slack_PostMessage",
+    ]);
+    expect(fake.hookCalls.map(call => call.status)).toEqual([200]);
+  });
+
+  test("the real hook counter, same gateway and catalogue, does remove Gmail", async () => {
+    // The control for the two above: the difference is the shape of the answer,
+    // not the wiring. This one goes through `deny`.
+    const hook = hookServer();
+    const fake = gateway(hook);
+
+    expect(await listedTools(fake, "u-real-hook")).toEqual(["Slack_PostMessage"]);
+  });
+});
+
+describe("the gateway consumes an AccessHookResult the way the engine documents it", () => {
+  test("`deny` removes the named toolkit's tools and leaves the rest", async () => {
+    const hook = stubHook(request => ({
+      deny: { Gmail: (request.toolkits as Loose).Gmail },
+    }));
+    const fake = gatewayOn(hook.url);
+
+    expect(await listedTools(fake, "u-deny")).toEqual(["Slack_PostMessage"]);
+  });
+
+  test("`deny` is read at tool level: naming one tool leaves its sibling listed", async () => {
+    // Proof the gateway reads the `ToolkitInfo` it was handed rather than
+    // treating any mention of a toolkit as a blanket deny. Our hook always
+    // sends the whole `tools` map, so this distinction is invisible against it.
+    const hook = stubHook(() => ({
+      deny: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } },
+    }));
+    const fake = gatewayOn(hook.url);
+
+    expect(await listedTools(fake, "u-deny-one")).toEqual([
+      "Gmail_ListEmails",
+      "Slack_PostMessage",
+    ]);
+  });
+
+  test("`only` wins over `deny`, as the schema says it does", async () => {
+    // "If 'only' is included, ONLY those are allowed (deny list ignored)."
+    // A gateway that applied both would deny Gmail_SendEmail here and list
+    // nothing, which is a plausible-looking wrong answer.
+    const hook = stubHook(() => ({
+      only: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } },
+      deny: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } },
+    }));
+    const fake = gatewayOn(hook.url);
+
+    expect(await listedTools(fake, "u-only")).toEqual(["Gmail_SendEmail"]);
+  });
+
+  test("a hook that never answers 200 still lists nothing", async () => {
+    // Unchanged, and a different case from "answered 200 with no opinion": a
+    // hook we could not consult is not a hook that allowed everything.
+    const hook = hookServer();
+    const fake = gateway(hook, { hookToken: "not-the-hook-token" });
+
+    expect(await listedTools(fake, "u-unreachable")).toEqual([]);
+    expect(fake.hookCalls.map(call => call.status)).toEqual([401]);
   });
 });

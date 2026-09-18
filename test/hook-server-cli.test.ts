@@ -185,8 +185,10 @@ describe("bun run hook-server (criterion 1)", () => {
       }),
     });
     expect(accepted.status).toBe(200);
-    const body = (await accepted.json()) as { toolkits: Record<string, unknown> };
-    expect(Object.keys(body.toolkits)).toEqual(["Slack"]);
+    // The contract's `AccessHookResult`, not an echo: `deny` names Gmail and
+    // nothing else travels back. See DESIGN.md decision 6 (amended).
+    const body = (await accepted.json()) as Record<string, unknown>;
+    expect(body).toEqual({ deny: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } } });
 
     const rejected = await fetch(`${cli.url}/access`, {
       method: "POST",

@@ -4,7 +4,8 @@
  * It is a real Streamable HTTP MCP server (`@modelcontextprotocol/server`) that
  * imitates the one behaviour under measurement: on an MCP request it calls a
  * contextual-access hook some configured number of times, forwarding the
- * caller's user id, and lists only the tools the hook's answer left standing.
+ * caller's user id, and applies the hook's `AccessHookResult` — `only`, `deny`,
+ * or neither — to the tools it lists.
  *
  * It is a measuring instrument, so its honesty rules are explicit:
  *
@@ -25,7 +26,10 @@
  *    only thing that tells those two apart.
  *  - **It fails loudly.** No user header is an MCP error, not an invented id;
  *    a hook that does not answer 200 yields an empty tool list rather than the
- *    unfiltered one.
+ *    unfiltered one. A hook that *does* answer 200 with neither `only` nor
+ *    `deny` is the opposite case and is honoured as the engine documents it —
+ *    no change — because that silent fail-open is the bug this harness has to
+ *    be able to show.
  */
 import {
   ProtocolError,
@@ -141,26 +145,82 @@ function accessPayload(userId: string, tools: readonly string[]): Record<string,
   return { user_id: userId, toolkits };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
- * The tool names a hook response leaves allowed.
+ * The tool names a `Toolkits` map names, as `Toolkit_Tool`.
  *
- * The filter is driven by what came back, not by what we sent: a toolkit the
- * hook dropped takes its tools with it. An unusable body allows nothing.
+ * A toolkit entry whose `tools` map is absent or empty names the toolkit and
+ * no tool in it. `wholeToolkits` collects those, because "GitHub, and I am not
+ * enumerating its tools" is a statement about the whole toolkit — the caller
+ * decides what that means for an `only` and for a `deny`. This hook always
+ * sends the `tools` map it received, so for our own responses the two readings
+ * coincide; the fallback exists so a hand-written decision in a test is not
+ * silently read as naming nothing.
  */
-function allowedToolNames(decision: unknown): Set<string> {
-  const allowed = new Set<string>();
-  if (decision === null || typeof decision !== "object") return allowed;
-  const toolkits = (decision as Record<string, unknown>).toolkits;
-  if (toolkits === null || typeof toolkits !== "object" || Array.isArray(toolkits)) return allowed;
-  for (const [toolkit, value] of Object.entries(toolkits as Record<string, unknown>)) {
-    if (value === null || typeof value !== "object") continue;
-    const tools = (value as Record<string, unknown>).tools;
-    if (tools === null || typeof tools !== "object" || Array.isArray(tools)) continue;
-    for (const tool of Object.keys(tools as Record<string, unknown>)) {
-      allowed.add(`${toolkit}_${tool}`);
-    }
+function namedTools(toolkits: unknown): { tools: Set<string>; wholeToolkits: Set<string> } {
+  const tools = new Set<string>();
+  const wholeToolkits = new Set<string>();
+  if (!isPlainObject(toolkits)) return { tools, wholeToolkits };
+  for (const [toolkit, value] of Object.entries(toolkits)) {
+    const entry = isPlainObject(value) ? value["tools"] : undefined;
+    const names = isPlainObject(entry) ? Object.keys(entry) : [];
+    if (names.length === 0) wholeToolkits.add(toolkit);
+    for (const tool of names) tools.add(`${toolkit}_${tool}`);
   }
-  return allowed;
+  return { tools, wholeToolkits };
+}
+
+/** The toolkit half of a `Toolkit_Tool` name; `""` if it is not shaped that way. */
+function toolkitOf(name: string): string {
+  const separator = name.indexOf("_");
+  return separator <= 0 ? "" : name.slice(0, separator);
+}
+
+/**
+ * The tools a hook decision leaves allowed, read the way Arcade's engine
+ * documents `AccessHookResult` (`logic_extensions/http/1.0/schema.yaml`):
+ *
+ *  - `only` present -> **only** those tools are allowed; `deny` is ignored.
+ *  - otherwise `deny` present -> those tools are removed from the catalogue.
+ *  - **neither present -> no change: every tool stays allowed.**
+ *
+ * That last line is the one this gateway exists to reproduce faithfully. The
+ * hook used to answer with the request body minus Gmail, which carries neither
+ * field: it reads like a deny and means nothing, so the engine left Gmail
+ * allowed and nothing crashed. A fake that took the echoed body as the allowed
+ * set would keep agreeing with that hook forever while proving nothing — see
+ * DESIGN.md decision 6 (amended) and the fail-open test in
+ * `test/fake-gateway.test.ts`.
+ *
+ * The decision is read against `catalogue`, not built from itself: a `deny`
+ * naming a tool this gateway never offered changes nothing, which is what
+ * "remove from the list" means.
+ */
+function allowedToolNames(decision: unknown, catalogue: readonly string[]): Set<string> {
+  if (!isPlainObject(decision)) return new Set(catalogue);
+
+  const only = decision["only"];
+  if (only !== undefined) {
+    const { tools, wholeToolkits } = namedTools(only);
+    return new Set(
+      catalogue.filter(name => tools.has(name) || wholeToolkits.has(toolkitOf(name))),
+    );
+  }
+
+  const deny = decision["deny"];
+  if (deny !== undefined) {
+    const { tools, wholeToolkits } = namedTools(deny);
+    return new Set(
+      catalogue.filter(name => !tools.has(name) && !wholeToolkits.has(toolkitOf(name))),
+    );
+  }
+
+  // No opinion expressed. Not a failure, and not an excuse to deny: the engine
+  // treats this as no change, so the whole catalogue stays listed.
+  return new Set(catalogue);
 }
 
 function accessEndpoint(hookUrl: string): string {
@@ -278,9 +338,12 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
       const cursor = request.params?.cursor;
       listCursors.push(typeof cursor === "string" ? cursor : null);
       const decision = await callHook("tools/list", userId, callsPerList);
-      // No usable answer -> nothing is allowed. Failing open would hand the
-      // caller the very tools the hook exists to remove.
-      const allowed = allowedToolNames(decision);
+      // No usable answer at all -> nothing is allowed. That is this gateway's
+      // own fail-closed choice for a hook that errored, refused us or was never
+      // called, and it is a different case from a hook that answered 200 with
+      // no opinion — which `allowedToolNames` reads as "no change".
+      const allowed =
+        decision === undefined ? new Set<string>() : allowedToolNames(decision, tools);
 
       // Pagination runs over the whole catalogue and the hook filters each
       // page, which is the order a gateway consulting an access hook per

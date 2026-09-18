@@ -5,8 +5,11 @@
  *
  *   POST /access          Arcade access-hook contract. Requires
  *                         `Authorization: Bearer <token>`, else 401 and
- *                         **not counted**. Responds with the same body, minus
- *                         every toolkit whose name matches `/^gmail$/i`.
+ *                         **not counted**. Responds with the contract's
+ *                         `AccessHookResult` — `{ deny: { <Toolkit>: ... } }`
+ *                         naming every toolkit whose name matches
+ *                         `/^gmail$/i`, `{}` when the request carried none.
+ *                         It is **not** an echo of the request body.
  *   GET  /hits?user_id=   `{ count, hits: [ <hit> ] }` — see {@link HookHit}.
  *   GET  /healthz         200.
  *
@@ -266,18 +269,37 @@ function millisSince(start: number): number {
   return Math.round((performance.now() - start) * 1000) / 1000;
 }
 
-/** The access decision: drop denied toolkits, keep the rest and every other field. */
-function applyPolicy(payload: Record<string, unknown>): Record<string, unknown> {
-  const { toolkits } = payload;
-  if (toolkits === null || typeof toolkits !== "object" || Array.isArray(toolkits)) {
-    return { ...payload };
+/**
+ * The access decision, in the contract's own shape.
+ *
+ * `AccessHookResult` (`logic_extensions/http/1.0/schema.yaml`, ArcadeAI/schemas)
+ * is `{ only?: Toolkits, deny?: Toolkits }` and nothing else. It is **not** an
+ * echo of the request: a response carrying neither field means *no change*, so
+ * the request body with Gmail removed — which is what this function used to
+ * return — expressed no opinion at all and left every tool allowed, Gmail
+ * included. It read like a deny to a human and was a silent fail-open to the
+ * engine. DESIGN.md decision 6, amended 2026-09-18, is the ruling.
+ *
+ * `deny` carries each denied toolkit's `ToolkitInfo` **as received**, so the
+ * engine denies the tools it told us about rather than a set we reconstructed.
+ * Nothing else from the request travels back: no `user_id`, no `toolkits`, no
+ * passthrough of unknown top-level fields — they are not part of the result
+ * type, and a response that carried them would be guessing at the contract
+ * again.
+ *
+ * Nothing matched -> `{}`, per DESIGN.md's Contracts entry. That *is* "no
+ * change", and here it is the deliberate answer: a request with no Gmail in it
+ * is one this policy has no opinion about. The empty case is pinned by a test
+ * precisely because it is shaped like the bug.
+ */
+function accessDecision(payload: Record<string, unknown>): Record<string, unknown> {
+  const toolkits = payload["toolkits"];
+  if (!isPlainObject(toolkits)) return {};
+  const deny: Record<string, unknown> = {};
+  for (const [name, info] of Object.entries(toolkits)) {
+    if (DENIED_TOOLKIT.test(name)) deny[name] = info;
   }
-  const allowed: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(toolkits)) {
-    if (DENIED_TOOLKIT.test(name)) continue;
-    allowed[name] = value;
-  }
-  return { ...payload, toolkits: allowed };
+  return Object.keys(deny).length === 0 ? {} : { deny };
 }
 
 /** The instant a request arrived, in both the forms a hit needs. */
@@ -352,7 +374,7 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
       return json({ error: "missing user_id" }, 400);
     }
 
-    const response = json(applyPolicy(body));
+    const response = json(accessDecision(body));
     // Everything the answer needed is done; what remains is bookkeeping, and
     // the JSONL append cannot be inside the number it writes.
     record(userId, {

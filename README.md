@@ -362,4 +362,6 @@ Slice #16 extended the report to decision 17's profile: payload shape and size,
 What has not happened yet is the part no test can stand in for: a run against
 the real Arcade gateway, with the hook counter behind a tunnel. Until then the
 numbers in `results/` come from the fake gateway and are a check on the
-instrument, not a finding.
+instrument, not a finding. `RUNBOOK.md` is the operator's order of play for that
+run — hook counter, tunnel, Dashboard, probe, report, curated evidence — with
+the checks that tell a broken run from a clean zero.

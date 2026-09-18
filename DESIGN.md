@@ -8,8 +8,8 @@ reasoning is recorded so a worker can tell when a decision no longer applies.
 
 Answer one question with evidence the Arcade engine team can act on: **how many
 times does an Arcade MCP gateway call a configured contextual-access hook per
-`tools/list` request**? The expected value is exactly one hook call per
-`tools/list`.
+`tools/list` request, how much does it send each time, and what does that cost
+in latency?**
 
 **Scope today: the `2025-11-25` revision, taken end to end against the real
 Arcade gateway.** `2026-07-28` was originally in scope alongside it and is
@@ -17,9 +17,19 @@ deferred to a follow-up, for the reason recorded in decision 15: it is not a
 different version string but a different protocol **era**, with a different
 handshake. Everything here is written so that adding it later is a parameter and
 a slice, not a rewrite.
-A prior, unrelated project observed far more. A conclusive result is a set of
-JSON run files plus an HTML report showing, per revision and per fresh session,
-requests sent versus hook hits, with raw hook payloads attached.
+
+A prior, unrelated project observed a call volume it did not expect. A
+conclusive result is a set of JSON run files plus an HTML report showing, per
+revision and per fresh session, requests sent versus hook hits, how many
+toolkits and tools each hit carried, how large each payload was, how many
+`tools/list` requests the client actually issued, and how much wall-clock time
+the hook round trips added — with raw hook payloads attached.
+
+The test gateway is deliberately small: **two toolkits, roughly fifty tools.**
+That size is a measurement instrument, not an accident. It is large enough that
+a payload carrying the whole set is obviously distinguishable from one carrying
+a single tool, and small enough that any per-tool or per-toolkit fan-out would
+stand out immediately against a per-request call.
 
 ## Architecture
 
@@ -143,8 +153,15 @@ browser's print dialog.
 
 ## Decisions
 
-1. **Baseline is exactly one hook call per `tools/list`.** One user, one list
-   request, one access decision. Anything above one is the finding.
+1. **Characterise, do not prejudge.** It is tempting to assert that one list
+   request should mean one access decision and treat anything else as the
+   finding. We do not assert it. The deliverable is a *profile* of what the
+   gateway actually does — invocations, payload size, tool and toolkit counts,
+   pages fetched, and added latency — measured from outside with no assumption
+   about the implementation. A number stated in advance becomes the thing the
+   measurement is read against, and a measurement that only reports agreement
+   or disagreement with a guess is worth less than one that reports what
+   happened.
 2. **Probe issues `initialize` and one `tools/list` only.** Minimal surface
    gives the cleanest attribution. Repeat lists, prompts, resources and
    `tools/call` are out of scope until this number is known.
@@ -206,6 +223,15 @@ browser's print dialog.
     we measure what real clients experience. Migrating is its own slice, done
     before the probe is written, because the probe is the file the migration
     would otherwise force a rewrite of.
+17. **Measure size and latency, not just count.** A bare invocation count does
+    not tell the engine team what an access hook costs them. Each recorded hit
+    carries how many toolkits, tools and tool-versions arrived and how many
+    bytes the payload was; each probe records how many `tools/list` requests
+    actually went out, whether a cursor was followed, and the wall-clock time
+    the call took. Hook round trips are synchronous on the request path and the
+    hook in this harness is on the far side of a tunnel, so latency is a real
+    number a reader will care about — and a count that doubles matters more if
+    each call also carries the whole tool set.
 
 ## Non-goals
 

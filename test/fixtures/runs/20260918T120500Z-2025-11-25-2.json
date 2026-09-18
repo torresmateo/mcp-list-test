@@ -1,0 +1,159 @@
+{
+  "schema": 1,
+  "revisionRequested": "2025-11-25",
+  "revisionNegotiated": "2025-11-25",
+  "status": "ok",
+  "userId": "probe-2025-11-25-1758197100000-2",
+  "hookPublicUrl": "https://fixture-tunnel.ngrok.app",
+  "requests": [
+    {
+      "id": 0,
+      "method": "initialize",
+      "sentAt": "2026-09-18T12:05:00.000Z",
+      "hookHitsAfter": 2
+    },
+    {
+      "id": 1,
+      "method": "tools/list",
+      "sentAt": "2026-09-18T12:05:02.500Z",
+      "hookHitsAfter": 3
+    }
+  ],
+  "hookHits": [
+    {
+      "receivedAt": "2026-09-18T12:05:00.400Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197100000-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:05:00.520Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197100000-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:05:00.640Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197100000-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "toolsListed": 42,
+  "gmailToolsListed": 0,
+  "error": null
+}

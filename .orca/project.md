@@ -44,9 +44,14 @@ bun run report                             # results/*.json -> results/report.ht
   `scripts/orca-setup.sh`. Never hard-code a port. The hook server listens on
   `$PORT_WEB`.
 - **Which tools read `.env.local` and which do not.** bun loads `.env` and
-  `.env.local` automatically for `bun run` and `bun test`, but any shell
-  command (curl, ngrok, arcade CLI) does not; export it first with
-  `set -a; . ./.env.local; set +a`.
+  `.env.local` automatically for `bun run`, but **not for `bun test`**: under
+  `bun test`, `NODE_ENV` is `test` and bun skips `.env.local` by convention.
+  Any shell command (curl, ngrok, arcade CLI) does not load it either; export
+  it first with `set -a; . ./.env.local; set +a`. Note the asymmetry: your test
+  process cannot see `.env.local`, but anything it **spawns** through `bun run`
+  or a shell can. Do not rely on either direction — set every variable a test
+  depends on explicitly, and remember that an explicitly-set variable beats
+  `.env.local` even when it is empty.
 - **The gateway is remote; the hook server is local.** Arcade's cloud gateway
   must reach your hook over the public internet. A tunnel (ngrok or similar)
   is required and its URL is registered in the Arcade Dashboard as the

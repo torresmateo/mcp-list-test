@@ -14,10 +14,20 @@
  * project exists to measure.
  */
 
-/** One hit exactly as `GET /hits` returned it. Never projected or reshaped. */
+/**
+ * One hit exactly as `GET /hits` returned it. Never projected or reshaped.
+ *
+ * The index signature is the point. `receivedAt` is the only field the probe
+ * itself reads, and the counter keeps growing what it records per hit —
+ * slice #15 added the request headers, `toolkitCount`, `toolCount`,
+ * `versionCount`, `bodyBytes` and `handlingMs`, and more may follow. Naming
+ * those here would invite the next reader to build a hit field by field, and a
+ * field nobody thought to copy is a field the engine team never sees. The probe
+ * is a courier: it hands on what arrived.
+ */
 export interface HookHit {
   receivedAt: string;
-  payload: unknown;
+  [field: string]: unknown;
 }
 
 /** A settled reading of the counter for one user id. */

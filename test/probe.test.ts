@@ -342,6 +342,71 @@ describe("attribution", () => {
     expect(ARCADE_USER_ID_HEADER).toBe("Arcade-User-ID");
   }, SPAWN_TIMEOUT_MS);
 
+  test("the run file carries every field the counter records per hit", async () => {
+    // The cross-slice check neither side's suite could have made. The probe was
+    // written against a counter that recorded `receivedAt` and `payload`;
+    // slice #15 then added the headers and the profile. Both suites stay green
+    // if a hit is rebuilt field by field somewhere in between, and the whole
+    // profile the operator is running this for disappears silently.
+    //
+    // So this reads the written file, not an in-memory object, and names every
+    // field rather than checking a shape — a projection that kept four of the
+    // six would still pass a structural test.
+    const hook = hookServer();
+    const fake = gateway(hook);
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      args: ["--repetitions", "1"],
+    });
+
+    expect(result.exitCode).toBe(0);
+    const written = (await Bun.file(join(result.outputDir, result.files[0]!)).json()) as Loose;
+    const hit = written.hookHits[0] as Loose;
+
+    for (const field of [
+      "receivedAt",
+      "headers",
+      "toolkitCount",
+      "toolCount",
+      "versionCount",
+      "bodyBytes",
+      "handlingMs",
+      "payload",
+    ]) {
+      expect(Object.hasOwn(hit, field)).toBe(true);
+    }
+    expect(typeof hit.toolkitCount).toBe("number");
+    expect(typeof hit.toolCount).toBe("number");
+    expect(typeof hit.versionCount).toBe("number");
+    expect(typeof hit.bodyBytes).toBe("number");
+    expect(typeof hit.handlingMs).toBe("number");
+
+    // Values, not just keys: a projection that wrote zeroes would satisfy the
+    // loop above. The fake gateway sends two toolkits and three tools, each
+    // with one version entry, and `bodyBytes` is the body it actually sent.
+    expect(hit.toolkitCount).toBe(2);
+    expect(hit.toolCount).toBe(3);
+    expect(hit.versionCount).toBe(3);
+    expect(hit.bodyBytes).toBe(Number(hit.headers["content-length"]));
+
+    // The headers survive both ways round: a credential arrives as #15's
+    // descriptor and never as the token itself, and an ordinary header arrives
+    // verbatim. A redaction that had swallowed the whole map would pass a
+    // "headers is present" check and lose the only thing that ties a hit back
+    // to the request that caused it.
+    expect(hit.headers.authorization).toMatch(/^Bearer <redacted len=\d+ sha256=[0-9a-f]{8}>$/);
+    expect(hit.headers.authorization).not.toContain(HOOK_TOKEN);
+    expect(hit.headers["content-type"]).toBe("application/json");
+
+    // And the file agrees with the counter it came from, field for field.
+    const stored = (await (
+      await fetch(`${hook.url}/hits?user_id=${encodeURIComponent(written.userId as string)}`)
+    ).json()) as Loose;
+    expect(written.hookHits).toEqual(stored.hits);
+  }, SPAWN_TIMEOUT_MS);
+
   test("hook hits are stored as the counter returned them, payload and all", async () => {
     // Slice #15 is extending what each hit carries. Passing entries through
     // unprojected is what keeps this slice from deciding what is interesting.

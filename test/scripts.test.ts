@@ -11,6 +11,13 @@ describe("package scripts", () => {
   // would read `results/`, which is gitignored runtime output. The probe is
   // still a stub, and `probe-cli.test.ts` covers it there because it has to
   // pass the environment explicitly.
+  //
+  // Expect this to bite once more. `probe-cli.test.ts` asserts the probe still
+  // prints `not implemented`, and slice #4 makes the probe real — which
+  // falsifies that assertion exactly the way the hook-counter and report slices
+  // falsified each other's entries in the stub list that used to live here.
+  // When it does, the resolution is to delete the assertion, not to keep it:
+  // it became false because the slice succeeded.
 
   test("package.json declares probe, hook-server, report and test", async () => {
     const pkg = await Bun.file(`${REPO_ROOT}package.json`).json();

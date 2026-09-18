@@ -1,0 +1,335 @@
+{
+  "schema": 1,
+  "revisionRequested": "2025-11-25",
+  "revisionNegotiated": "2025-06-18",
+  "status": "version-mismatch",
+  "userId": "probe-2025-11-25-1758197400000-3",
+  "hookPublicUrl": "https://fixture-tunnel.ngrok.app",
+  "requests": [
+    {
+      "id": 0,
+      "method": "initialize",
+      "sentAt": "2026-09-18T12:10:00.000Z",
+      "hookHitsAfter": 0
+    },
+    {
+      "id": 1,
+      "method": "tools/list",
+      "sentAt": "2026-09-18T12:10:02.500Z",
+      "hookHitsAfter": 7
+    }
+  ],
+  "hookHits": [
+    {
+      "receivedAt": "2026-09-18T12:10:00.400Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:00.520Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:00.640Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:00.760Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:00.880Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:01.000Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T12:10:01.120Z",
+      "payload": {
+        "user_id": "probe-2025-11-25-1758197400000-3",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "Gmail_SendEmail": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.send"
+                    ]
+                  }
+                }
+              ],
+              "Gmail_ListEmails": [
+                {
+                  "version": "3.1.0",
+                  "metadata": {
+                    "scopes": [
+                      "gmail.readonly"
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "Math": {
+            "tools": {
+              "Math_Add": [
+                {
+                  "version": "1.0.0",
+                  "metadata": {
+                    "scopes": []
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "toolsListed": 42,
+  "gmailToolsListed": 0,
+  "error": "protocol version mismatch: requested 2025-11-25, server negotiated 2025-06-18"
+}

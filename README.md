@@ -34,7 +34,14 @@ probe ──MCP over Streamable HTTP──▶ Arcade gateway ──POST /access�
   how you know the hook was consulted at all.
 - **Report** (`bun run report`) reads `results/*.json` and writes a
   self-contained `results/report.html`: requests sent versus hook hits, per
-  revision and per run, with the raw hook payloads attached.
+  revision and per run, with the raw hook payloads attached. `--in <dir>` and
+  `--out <file>` point it elsewhere. Hook hits for a method are the difference
+  between consecutive `hookHitsAfter` snapshots, and runs whose status is not
+  `ok` are counted in the version-mismatch and error columns but kept out of
+  min/max/mean. With no run files to read it exits non-zero with
+  `no run files in <dir>` rather than writing an empty report. Nothing in the
+  HTML is fetched over the network, so it opens from a directory with no
+  connection; PDF is the browser's print dialog.
 
 The gateway is remote and the hook counter is local, so Arcade's cloud has to
 reach your machine over a tunnel (ngrok or similar). Registering that tunnel URL
@@ -118,7 +125,9 @@ await hook.close();
 ## Status
 
 Slice #1 was the bootstrap: the bun project, the lockfile, `loadEnv()` and the
-package scripts. Slice #2 is the hook counter above. `bun run probe` and
-`bun run report` still print `not implemented` and exit 1; the probe checks its
-environment first, so the failure you see tells you which one you hit.
-`bun test` is real and must stay green without network access.
+package scripts. Slice #2 is the hook counter above. Slice #5 made
+`bun run report` real — it renders run JSON into `report.html` and needs no
+credentials, no network and no gateway. `bun run probe` still prints
+`not implemented` and exits 1, and it checks its environment first, so the
+failure you see tells you which one you hit. `bun test` is real and must stay
+green without network access.

@@ -39,8 +39,9 @@ probe ──MCP over Streamable HTTP──▶ Arcade gateway ──POST /access�
   `$PORT_WEB`, verifies a bearer token, counts every hit by `user_id`, appends
   raw payloads to `results/hook-log.jsonl`, and answers
   `GET /hits?user_id=` for the probe. Its policy is fixed: deny the Gmail
-  toolkit, allow everything else — zero Gmail tools in a `tools/list` result is
-  how you know the hook was consulted at all.
+  toolkit, allow everything else, expressed as the contract's `deny` list —
+  zero Gmail tools in a `tools/list` result is how you know the hook was
+  consulted at all.
 - **Report** (`bun run report`) reads `results/*.json` and writes a
   self-contained `results/report.html`: requests sent versus hook hits, what
   each hit carried and what it cost, per revision and per run, with the raw
@@ -163,7 +164,7 @@ exactly three endpoints (`DESIGN.md` Contracts -> Hook counter HTTP API):
 
 | Endpoint            | Behaviour                                                                                  |
 | ------------------- | ------------------------------------------------------------------------------------------ |
-| `POST /access`      | Arcade's access-hook contract. Needs `Authorization: Bearer $HOOK_BEARER_TOKEN`, else 401 — and a 401 is **not** counted. Replies with the request body minus every toolkit whose name matches `/^gmail$/i`. |
+| `POST /access`      | Arcade's access-hook contract. Needs `Authorization: Bearer $HOOK_BEARER_TOKEN`, else 401 — and a 401 is **not** counted. Replies with the contract's `AccessHookResult` — `{"deny": {"<Toolkit>": <ToolkitInfo as received>}}` naming every toolkit whose name matches `/^gmail$/i`, and `{}` when the request carried none. It is **not** an echo of the request: see **The answer is a deny list** below. |
 | `GET /hits?user_id=`| `{ "count": n, "hits": [ <hit> ] }` for that user — see **What a hit records** below; an unknown user is `count: 0`, a request with no `user_id` is a 400. |
 | `GET /healthz`      | 200.                                                                                        |
 
@@ -178,6 +179,40 @@ Every accepted hit appends one JSON line to `results/hook-log.jsonl` before the
 response goes out, so `wc -l` on that file and the count from `/hits` never
 disagree. `--log <path>` points it somewhere else. `PORT_WEB=0` binds an
 ephemeral port and the listening line reports the one it got.
+
+### The answer is a deny list
+
+`AccessHookResult` — from `logic_extensions/http/1.0/schema.yaml` in
+[ArcadeAI/schemas](https://github.com/ArcadeAI/schemas), which Arcade's
+[build-your-own guide](https://docs.arcade.dev/en/operate/governance/contextual-access/build-your-own)
+names as canonical — is `{ only?: Toolkits, deny?: Toolkits }`. `Toolkits` is
+the same map shape the request's `toolkits` uses, so a deny names toolkits and
+their tools:
+
+```json
+{ "deny": { "Gmail": { "tools": { "SendEmail": [ { "version": "1.0.0" } ] } } } }
+```
+
+Three rules, and the third is the one that bites:
+
+| Response                      | What the engine does                          |
+| ----------------------------- | --------------------------------------------- |
+| `only` present                | **Only** those tools are allowed; `deny` is ignored |
+| `deny` present, no `only`     | Those tools are removed                        |
+| **neither present**           | **No change — every tool stays allowed**       |
+
+This hook answers `{"deny": {...}}` when a request carries a Gmail toolkit and
+`{}` when it does not. `{}` is row three on purpose: a request with no Gmail in
+it is one this policy has no opinion about.
+
+Until #21 the hook answered with *the request body minus Gmail*. That is row
+three as well — it carries neither field — so it denied nothing and Gmail
+stayed listed. It read like a deny to a human and was a silent fail-open to the
+engine, and `gmailToolsListed` in a live run would have been uninterpretable:
+non-zero would have meant "we never expressed a deny", which is far too easy to
+misread as "the gateway ignored our deny". `DESIGN.md` decision 6 records the
+amendment; `test/fake-gateway.test.ts` pins the trap against a rendered
+`tools/list`.
 
 ### What a hit records
 
@@ -209,8 +244,8 @@ decision 17). `/hits` and each JSONL line hold the same record:
 | `handlingMs`   | The server's *own* handling time: received to response ready. Not client-observed latency — the report shows the two separately. |
 | `payload`      | The body exactly as the gateway sent it, unfiltered — Gmail included. |
 
-The counts describe what arrived, not what went back: a Gmail toolkit that the
-policy strips from the response is still counted in the profile.
+The counts describe what arrived, not what went back: a Gmail toolkit the
+policy names in its `deny` is still counted in the profile.
 
 ### Credential headers are redacted at capture
 
@@ -333,12 +368,19 @@ const gateway = startFakeGateway({ hookUrl: hook.url, hookToken: token, hookCall
 | `protocolVersion`        | echo the client's      | Version the `initialize` result reports, whatever was asked  |
 | `tools`                  | two Gmail, one Slack   | Catalogue, named `Toolkit_Tool`                              |
 
+It applies the hook's answer the way the engine documents `AccessHookResult`:
+`only` wins over `deny`, `deny` removes what it names, and a response carrying
+**neither** leaves the catalogue untouched. That last case is deliberate — it
+is the fail-open the pre-#21 hook triggered, and a fake that could not
+reproduce it could not show the bug.
+
 It fails loudly rather than plausibly. A request without the `Arcade-User-ID`
 header is an MCP error, never an invented user id. A hook that does not answer
-`200` yields an *empty* tool list, never the unfiltered one. And every outbound
-hook call is recorded in `gateway.hookCalls` with the HTTP status it got, which
-is the only way to tell "the hook rejected us" from "we never called it" — both
-of which leave the hit count at `0`.
+`200` yields an *empty* tool list, never the unfiltered one — a hook we could
+not consult is not a hook that allowed everything. And every outbound hook call
+is recorded in `gateway.hookCalls` with the HTTP status it got, which is the
+only way to tell "the hook rejected us" from "we never called it" — both of
+which leave the hit count at `0`.
 
 `src/client/headers.ts` holds the one thing the probe and the fake have to
 agree on: `ARCADE_USER_ID_HEADER`, the header carrying the user id the hook

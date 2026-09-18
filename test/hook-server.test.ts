@@ -117,8 +117,16 @@ describe("GET /healthz", () => {
   });
 });
 
-describe("POST /access — the Gmail deny (criterion 2)", () => {
-  test("removes Gmail and keeps Slack, from a payload that carried both", async () => {
+describe("POST /access — the answer is Arcade's deny list (issue #21)", () => {
+  /**
+   * The whole point of this slice. `AccessHookResult` is
+   * `{ only?: Toolkits, deny?: Toolkits }` — see DESIGN.md decision 6 as
+   * amended — and the engine reads a response carrying neither field as
+   * *no change*. The hook used to answer with the request body minus Gmail:
+   * that carries neither field, so it denied nothing at all while looking to a
+   * human exactly like a deny.
+   */
+  test("names the denied toolkit under `deny`, carrying its tools as received", async () => {
     const h = harness();
     const sent = mixedPayload("u1");
     expect(Object.keys(sent.toolkits)).toEqual(["Gmail", "Slack"]);
@@ -127,12 +135,28 @@ describe("POST /access — the Gmail deny (criterion 2)", () => {
     expect(response.status).toBe(200);
 
     const body = await accessBody(response);
-    // Both halves. "No Gmail" alone cannot tell a working filter from a
-    // payload that never mentioned Gmail.
-    expect(Object.keys(body.toolkits)).toEqual(["Slack"]);
-    expect(body.toolkits.Slack).toEqual({ tools: { Post: [{ version: "1.0.0" }] } });
-    expect(body.toolkits).not.toHaveProperty("Gmail");
-    expect(body.user_id).toBe("u1");
+    // The whole body, not a spot check: an extra key here is a different
+    // contract, and `deny`'s value has to be the ToolkitInfo that arrived.
+    expect(body).toEqual({ deny: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } } });
+  });
+
+  test("the response is not the request body: no user_id, no toolkits, no passthrough", async () => {
+    // The old bug, stated as the assertion that would have caught it. Every
+    // line below passed *before* this slice under the "Gmail is denied"
+    // reading, because a filtered echo looks like a deny — and none of them
+    // passes against the echo itself.
+    const h = harness();
+    const response = await h.post({ ...mixedPayload("u1"), trace_id: "abc-123" });
+
+    const body = await accessBody(response);
+    expect(Object.keys(body)).toEqual(["deny"]);
+    expect(body).not.toHaveProperty("user_id");
+    expect(body).not.toHaveProperty("toolkits");
+    expect(body).not.toHaveProperty("trace_id");
+    expect(body).not.toHaveProperty("only");
+    // The allowed toolkit is absent from the answer entirely — `deny` names
+    // what is denied, and an allow list would be the `only` field instead.
+    expect(JSON.stringify(body)).not.toContain("Slack");
   });
 
   test.each(["Gmail", "gmail", "GMAIL", "GmAiL"])(
@@ -144,7 +168,10 @@ describe("POST /access — the Gmail deny (criterion 2)", () => {
         toolkits: { [name]: { tools: { SendEmail: [{ version: "1.0.0" }] } }, Slack: { tools: {} } },
       });
       const body = await accessBody(response);
-      expect(Object.keys(body.toolkits)).toEqual(["Slack"]);
+      // The key is the toolkit name exactly as the gateway spelled it: the
+      // engine matches what it sent us, not a normalised copy.
+      expect(Object.keys(body.deny)).toEqual([name]);
+      expect(body.deny[name]).toEqual({ tools: { SendEmail: [{ version: "1.0.0" }] } });
     },
   );
 
@@ -157,11 +184,33 @@ describe("POST /access — the Gmail deny (criterion 2)", () => {
         toolkits: { [name]: { tools: { Thing: [{ version: "1.0.0" }] } }, Slack: { tools: {} } },
       });
       const body = await accessBody(response);
-      expect(Object.keys(body.toolkits).sort()).toEqual([name, "Slack"].sort());
+      // Nothing matched, so nothing is denied — and criterion 2's empty answer
+      // is the one asserted below.
+      expect(body).toEqual({});
     },
   );
 
-  test("keeps every other toolkit and every other top-level field intact", async () => {
+  test("a request carrying no denied toolkit answers exactly `{}`", async () => {
+    // Criterion 2. `{}` is the choice — it is what DESIGN.md's Contracts entry
+    // pins — and it means "no change", which is the same thing the old bug
+    // accidentally said about *every* request. Deliberate here: a payload with
+    // no Gmail in it is one this policy has no opinion about. Pinned so a
+    // future edit cannot drift it into `{"deny":{}}` or a filtered echo
+    // unnoticed.
+    const h = harness();
+    for (const sent of [
+      { user_id: "u1", toolkits: { Slack: { tools: { Post: [{ version: "1.0.0" }] } } } },
+      { user_id: "u2", toolkits: {} },
+      { user_id: "u3", toolkits: "not-an-object" },
+      { user_id: "u4" },
+    ]) {
+      const body = await accessBody(await h.post(sent));
+      expect(body).toEqual({});
+      expect(Object.keys(body)).toEqual([]);
+    }
+  });
+
+  test("denies every matching toolkit and only those, from a three-toolkit payload", async () => {
     const h = harness();
     const response = await h.post({
       user_id: "u1",
@@ -173,9 +222,10 @@ describe("POST /access — the Gmail deny (criterion 2)", () => {
       },
     });
     const body = await accessBody(response);
-    expect(Object.keys(body.toolkits).sort()).toEqual(["GitHub", "Slack"]);
-    expect(body.toolkits.Slack.tools.Post[0].metadata).toEqual({ scope: "chat" });
-    expect(body.trace_id).toBe("abc-123");
+    expect(Object.keys(body.deny)).toEqual(["Gmail"]);
+    // Nested metadata rides along untouched: the engine denies the versions it
+    // told us about, not a reconstruction of them.
+    expect(body.deny.Gmail.tools.SendEmail[0].metadata).toEqual({ scope: "send" });
   });
 
   test("the denial is in the response only — the stored payload stays raw", async () => {
@@ -500,8 +550,8 @@ describe("the recorded profile — derived counts (criteria 1, 4)", () => {
   test("the counts describe the payload that arrived, not the filtered answer", async () => {
     const h = harness();
     const response = await h.post(mixedPayload("u1"));
-    // Gmail is gone from the answer...
-    expect(Object.keys((await accessBody(response)).toolkits)).toEqual(["Slack"]);
+    // Gmail is the toolkit the answer denies...
+    expect(Object.keys((await accessBody(response)).deny)).toEqual(["Gmail"]);
 
     // ...and still counted in the profile: the measurement is of what the
     // gateway sent us, not of what we sent back.

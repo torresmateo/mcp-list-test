@@ -74,6 +74,18 @@ export interface StartFakeGatewayOptions {
   protocolVersion?: string;
   /** Tool names, `Toolkit_Tool`. Defaults to {@link DEFAULT_TOOLS}. */
   tools?: readonly string[];
+  /**
+   * Tools per `tools/list` page. Omit (the default) to answer in one page with
+   * no `nextCursor`, which is what every existing caller gets.
+   *
+   * It exists because "one `tools/list` call" and "one outbound `tools/list`
+   * request" are not the same thing: the v2 client walks pagination itself, so
+   * a client-side count of hook hits per *call* can be three pages' worth. A
+   * fake that could only ever answer in one page would leave that distinction
+   * untestable, and a probe that reported pages it never observed would look
+   * exactly like one that observed them correctly.
+   */
+  pageSize?: number;
 }
 
 /** One outbound hook call, whatever became of it. */
@@ -103,6 +115,8 @@ export interface FakeGateway {
   port: number;
   /** Every hook call this gateway issued, in order. */
   readonly hookCalls: readonly HookCall[];
+  /** The `cursor` of every `tools/list` it served, `null` for a first page. */
+  readonly listCursors: readonly (string | null)[];
   /** Stops listening and closes every open MCP session. */
   close(): Promise<void>;
 }
@@ -177,7 +191,13 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
     throw new Error("fake-gateway: hookCallsPerInitialize must be a non-negative integer");
   }
 
+  const pageSize = options.pageSize;
+  if (pageSize !== undefined && (!Number.isInteger(pageSize) || pageSize < 1)) {
+    throw new Error("fake-gateway: pageSize must be a positive integer");
+  }
+
   const hookCalls: HookCall[] = [];
+  const listCursors: (string | null)[] = [];
 
   /**
    * Issues `times` hook calls, one after another, and returns the last usable
@@ -253,20 +273,35 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
       };
     });
 
-    server.setRequestHandler("tools/list", async (_request, ctx) => {
+    server.setRequestHandler("tools/list", async (request, ctx) => {
       const userId = requireUserId(ctx.http?.req?.headers ?? new Headers());
+      const cursor = request.params?.cursor;
+      listCursors.push(typeof cursor === "string" ? cursor : null);
       const decision = await callHook("tools/list", userId, callsPerList);
       // No usable answer -> nothing is allowed. Failing open would hand the
       // caller the very tools the hook exists to remove.
       const allowed = allowedToolNames(decision);
+
+      // Pagination runs over the whole catalogue and the hook filters each
+      // page, which is the order a gateway consulting an access hook per
+      // request would use. A page can therefore come back empty while a later
+      // one still has tools, and the cursor keeps going.
+      const start = cursor === undefined ? 0 : Number(cursor);
+      if (!Number.isInteger(start) || start < 0 || start > tools.length) {
+        throw new ProtocolError(ProtocolErrorCode.InvalidParams, `unknown cursor ${String(cursor)}`);
+      }
+      const end = pageSize === undefined ? tools.length : Math.min(tools.length, start + pageSize);
+      const page = tools.slice(start, end);
+
       return {
-        tools: tools
+        tools: page
           .filter(name => allowed.has(name))
           .map(name => ({
             name,
             description: `${name} (fake)`,
             inputSchema: { type: "object" as const, properties: {} },
           })),
+        ...(end < tools.length ? { nextCursor: String(end) } : {}),
       };
     });
 
@@ -373,6 +408,7 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
     url: `http://${hostname}:${boundPort}${MCP_PATH}`,
     port: boundPort,
     hookCalls,
+    listCursors,
     async close() {
       // Close the MCP sessions first: a stopped listener would leave their SSE
       // streams open, and a leaked listener is an unreviewed server still running.

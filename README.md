@@ -3,13 +3,22 @@
 A throwaway harness that answers one question with evidence:
 
 > How many times does an Arcade MCP gateway call a configured **contextual-access
-> hook** per `tools/list` request, for MCP protocol revisions `2025-11-25` and
-> `2026-07-28`?
+> hook** per `tools/list` request, how much does it send each time, and what
+> does that cost in latency?
 
-The expected answer is exactly one hook call per `tools/list`. A prior,
-unrelated project observed far more. The audience is the Arcade engine team,
-who need a reproducible count rather than an opinion. `DESIGN.md` is the
+A prior, unrelated project observed a call volume it did not expect. This repo
+does not restate that expectation: `DESIGN.md` decision 1 is to characterise
+rather than prejudge, because a number stated in advance becomes the thing the
+measurement gets read against. What comes out is a profile measured from
+outside — invocations, payload size, toolkit and tool counts, how many
+`tools/list` requests the client actually issued, and the wall-clock time the
+hook round trips added. The audience is the Arcade engine team, who need a
+reproducible measurement rather than an opinion. `DESIGN.md` is the
 authoritative record of the architecture and the contracts.
+
+Scope today is the `2025-11-25` revision, taken end to end against the real
+Arcade gateway; `2026-07-28` is a different protocol *era* and is deferred
+(decision 15).
 
 ## How the pieces fit together
 
@@ -65,6 +74,12 @@ bun run report                             # results/*.json -> results/report.ht
 writes `.env.local`, and runs `bun install --frozen-lockfile`. Never hard-code a
 port — the hook server listens on `$PORT_WEB` from that file.
 
+One line of that quickstart does not work yet, and says so rather than
+pretending: `--protocol 2026-07-28` is the `modern` era, deferred by
+`DESIGN.md` decision 15 until there is a live number for `2025-11-25`. The
+probe exits non-zero naming the revision and the ones it can request, instead
+of quietly measuring `2025-11-25` and labelling the file `2026-07-28`.
+
 ## Configuration
 
 `.env.local` is never committed. `scripts/orca-setup.sh` writes the port block;
@@ -88,6 +103,57 @@ order of the table above:
 $ bun run probe --protocol 2025-11-25
 missing ARCADE_API_KEY
 ```
+
+## The probe
+
+`bun run probe --protocol <revision>` is the measurement. Per repetition it
+generates a fresh user id, opens a new MCP session against `$ARCADE_MCP_URL`
+over Streamable HTTP with the v2 SDK client, sends `initialize` then one
+`tools/list`, and writes one JSON file to `results/`.
+
+```console
+$ set -a; . ./.env.local; set +a
+$ bun run probe --protocol 2025-11-25 --repetitions 2
+probe: 2 repetitions of 2025-11-25 against https://api.arcade.dev/v1/mcps/...
+probe: hook counter http://127.0.0.1:3411, quiescence 2000 ms
+results/20260918T203958539Z-2025-11-25-1.json
+  probe-2025-11-25-1789763998538-1  [ok]  negotiated 2025-11-25
+    method          hits  duration
+    initialize         0  13.0 ms
+    tools/list         3  6.6 ms
+    tools/list: 1 request, no cursor; 1 tools listed, 0 Gmail
+```
+
+| Flag                 | Default      | Meaning                                                      |
+| -------------------- | ------------ | ------------------------------------------------------------ |
+| `--protocol`         | *required*   | Revision to request. Validated against what the client can ask for |
+| `--repetitions`      | `5`          | Fresh sessions, run serially                                  |
+| `--out`              | `results`    | Where the run JSON lands                                      |
+| `--quiesce-ms`       | `2000`       | How long the hook count must hold still before a snapshot     |
+| `--poll-interval-ms` | a quarter of the window | Gap between reads of `GET /hits`                   |
+| `--hook-url`         | `http://127.0.0.1:$PORT_WEB` | Where to read the counter. `HOOK_PUBLIC_URL` is the tunnel *Arcade* calls and is recorded for provenance only |
+
+Every outbound JSON-RPC request goes through a wrapping `fetch`, so the run
+records what the client actually sent rather than what it was asked to send.
+That matters in two places a count alone would mislead you:
+
+- **Pagination is a number, not something you infer.** The SDK walks
+  `tools/list` pages for you, so one call can be three requests. `requests[]`
+  has a row per request with its own hook snapshot, and `toolsListRequests` and
+  `cursorFollowed` say so outright.
+- **Latency is measured to the reply, not to the response headers.** A hook
+  that filters a tool list has to answer before the list can come back, so its
+  round trip is on the critical path; `durationMs` per request is where the
+  cost of that shows up against the hook server's own handling time.
+
+Nothing falls back to a plausible value. A missing credential, a revision the
+client cannot request, an unreachable gateway, an unreachable hook counter and
+a gateway that negotiates a different revision are each a non-zero exit that
+names what happened — and every one of them, bar the first two, still writes
+the run JSON so the failure is evidence rather than a message that scrolled
+past. `status` is `ok`, `version-mismatch` or `error`; `revisionNegotiated` is
+`null` when nothing was negotiated, and `error` is `null` only when `status` is
+`ok`.
 
 ## The hook counter
 
@@ -227,6 +293,13 @@ Slice #1 was the bootstrap: the bun project, the lockfile, `loadEnv()` and the
 package scripts. Slice #2 is the hook counter above, and slice #3 the fake
 gateway the offline tests run against. Slice #5 made `bun run report` real — it
 renders run JSON into `report.html` and needs no credentials, no network and no
-gateway. `bun run probe` still prints `not implemented` and exits 1, and it
-checks its environment first, so the failure you see tells you which one you
-hit. `bun test` is real and must stay green without network access.
+gateway. Slice #11 moved the client onto the v2 scoped SDK packages with no
+behaviour change, and slice #4 made `bun run probe` real: it is the measurement
+this repo exists for, and every command in the quickstart now does something,
+except `--protocol 2026-07-28`, which is deferred. `bun test` is real and must
+stay green without network access.
+
+What has not happened yet is the part no test can stand in for: a run against
+the real Arcade gateway, with the hook counter behind a tunnel. Until then the
+numbers in `results/` come from the fake gateway and are a check on the
+instrument, not a finding.

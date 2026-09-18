@@ -16,9 +16,11 @@ async function runScript(name: string) {
 }
 
 describe("package scripts", () => {
-  // The probe has its own suite; these two are stubs until their slices land,
-  // and the contract for now is only that they exist and fail loudly.
-  for (const name of ["hook-server", "report"]) {
+  // `hook-server` is real as of the hook-counter slice and has its own suites
+  // (`hook-server.test.ts`, `hook-server-cli.test.ts`); it must not be started
+  // from here, because it does not exit. The probe likewise has its own suite.
+  // `report` is still a stub, and the contract for now is that it fails loudly.
+  for (const name of ["report"]) {
     test(`bun run ${name} exits 1 with "not implemented"`, async () => {
       const { exitCode, stderr } = await runScript(name);
       expect(stderr).toContain("not implemented");

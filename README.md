@@ -82,10 +82,43 @@ $ bun run probe --protocol 2025-11-25
 missing ARCADE_API_KEY
 ```
 
+## The hook counter
+
+`bun run hook-server` reads `PORT_WEB` and `HOOK_BEARER_TOKEN` and serves
+exactly three endpoints (`DESIGN.md` Contracts -> Hook counter HTTP API):
+
+| Endpoint            | Behaviour                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `POST /access`      | Arcade's access-hook contract. Needs `Authorization: Bearer $HOOK_BEARER_TOKEN`, else 401 — and a 401 is **not** counted. Replies with the request body minus every toolkit whose name matches `/^gmail$/i`. |
+| `GET /hits?user_id=`| `{ "count": n, "hits": [ { "receivedAt", "payload" } ] }` for that user; an unknown user is `count: 0`, a request with no `user_id` is a 400. |
+| `GET /healthz`      | 200.                                                                                        |
+
+```console
+$ set -a; . ./.env.local; set +a
+$ bun run hook-server
+hook-server listening on :3411
+appending hits to /path/to/worktree/results/hook-log.jsonl
+```
+
+Every accepted hit appends one JSON line to `results/hook-log.jsonl` before the
+response goes out, so `wc -l` on that file and the count from `/hits` never
+disagree. `--log <path>` points it somewhere else. `PORT_WEB=0` binds an
+ephemeral port and the listening line reports the one it got.
+
+Other code starts the counter directly instead of shelling out:
+
+```ts
+import { startHookServer } from "./src/hook-server/server.ts";
+
+const hook = startHookServer({ port: 0, token, logPath: "/tmp/run/hook-log.jsonl" });
+// hook.url -> http://127.0.0.1:<ephemeral>
+await hook.close();
+```
+
 ## Status
 
-Slice #1 (this one) is the bootstrap: the bun project, the lockfile, `loadEnv()`
-and the package scripts. `bun run probe`, `bun run hook-server` and
-`bun run report` currently print `not implemented` and exit 1; the probe checks
-its environment first, so the failure you see tells you which one you hit.
+Slice #1 was the bootstrap: the bun project, the lockfile, `loadEnv()` and the
+package scripts. Slice #2 is the hook counter above. `bun run probe` and
+`bun run report` still print `not implemented` and exit 1; the probe checks its
+environment first, so the failure you see tells you which one you hit.
 `bun test` is real and must stay green without network access.

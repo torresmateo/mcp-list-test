@@ -1,0 +1,185 @@
+{
+  "schema": 1,
+  "revisionRequested": "2025-11-25",
+  "revisionNegotiated": "2025-11-25",
+  "status": "ok",
+  "userId": "probe-2025-11-25-1789768815132-2",
+  "hookPublicUrl": "https://fixture-tunnel.ngrok.app",
+  "requests": [
+    {
+      "id": 0,
+      "jsonRpcId": 0,
+      "method": "initialize",
+      "sentAt": "2026-09-18T22:00:15.775Z",
+      "finishedAt": "2026-09-18T22:00:15.777Z",
+      "durationMs": 1.714,
+      "status": 200,
+      "userIdHeader": "probe-2025-11-25-1789768815132-2",
+      "authorizationScheme": "Bearer",
+      "responseObserved": true,
+      "hookHitsAfter": 0
+    },
+    {
+      "id": 1,
+      "jsonRpcId": 1,
+      "method": "tools/list",
+      "sentAt": "2026-09-18T22:00:16.081Z",
+      "finishedAt": "2026-09-18T22:00:16.083Z",
+      "durationMs": 1.745,
+      "status": 200,
+      "userIdHeader": "probe-2025-11-25-1789768815132-2",
+      "authorizationScheme": "Bearer",
+      "responseObserved": true,
+      "hookHitsAfter": 3
+    }
+  ],
+  "hookHits": [
+    {
+      "receivedAt": "2026-09-18T22:00:16.081Z",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "authorization": "Bearer <redacted len=18 sha256=aec554bb>",
+        "connection": "keep-alive",
+        "content-length": "204",
+        "content-type": "application/json",
+        "host": "127.0.0.1:61045",
+        "user-agent": "Bun/1.3.14"
+      },
+      "toolkitCount": 2,
+      "toolCount": 3,
+      "versionCount": 3,
+      "bodyBytes": 204,
+      "handlingMs": 0.079,
+      "payload": {
+        "user_id": "probe-2025-11-25-1789768815132-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "SendEmail": [
+                {
+                  "version": "1.0.0"
+                }
+              ],
+              "ListEmails": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          },
+          "Slack": {
+            "tools": {
+              "PostMessage": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T22:00:16.082Z",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "authorization": "Bearer <redacted len=18 sha256=aec554bb>",
+        "connection": "keep-alive",
+        "content-length": "204",
+        "content-type": "application/json",
+        "host": "127.0.0.1:61045",
+        "user-agent": "Bun/1.3.14"
+      },
+      "toolkitCount": 2,
+      "toolCount": 3,
+      "versionCount": 3,
+      "bodyBytes": 204,
+      "handlingMs": 0.048,
+      "payload": {
+        "user_id": "probe-2025-11-25-1789768815132-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "SendEmail": [
+                {
+                  "version": "1.0.0"
+                }
+              ],
+              "ListEmails": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          },
+          "Slack": {
+            "tools": {
+              "PostMessage": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "receivedAt": "2026-09-18T22:00:16.082Z",
+      "headers": {
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "authorization": "Bearer <redacted len=18 sha256=aec554bb>",
+        "connection": "keep-alive",
+        "content-length": "204",
+        "content-type": "application/json",
+        "host": "127.0.0.1:61045",
+        "user-agent": "Bun/1.3.14"
+      },
+      "toolkitCount": 2,
+      "toolCount": 3,
+      "versionCount": 3,
+      "bodyBytes": 204,
+      "handlingMs": 0.051,
+      "payload": {
+        "user_id": "probe-2025-11-25-1789768815132-2",
+        "toolkits": {
+          "Gmail": {
+            "tools": {
+              "SendEmail": [
+                {
+                  "version": "1.0.0"
+                }
+              ],
+              "ListEmails": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          },
+          "Slack": {
+            "tools": {
+              "PostMessage": [
+                {
+                  "version": "1.0.0"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
+  "toolsListed": 1,
+  "gmailToolsListed": 0,
+  "error": null,
+  "toolsListRequests": 1,
+  "cursorFollowed": false,
+  "toolsListDurationMs": 1.745,
+  "protocolEra": "legacy",
+  "startedAt": "2026-09-18T22:00:15.775Z",
+  "finishedAt": "2026-09-18T22:00:16.386Z"
+}

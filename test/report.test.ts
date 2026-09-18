@@ -9,6 +9,27 @@ const REPO_ROOT = new URL("..", import.meta.url).pathname;
 /** Relative on purpose: it is what a reader types, and what the CLI echoes back. */
 const FIXTURE_DIR = "test/fixtures/runs";
 
+/**
+ * The profile fixtures issue #16 added, one directory per case.
+ *
+ * Separate from FIXTURE_DIR on purpose. Those runs predate the profile fields
+ * and are pinned key-for-key by the suite below; keeping them that way is what
+ * proves the renderer still reads a run file that carries none of this, and
+ * says `not recorded` rather than `0`.
+ *
+ * These three were produced by the real pipeline — `bun run probe` against the
+ * fake gateway and the real hook counter — and then trimmed to one case each,
+ * so their shape is the probe's, not a second guess at it. `varied` is the one
+ * exception, and it is edited rather than generated because the fake gateway
+ * sends the whole catalogue on every hook call: its three hits carry different
+ * slices, which is what a per-toolkit fan-out would look like.
+ */
+const PROFILE_DIRS = {
+  identical: "test/fixtures/profile/identical",
+  varied: "test/fixtures/profile/varied",
+  paged: "test/fixtures/profile/paged",
+} as const;
+
 /** `results/` is runtime output and gitignored — tests never read or write it. */
 let scratch: string;
 
@@ -72,6 +93,44 @@ function sectionFor(html: string, file: string): string {
   expect(start).toBeGreaterThan(-1);
   const end = html.indexOf("</section>", start);
   return html.slice(start, end);
+}
+
+/** The rows of a table with the given class, as plain-text cells. */
+function tableRows(html: string, className: string): string[][] {
+  const table = new RegExp(`<table class="${className}">([\\s\\S]*?)</table>`).exec(html);
+  if (table === null) throw new Error(`no ${className} table`);
+  return [...table[1]!.matchAll(/<tr>([\s\S]*?)<\/tr>/g)].map((row) =>
+    [...row[1]!.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)].map((cell) => stripTags(cell[1]!)),
+  );
+}
+
+/** The `tools/list`-request banner, as plain text. */
+function banner(html: string): string {
+  const match = /<div class="callout[^"]*" id="tools-list-requests">([\s\S]*?)<\/div>/.exec(html);
+  if (match === null) throw new Error("no tools/list banner in the report");
+  return stripTags(match[0]);
+}
+
+/** Renders one directory of run files and returns the HTML. */
+async function renderDir(dir: string, name: string) {
+  const out = join(scratch, name);
+  const result = await runReport(["--in", dir, "--out", out]);
+  expect(result.exitCode, result.stderr).toBe(0);
+  return { html: await Bun.file(out).text(), out, ...result };
+}
+
+/** Every run file in a directory, parsed. */
+async function loadDir(dir: string) {
+  const glob = new Bun.Glob("*.json");
+  const files: string[] = [];
+  for await (const name of glob.scan({ cwd: `${REPO_ROOT}${dir}` })) files.push(name);
+  files.sort();
+  return Promise.all(
+    files.map(async (file) => ({
+      file,
+      run: parseRun(file, await Bun.file(`${REPO_ROOT}${dir}/${file}`).text()),
+    })),
+  );
 }
 
 async function fixtureFiles(): Promise<string[]> {
@@ -359,5 +418,415 @@ describe("bun run report", () => {
     const { exitCode } = await runReport(["--in", FIXTURE_DIR, "--out", out]);
     expect(exitCode).toBe(0);
     expect(await Bun.file(out).exists()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #16: the report shows payload shape, size, pages and latency
+// ---------------------------------------------------------------------------
+
+/** The toolkit and tool names one hook payload carried, as a sorted list. */
+function toolSetOf(payload: unknown): string[] {
+  const toolkits = (payload as { toolkits?: Record<string, { tools?: Record<string, unknown> }> })
+    .toolkits;
+  return Object.entries(toolkits ?? {})
+    .flatMap(([toolkit, entry]) => Object.keys(entry.tools ?? {}).map((tool) => `${toolkit}:${tool}`))
+    .sort();
+}
+
+/** The renderer escapes what it prints; a header value read back is escaped too. */
+function escaped(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/** Milliseconds the way the renderer prints them, re-derived rather than imported. */
+function ms(value: number): string {
+  return String(Math.round(value * 1000) / 1000);
+}
+
+/** Column index of a summary header, found by its label rather than by counting. */
+function columnOf(html: string, label: string): number {
+  const index = summaryTable(html)[0]!.findIndex((cell) => cell.includes(label));
+  if (index < 0) throw new Error(`no summary column matching "${label}"`);
+  return index;
+}
+
+function cell(html: string, revision: string, label: string): string {
+  return summaryRow(html, revision)[columnOf(html, label)]!;
+}
+
+describe("profile fixtures", () => {
+  // Second implementation of the shape `src/probe/run.ts` writes and
+  // `src/hook-server/server.ts` records. If these drift from the real writers,
+  // both slices pass their own tests while the report mis-renders real runs.
+  const RUN_KEYS = [
+    "schema",
+    "revisionRequested",
+    "revisionNegotiated",
+    "status",
+    "userId",
+    "hookPublicUrl",
+    "requests",
+    "hookHits",
+    "toolsListed",
+    "gmailToolsListed",
+    "error",
+    "toolsListRequests",
+    "cursorFollowed",
+    "toolsListDurationMs",
+    "protocolEra",
+    "startedAt",
+    "finishedAt",
+  ].sort();
+
+  const REQUEST_KEYS = [
+    "id",
+    "jsonRpcId",
+    "method",
+    "sentAt",
+    "finishedAt",
+    "durationMs",
+    "status",
+    "userIdHeader",
+    "authorizationScheme",
+    "responseObserved",
+    "hookHitsAfter",
+  ].sort();
+
+  const HIT_KEYS = [
+    "receivedAt",
+    "headers",
+    "toolkitCount",
+    "toolCount",
+    "versionCount",
+    "bodyBytes",
+    "handlingMs",
+    "payload",
+  ].sort();
+
+  test("carry the fields the probe and the hook counter actually write", async () => {
+    for (const dir of Object.values(PROFILE_DIRS)) {
+      const loaded = await loadDir(dir);
+      expect(loaded.length, dir).toBeGreaterThan(0);
+
+      for (const { file } of loaded) {
+        const raw = await Bun.file(`${REPO_ROOT}${dir}/${file}`).json();
+        expect(Object.keys(raw).sort(), `${file} top-level keys`).toEqual(RUN_KEYS);
+
+        for (const request of raw.requests) {
+          // `cursor` is written only when the request followed one, so it is
+          // the one key that may be absent.
+          const keys = Object.keys(request).filter((key) => key !== "cursor");
+          expect(keys.sort(), `${file} request keys`).toEqual(REQUEST_KEYS);
+          if ("cursor" in request) expect(request.method).toBe("tools/list");
+        }
+
+        for (const hit of raw.hookHits) {
+          expect(Object.keys(hit).sort(), `${file} hit keys`).toEqual(HIT_KEYS);
+          // A fixture whose `bodyBytes` does not match its own payload would
+          // let a renderer that invented the number look right.
+          expect(hit.bodyBytes, `${file} bodyBytes vs payload`).toBe(
+            Buffer.byteLength(JSON.stringify(hit.payload), "utf8"),
+          );
+        }
+
+        const last = raw.requests.at(-1)?.hookHitsAfter ?? 0;
+        expect(raw.hookHits.length, `${file} hookHits vs last hookHitsAfter`).toBe(last);
+      }
+    }
+  });
+
+  test("cover the three cases issue #16 asks for", async () => {
+    const identical = await loadDir(PROFILE_DIRS.identical);
+    // The set is the toolkit and tool names, not the whole payload: every
+    // repetition carries its own generated `user_id`, so comparing bodies
+    // would call two hits different for a reason that is not the tool set.
+    const sets = new Set(
+      identical.flatMap(({ run }) =>
+        run.hookHits.map((hit) => toolSetOf(hit.payload).join(",")),
+      ),
+    );
+    expect(sets.size, "every hit in the identical fixture carries one set").toBe(1);
+    expect([...sets][0]).not.toBe("");
+
+    const varied = await loadDir(PROFILE_DIRS.varied);
+    const sizes = varied.flatMap(({ run }) => run.hookHits.map((hit) => hit.bodyBytes));
+    expect(new Set(sizes).size, "the varied fixture's payload sizes differ").toBeGreaterThan(1);
+
+    const paged = await loadDir(PROFILE_DIRS.paged);
+    expect(paged.some(({ run }) => (run.toolsListRequests ?? 0) > 1)).toBe(true);
+    // …and one that did not, so "more than one" is this run's fact and not the
+    // directory's.
+    expect(paged.some(({ run }) => run.toolsListRequests === 1)).toBe(true);
+  });
+});
+
+describe("summary profile columns", () => {
+  test("say every hit carried the same set, rather than leaving it to be inferred", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "profile-identical.html");
+    const loaded = await loadDir(PROFILE_DIRS.identical);
+    const hits = loaded.flatMap(({ run }) => run.hookHits);
+
+    expect(cell(html, "2025-11-25", "tool set")).toBe(`identical on all ${hits.length} hits`);
+    // The counts are still there, and they are the same number — which is
+    // exactly the rendering the sentence above exists because it is not enough.
+    expect(cell(html, "2025-11-25", "toolkits")).toBe("2");
+    expect(cell(html, "2025-11-25", "tools per hook hit")).toBe("3");
+  });
+
+  test("report tools and toolkits as a range when the hits differ", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.varied, "profile-varied.html");
+    const { run } = (await loadDir(PROFILE_DIRS.varied))[0]!;
+
+    expect(cell(html, "2025-11-25", "toolkits")).toBe("1–2");
+    expect(cell(html, "2025-11-25", "tools per hook hit")).toBe("1–3");
+    expect(cell(html, "2025-11-25", "tool set")).toBe(
+      `varies across ${run.hookHits.length} hits`,
+    );
+  });
+
+  test("total bytes to the hook is the sum of the hits' bodyBytes", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.varied, "profile-bytes.html");
+    const { run } = (await loadDir(PROFILE_DIRS.varied))[0]!;
+    const total = run.hookHits.reduce((sum, hit) => sum + (hit.bodyBytes ?? 0), 0);
+
+    expect(total).toBeGreaterThan(0);
+    expect(cell(html, "2025-11-25", "bytes sent")).toBe(String(total));
+  });
+
+  test("the hook server's handling time and the client's wall clock are two numbers, never one", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "profile-latency.html");
+    const loaded = await loadDir(PROFILE_DIRS.identical);
+
+    const handling = loaded
+      .flatMap(({ run }) => run.hookHits)
+      .reduce((sum, hit) => sum + (hit.handlingMs ?? 0), 0);
+    const client = loaded.reduce((sum, { run }) => sum + (run.toolsListDurationMs ?? 0), 0);
+
+    expect(cell(html, "2025-11-25", "hook server")).toBe(ms(handling));
+    expect(cell(html, "2025-11-25", "client-observed")).toBe(ms(client));
+
+    // They measure different things — the hook counter's own received-to-
+    // answered time (which excludes its JSONL append) and the round trip the
+    // client waited on — so their sum is meaningless and must appear nowhere.
+    expect(handling).not.toBe(client);
+    expect(html).not.toContain(ms(handling + client));
+    expect(html).toContain("never summed");
+  });
+
+  test("a run file without the profile fields reads `not recorded`, never 0", async () => {
+    // The #5 fixtures predate every field this slice renders. A renderer that
+    // defaulted them to 0 would report a hook that sent no bytes and cost no
+    // time — a measurement, from a run that never made one.
+    const { html } = await renderFixtures("profile-absent.html");
+
+    for (const label of [
+      "toolkits per hook hit",
+      "tools per hook hit",
+      "bytes sent",
+      "tools/list requests issued",
+      "hook server",
+      "client-observed",
+    ]) {
+      expect(cell(html, "2025-11-25", label), label).toBe("not recorded");
+    }
+  });
+
+  test("a partly-recorded revision says how many of its hits it could read", async () => {
+    // One run with the profile fields, one without, in one directory: the sum
+    // is over half the hits, and a bare total would hide that.
+    const mixed = join(scratch, "mixed-in");
+    const legacy = "20260918T120000Z-2025-11-25-1.json";
+    const profiled = (await loadDir(PROFILE_DIRS.identical))[0]!.file;
+    await Bun.write(
+      join(mixed, legacy),
+      await Bun.file(`${REPO_ROOT}${FIXTURE_DIR}/${legacy}`).text(),
+    );
+    await Bun.write(
+      join(mixed, profiled),
+      await Bun.file(`${REPO_ROOT}${PROFILE_DIRS.identical}/${profiled}`).text(),
+    );
+
+    const { html } = await renderDir(mixed, "profile-mixed.html");
+    expect(cell(html, "2025-11-25", "bytes sent")).toContain("(3 of 6 hits)");
+    expect(cell(html, "2025-11-25", "tools/list requests issued")).toContain("(1 of 2 runs)");
+  });
+});
+
+describe("tools/list requests the client actually issued", () => {
+  test("a paged run is announced at the top of the report, not left to be derived", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.paged, "profile-paged.html");
+    const loaded = await loadDir(PROFILE_DIRS.paged);
+    const paged = loaded.find(({ run }) => (run.toolsListRequests ?? 0) > 1)!;
+    const single = loaded.find(({ run }) => run.toolsListRequests === 1)!;
+
+    const text = banner(html);
+    expect(text).toContain("1 of 2 runs issued more than one");
+    expect(text).toContain(paged.file);
+    expect(text).toContain(`${paged.run.toolsListRequests} tools/list requests`);
+    expect(text).toContain("following a cursor");
+    expect(text).not.toContain(single.file);
+
+    // The banner comes before the summary table, so a reader cannot reach the
+    // hit counts without having read what they are counts of.
+    expect(html.indexOf('id="tools-list-requests"')).toBeLessThan(
+      html.indexOf('<table id="summary">'),
+    );
+
+    // …and the same fact is inside the run it belongs to, not only at the top.
+    expect(sectionFor(html, paged.file)).toContain(
+      `This run issued ${paged.run.toolsListRequests} <code>tools/list</code> requests`,
+    );
+    expect(sectionFor(html, single.file)).not.toContain("This run issued");
+  });
+
+  test("the summary column separates requests from runs", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.paged, "profile-paged-summary.html");
+    const loaded = await loadDir(PROFILE_DIRS.paged);
+    const requests = loaded.reduce((sum, { run }) => sum + (run.toolsListRequests ?? 0), 0);
+
+    // 3 requests over 2 runs is not the same measurement as 3 over 3, and the
+    // per-run spread is what says which one this is.
+    expect(cell(html, "2025-11-25", "tools/list requests issued")).toBe(
+      `${requests} (1–2 per run) — paged in 1`,
+    );
+    expect(summaryRow(html, "2025-11-25").slice(2, 5)).toEqual(["2", "4", "3"]);
+  });
+
+  test("a run that never recorded the number says so instead of implying one", async () => {
+    const { html } = await renderFixtures("profile-no-requests.html");
+    expect(banner(html)).toContain("No run records how many");
+    expect(banner(html)).toContain("the client may have paged");
+  });
+
+  test("every run issuing exactly one request is stated too", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "profile-single.html");
+    expect(banner(html)).toContain("issued exactly one");
+    expect(banner(html)).toContain("hook hits per request");
+  });
+});
+
+describe("per-hit detail", () => {
+  test("one row per hit with what it carried, what it cost and its headers", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.varied, "profile-hits.html");
+    const { file, run } = (await loadDir(PROFILE_DIRS.varied))[0]!;
+    const rows = tableRows(sectionFor(html, file), "hits");
+
+    expect(rows[0]!.join(" | ")).toContain("received at");
+    expect(rows).toHaveLength(run.hookHits.length + 1);
+
+    run.hookHits.forEach((hit, index) => {
+      const cells = rows[index + 1]!;
+      expect(cells[1]).toBe(hit.receivedAt);
+      expect(cells[2]).toBe(String(hit.toolkitCount));
+      expect(cells[3]).toBe(String(hit.toolCount));
+      expect(cells[4]).toBe(String(hit.versionCount));
+      expect(cells[5]).toBe(String(hit.bodyBytes));
+      expect(cells[6]).toBe(ms(hit.handlingMs!));
+      for (const [name, value] of Object.entries(hit.headers!)) {
+        expect(cells[7], `${name} on hit ${index + 1}`).toContain(
+          `${name} : ${escaped(value)}`,
+        );
+      }
+    });
+
+    // The sizes differ hit to hit, so the column is reading each hit rather
+    // than repeating one number.
+    const sizes = rows.slice(1).map((cells) => cells[5]!);
+    expect(new Set(sizes).size).toBeGreaterThan(1);
+  });
+
+  test("the credential header renders as the counter's descriptor, on every hit", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "profile-headers.html");
+    const loaded = await loadDir(PROFILE_DIRS.identical);
+    const descriptors = loaded.flatMap(({ run }) =>
+      run.hookHits.map((hit) => hit.headers!["authorization"]!),
+    );
+
+    expect(descriptors.length).toBeGreaterThan(1);
+    for (const descriptor of descriptors) {
+      // Shape, not secret: scheme in the clear, then length and digest.
+      expect(descriptor).toMatch(/^Bearer <redacted len=\d+ sha256=[0-9a-f]{8}>$/);
+    }
+    // The same descriptor on every hit is a finding — the same value arrived
+    // every time — so it is printed in full each time, never collapsed into a
+    // "same as above" that would destroy it.
+    const rendered = html.split("Bearer &lt;redacted").length - 1;
+    expect(rendered).toBe(descriptors.length);
+  });
+
+  test("the raw payload is still pretty-printed JSON under the table", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.paged, "profile-payloads.html");
+    let rendered = 0;
+
+    for (const { file, run } of await loadDir(PROFILE_DIRS.paged)) {
+      const section = sectionFor(html, file);
+      for (const hit of run.hookHits) {
+        const pretty = JSON.stringify(hit.payload, null, 2);
+        expect(pretty).toContain("\n  ");
+        expect(section).toContain(
+          pretty
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#39;"),
+        );
+        rendered += 1;
+      }
+    }
+
+    expect(rendered).toBeGreaterThan(0);
+    // The hit table added no `<pre>` of its own: one per payload, still.
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(rendered);
+  });
+
+  test("the request timeline carries the client-observed round trip per request", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.paged, "profile-timeline.html");
+    const paged = (await loadDir(PROFILE_DIRS.paged)).find(
+      ({ run }) => (run.toolsListRequests ?? 0) > 1,
+    )!;
+    const rows = tableRows(sectionFor(html, paged.file), "timeline");
+
+    expect(rows).toHaveLength(paged.run.requests.length + 1);
+    paged.run.requests.forEach((request, index) => {
+      expect(rows[index + 1]![5]).toBe(ms(request.durationMs!));
+    });
+  });
+});
+
+describe("the profile report is still self-contained", () => {
+  test("nothing is fetched off-file and every link is a fragment", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.paged, "profile-self-contained.html");
+
+    expect(html).not.toMatch(/<script\b[^>]*\bsrc\s*=/i);
+    expect(html).not.toMatch(/<link\b[^>]*\bhref\s*=/i);
+    expect(html).not.toMatch(/\bsrc\s*=/i);
+    expect(html).not.toMatch(/<(iframe|object|embed)\b/i);
+    expect(html).not.toMatch(/@import/i);
+    expect(html).not.toMatch(/url\s*\(/i);
+
+    const hrefs = [...html.matchAll(/\bhref\s*=\s*"([^"]*)"/g)].map((m) => m[1]!);
+    // The banner links to the paged run, so there is more than the run index.
+    expect(hrefs.length).toBeGreaterThan(1);
+    for (const href of hrefs) expect(href).toStartWith("#");
+  });
+
+  test("an empty directory still exits non-zero with `no run files in <dir>`", async () => {
+    const emptyDir = join(scratch, "empty-profile-in");
+    await Bun.write(join(emptyDir, ".keep"), "");
+    const { exitCode, stderr } = await runReport([
+      "--in",
+      emptyDir,
+      "--out",
+      join(scratch, "x.html"),
+    ]);
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain(`no run files in ${emptyDir}`);
   });
 });

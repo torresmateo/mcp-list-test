@@ -35,9 +35,10 @@ are not optional.
 - [Step 5 — run the probe](#step-5--run-the-probe)
 - [Step 6 — the verification gate: before you trust any count](#step-6--the-verification-gate-before-you-trust-any-count)
 - [Step 7 — generate the report](#step-7--generate-the-report)
-- [Step 8 — curate evidence and check it for secrets](#step-8--curate-evidence-and-check-it-for-secrets)
+- [Step 8 — curate evidence and scrub it](#step-8--curate-evidence-and-scrub-it)
 - [Step 9 — write NOTES.md](#step-9--write-notesmd)
-- [Step 10 — shut everything down and rotate the tunnel](#step-10--shut-everything-down-and-rotate-the-tunnel)
+- [Step 10 — the final gate, then commit](#step-10--the-final-gate-then-commit)
+- [Step 11 — shut everything down and rotate the tunnel](#step-11--shut-everything-down-and-rotate-the-tunnel)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -357,11 +358,12 @@ to be consistent with what step 6 told you.
 
 ---
 
-## Step 8 — curate evidence and check it for secrets
+## Step 8 — curate evidence and scrub it
 
 `results/` is gitignored; `evidence/` is committed by hand, and **this repository
-is public**. Work on copies, redact, verify, then generate the report *from the
-redacted copies* so it cannot carry anything the copies do not.
+is public**. Work on copies, scrub them, render the report from the scrubbed
+copies. The final check is step 10, after `NOTES.md` exists, because a note is as
+publishable as a run file.
 
 ```sh
 DATE=$(date -u +%Y-%m-%d)
@@ -369,7 +371,13 @@ mkdir -p "evidence/$DATE"
 cp results/*-*.json "evidence/$DATE/"
 ```
 
-### 8a. Look at a hook hit before you trust the redaction
+`results/` accumulates across sessions, so that copy can pick up runs from an
+earlier tunnel with an older host in them. Either copy only this run's files (the
+probe prints each path as it writes it, and `--out results/<name>` gives one
+invocation its own directory), or rely on 8b, which reads the hosts out of the
+copied files rather than out of your shell.
+
+### 8a. Look at a hook hit before you trust the scrub
 
 The counter records **every** request header of every hit, on purpose: nobody
 knows yet which headers a real Arcade gateway sends, and that is part of what
@@ -403,74 +411,92 @@ token appearing verbatim anywhere. If you see that, stop and do not commit;
 redaction is not doing its job and that is a bug to file, not something to clean
 up by hand.
 
-Note `host` above: it is **not** a credential header, so it is recorded verbatim
-and through a tunnel it is your public ngrok hostname. Step 8b handles that.
+Note `host` above: it is **not** a credential header, so it is recorded verbatim,
+and through a tunnel it is your public hostname. Step 8b handles that.
 
-### 8b. Redact the tunnel URL
+### 8b. Scrub every tunnel host the copies actually contain
 
 `HOOK_PUBLIC_URL` is sensitive in its own right: it is a live route to a service
-on your machine. It appears in every run file by design (`hookPublicUrl`, kept
-for provenance) and can also show up inside captured headers. **The decision for
-this repository: the committed evidence does not keep it.** Provenance is
-preserved by the fact that a tunnel was used and by `NOTES.md`, not by the
-literal host. A URL that is public and rotated afterwards is worth nothing to a
-reader and something to a scanner.
+on your machine. It is in every run file by design (`hookPublicUrl`, kept for
+provenance) and in the captured `host` header of every hit. **The decision for
+this repository: the committed evidence does not keep it.** Provenance survives
+in `NOTES.md`, the literal host is worth nothing to a reader and something to a
+scanner, and you rotate it in step 11 anyway.
+
+Scrub what the files say, not what your shell says. A run copied from an earlier
+ngrok session carries that session's host, and a sweep driven by
+`$HOOK_PUBLIC_URL` walks straight past it and still reports clean. Read the hosts
+out of the files:
 
 ```sh
-set -a; . ./.env.local; set +a
-host=${HOOK_PUBLIC_URL#https://}; host=${host%%/*}
-grep -rlF "$host" "evidence/$DATE" | while read -r f; do
-  sed -i '' "s|$host|TUNNEL-REDACTED.invalid|g" "$f"
+evidence_hosts() {
+  bun -e '
+const dir = Bun.argv[1];
+const found = new Set();
+const hostOf = (url) => { try { return new URL(url).host } catch { return null } };
+const add = (value) => { if (typeof value === "string" && value.trim() !== "") found.add(value.trim()); };
+for (const name of new Bun.Glob("*.json").scanSync(dir)) {
+  const run = await Bun.file(`${dir}/${name}`).json();
+  add(hostOf(run.hookPublicUrl ?? ""));
+  for (const hit of run.hookHits ?? []) {
+    for (const [header, value] of Object.entries(hit.headers ?? {})) {
+      if (["host", "x-forwarded-host", ":authority"].includes(header.toLowerCase())) add(String(value).split(",")[0]);
+    }
+  }
+}
+for (const host of found) console.log(host);
+' "$1"
+}
+
+evidence_hosts "evidence/$DATE" | sort -u
+```
+
+**You should see** one line per tunnel these files were produced behind. More
+than one means the copy spans sessions, which is exactly the case a
+`$HOOK_PUBLIC_URL`-driven sweep misses. Scrub all of them:
+
+```sh
+evidence_hosts "evidence/$DATE" | sort -u | while read -r h; do
+  [ -n "$h" ] || continue
+  grep -rlF "$h" "evidence/$DATE" | while read -r f; do
+    sed -i '' "s|$h|tunnel-redacted.invalid|g" "$f"
+  done
 done
-grep -n hookPublicUrl "evidence/$DATE"/*-1.json
+
+if evidence_hosts "evidence/$DATE" | sort -u | grep -vi '^tunnel-redacted\.invalid$'; then
+  echo "SCRUB INCOMPLETE: the hosts above survived"
+else
+  echo "scrub clean: every host these files name is the placeholder"
+fi
 ```
 
-**You should see** `"hookPublicUrl": "https://TUNNEL-REDACTED.invalid"`.
+**You should see** `scrub clean` and nothing above it. Any host printed survived
+the sweep, and it is named, so re-run the scrub rather than guessing.
+`grep -n hookPublicUrl "evidence/$DATE"/*.json` shows the same thing file by file.
 
-### 8c. Grep for every secret, and prove the grep works
+Keep `evidence_hosts` defined in this shell; step 10 uses it again.
 
-```sh
-: "${ARCADE_API_KEY:?not set; an empty pattern matches everything and the check is meaningless}" \
-  "${ARCADE_MCP_URL:?not set}" "${HOOK_BEARER_TOKEN:?not set}" "${HOOK_PUBLIC_URL:?not set}" \
-  "${host:?not set; re-run the two lines at the top of 8b in this shell}"
-
-grep -rFn -e "$ARCADE_API_KEY" -e "$ARCADE_MCP_URL" -e "$HOOK_BEARER_TOKEN" -e "$host" "evidence/$DATE"
-echo "exit=$?"
-```
-
-**You should see** no output and `exit=1`. That is clean.
-
-**No output is only evidence if the command can find something**, so confirm the
-grep is actually looking. Search for a string you know is in there and watch it
-match:
-
-```sh
-grep -rFn -e 'hookPublicUrl' "evidence/$DATE" | head -3
-```
-
-If that prints nothing either, your grep is not reading the files (wrong `$DATE`,
-empty directory) and the clean result above meant nothing.
-
-### 8d. Render the report from the redacted copies, then commit
+### 8c. Render the report from the scrubbed copies
 
 ```sh
 bun run report --in "evidence/$DATE" --out "evidence/$DATE/report.html"
-grep -c 'TUNNEL-REDACTED' "evidence/$DATE/report.html"    # > 0 if a run mentioned the tunnel
 ```
 
-Re-run the grep from 8c over `evidence/$DATE` one last time now that
-`report.html` exists. It is generated output and deserves the same check.
-
-Then write `NOTES.md` (step 9) and commit **only** `evidence/$DATE/`. Never
-`results/`, never `.env.local`, never `hook-log.jsonl` (it is raw, unredacted for
-`hookPublicUrl`, and gitignored for that reason).
+Rendering *from* the scrubbed copies is the point: the report cannot carry
+anything they no longer hold. This is the copy that gets committed; the one step
+7 wrote over `results/` stays where it is.
 
 ---
 
 ## Step 9 — write NOTES.md
 
-`evidence/<date>/NOTES.md` is what a reader on the engine team reads first. It
-must contain, at minimum:
+`evidence/<date>/NOTES.md` is what a reader on the engine team reads first.
+
+It is also the file most likely to reintroduce a secret, which is why the final
+gate is step 10 and not here: you are pasting raw responses into a file in a
+public repository. Paste, then read what you pasted.
+
+It must contain, at minimum:
 
 1. **What was run**: date, gateway toolkits, number of repetitions, the revision
    (`2025-11-25`), and that the hook was fail-closed with a 5 s timeout.
@@ -512,15 +538,104 @@ must contain, at minimum:
      -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}'
    ```
 
-   Whatever comes back, paste it verbatim and label it as a one-off curl, not a
+   Paste the response verbatim and label it as a one-off curl, not a
    measurement. It is outside the probe's contract and nothing in the report
-   accounts for it.
+   accounts for it. **Then read it**: an error body can echo the gateway URL, and
+   a shell that expanded `$ARCADE_API_KEY` into the command you copied alongside
+   it puts the key in the file. Step 10 catches both, and only because it runs
+   after this step.
 6. **Anything that surprised you**, including a `MISMATCH` from step 6, a
    retried request, or a `tools/list` that paged (`toolsListRequests > 1`).
 
 ---
 
-## Step 10 — shut everything down and rotate the tunnel
+## Step 10 — the final gate, then commit
+
+Everything you are about to publish is now in `evidence/$DATE`: run JSON, the
+report, and `NOTES.md`. Nothing after this step adds to it. Four checks, then the
+commit.
+
+```sh
+set -a; . ./.env.local; set +a
+: "${ARCADE_API_KEY:?not set; an empty pattern matches everything and the check is meaningless}" \
+  "${ARCADE_MCP_URL:?not set}" "${HOOK_BEARER_TOKEN:?not set}" "${HOOK_PUBLIC_URL:?not set}"
+TUNNEL_HOSTS='[A-Za-z0-9._-]+\.(ngrok\.[a-z]+|ngrok-free\.app|trycloudflare\.com|loca\.lt|tunnelto\.dev)'
+
+ls "evidence/$DATE"        # everything about to be committed, NOTES.md included
+
+# 1. the credential values you hold right now, anywhere in the directory
+if grep -rFn -e "$ARCADE_API_KEY" -e "$ARCADE_MCP_URL" -e "$HOOK_BEARER_TOKEN" \
+     -e "${HOOK_PUBLIC_URL#https://}" "evidence/$DATE"; then
+  echo "check 1 FAILED: the lines above carry a current secret"
+else
+  echo "check 1 clean"
+fi
+
+# 2. any tunnel hostname at all, current or stale, in any file
+if grep -rnE "$TUNNEL_HOSTS" "evidence/$DATE"; then
+  echo "check 2 FAILED: the lines above carry a tunnel hostname"
+else
+  echo "check 2 clean"
+fi
+
+# 3. the run files' own account of which hosts they name
+if ! command -v evidence_hosts >/dev/null; then
+  echo "check 3 DID NOT RUN: re-run the evidence_hosts block from 8b in this shell"
+elif evidence_hosts "evidence/$DATE" | sort -u | grep -vi '^tunnel-redacted\.invalid$'; then
+  echo "check 3 FAILED: the hosts above survived the scrub"
+else
+  echo "check 3 clean"
+fi
+```
+
+**You should see** three `clean` lines and nothing else. `FAILED` names the file
+and line; `DID NOT RUN` means exactly that, and a check that did not run is not a
+check that passed. Check 2 is pattern-based rather than value-based on purpose:
+it does not care which tunnel or which session a host came from, so a stale host
+that check 1 cannot know about still trips it. Writing the word "ngrok" in prose
+is fine; a hostname is not.
+
+### 4. Prove the gate can find something
+
+A grep that reads nothing exits clean and looks exactly like proof. Seed a
+throwaway copy and watch both greps fire:
+
+```sh
+CTL=$(mktemp -d)
+cp -R "evidence/$DATE/." "$CTL/"
+printf 'control: %s and https://old-tunnel.ngrok.app\n' "$ARCADE_API_KEY" >> "$CTL/NOTES.md"
+
+grep -rFn -e "$ARCADE_API_KEY" "$CTL" && echo "control: the value grep works" \
+  || echo "CONTROL FAILED: the value grep found nothing"
+grep -rnE "$TUNNEL_HOSTS" "$CTL" && echo "control: the host grep works" \
+  || echo "CONTROL FAILED: the host grep found nothing"
+
+rm -rf "$CTL"
+```
+
+**You should see** both greps print the seeded line, each followed by `works`. A
+`CONTROL FAILED` line means the gate above was not reading your files and its
+`clean` verdicts meant nothing.
+
+This writes your API key into a temp directory for a few seconds and the last
+line deletes it. If you would rather it never touched disk, seed any sentinel
+string instead; you lose only the proof that the pattern matches your real value.
+
+### Commit
+
+```sh
+git add "evidence/$DATE"
+git status --short "evidence/$DATE"
+git commit -m "evidence: live run $DATE, 2025-11-25 against the Arcade gateway"
+```
+
+Commit **only** `evidence/$DATE`. Never `results/`, never `.env.local`, never
+`hook-log.jsonl`, which is raw, unscrubbed for the tunnel host, and gitignored
+for that reason.
+
+---
+
+## Step 11 — shut everything down and rotate the tunnel
 
 ```sh
 # terminal 2: Ctrl-C ngrok
@@ -529,8 +644,8 @@ curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:$PORT_WEB/healthz"   
 ```
 
 Then, in the Dashboard: the extension still points at a tunnel URL that was in
-the evidence trail until you redacted it, and the gateway is fail-closed against
-a hook that is now down. Either disable the extension or leave the test project
+the evidence trail until step 8b scrubbed it, and the gateway is fail-closed
+against a hook that is now down. Either disable the extension or leave the test project
 idle. Do not leave a live extension pointing at a dead endpoint on anything
 that matters. Start a fresh tunnel next time; treat the old URL as spent.
 

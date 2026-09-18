@@ -1,7 +1,7 @@
 /**
  * A fake Arcade MCP gateway, for tests that must never touch the network.
  *
- * It is a real Streamable HTTP MCP server (`@modelcontextprotocol/sdk`) that
+ * It is a real Streamable HTTP MCP server (`@modelcontextprotocol/server`) that
  * imitates the one behaviour under measurement: on an MCP request it calls a
  * contextual-access hook some configured number of times, forwarding the
  * caller's user id, and lists only the tools the hook's answer left standing.
@@ -27,16 +27,14 @@
  *    a hook that does not answer 200 yields an empty tool list rather than the
  *    unfiltered one.
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import {
-  ErrorCode,
-  InitializeRequestSchema,
-  ListToolsRequestSchema,
-  McpError,
+  ProtocolError,
+  ProtocolErrorCode,
   SUPPORTED_PROTOCOL_VERSIONS,
+  Server,
+  WebStandardStreamableHTTPServerTransport,
   isInitializeRequest,
-} from "@modelcontextprotocol/sdk/types.js";
+} from "@modelcontextprotocol/server";
 import { readArcadeUserId } from "../client/headers.ts";
 
 /** The MCP endpoint path; `FakeGateway.url` already includes it. */
@@ -225,12 +223,12 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
     return lastAccepted;
   }
 
-  function requireUserId(headers: Record<string, string | string[] | undefined>): string {
+  function requireUserId(headers: Headers): string {
     const userId = readArcadeUserId(headers);
     if (userId === undefined) {
       // Loud, on purpose. Inventing an id here would file the hook hits under
       // a key nobody polls, and the caller would read a plausible 0.
-      throw new McpError(ErrorCode.InvalidRequest, "missing Arcade-User-ID header");
+      throw new ProtocolError(ProtocolErrorCode.InvalidRequest, "missing Arcade-User-ID header");
     }
     return userId;
   }
@@ -245,8 +243,8 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
     // version when it recognises it, and a gateway pinned to one revision does
     // not. That pinning is what the probe must detect, so the fake has to be
     // able to do it.
-    server.setRequestHandler(InitializeRequestSchema, async (request, extra) => {
-      const userId = requireUserId(extra.requestInfo?.headers ?? {});
+    server.setRequestHandler("initialize", async (request, ctx) => {
+      const userId = requireUserId(ctx.http?.req?.headers ?? new Headers());
       await callHook("initialize", userId, callsPerInitialize);
       return {
         protocolVersion: options.protocolVersion ?? request.params.protocolVersion,
@@ -255,8 +253,8 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
       };
     });
 
-    server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
-      const userId = requireUserId(extra.requestInfo?.headers ?? {});
+    server.setRequestHandler("tools/list", async (_request, ctx) => {
+      const userId = requireUserId(ctx.http?.req?.headers ?? new Headers());
       const decision = await callHook("tools/list", userId, callsPerList);
       // No usable answer -> nothing is allowed. Failing open would hand the
       // caller the very tools the hook exists to remove.

@@ -21,9 +21,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
+import {
+  Client,
+  LATEST_PROTOCOL_VERSION,
+  StreamableHTTPClientTransport,
+} from "@modelcontextprotocol/client";
 import { ARCADE_USER_ID_HEADER, arcadeUserHeaders } from "../src/client/headers.ts";
 import { type FakeGateway, startFakeGateway } from "../src/fake-gateway/server.ts";
 import { type HookServer, startHookServer } from "../src/hook-server/server.ts";

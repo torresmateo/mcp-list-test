@@ -122,12 +122,50 @@ const hook = startHookServer({ port: 0, token, logPath: "/tmp/run/hook-log.jsonl
 await hook.close();
 ```
 
+## The offline fake gateway
+
+`bun test` must be green without network access, so the tests run the probe
+against a fake Arcade gateway instead of the real one. It is a Streamable HTTP
+MCP server (`@modelcontextprotocol/sdk`) that imitates the single behaviour
+under measurement: it calls the hook counter a configured number of times per
+MCP method, forwarding the caller's user id, and lists only the tools the
+hook's answer left standing.
+
+```ts
+import { startHookServer } from "./src/hook-server/server.ts";
+import { startFakeGateway } from "./src/fake-gateway/server.ts";
+import { arcadeUserHeaders } from "./src/client/headers.ts";
+
+const hook = startHookServer({ port: 0, token, logPath: "/tmp/run/hook-log.jsonl" });
+const gateway = startFakeGateway({ hookUrl: hook.url, hookToken: token, hookCallsPerList: 3 });
+// gateway.url -> http://127.0.0.1:<ephemeral>/mcp, for an SDK client whose
+// requests carry arcadeUserHeaders(userId)
+```
+
+| Option                   | Default                | Meaning                                                     |
+| ------------------------ | ---------------------- | ----------------------------------------------------------- |
+| `hookCallsPerList`       | `1`                    | Hook calls per `tools/list`, issued serially and awaited     |
+| `hookCallsPerInitialize` | `0`                    | Hook calls per `initialize` — configurable, not assumed      |
+| `protocolVersion`        | echo the client's      | Version the `initialize` result reports, whatever was asked  |
+| `tools`                  | two Gmail, one Slack   | Catalogue, named `Toolkit_Tool`                              |
+
+It fails loudly rather than plausibly. A request without the `Arcade-User-ID`
+header is an MCP error, never an invented user id. A hook that does not answer
+`200` yields an *empty* tool list, never the unfiltered one. And every outbound
+hook call is recorded in `gateway.hookCalls` with the HTTP status it got, which
+is the only way to tell "the hook rejected us" from "we never called it" — both
+of which leave the hit count at `0`.
+
+`src/client/headers.ts` holds the one thing the probe and the fake have to
+agree on: `ARCADE_USER_ID_HEADER`, the header carrying the user id the hook
+counter keys on. Both read the constant; neither repeats the string.
+
 ## Status
 
 Slice #1 was the bootstrap: the bun project, the lockfile, `loadEnv()` and the
-package scripts. Slice #2 is the hook counter above. Slice #5 made
-`bun run report` real — it renders run JSON into `report.html` and needs no
-credentials, no network and no gateway. `bun run probe` still prints
-`not implemented` and exits 1, and it checks its environment first, so the
-failure you see tells you which one you hit. `bun test` is real and must stay
-green without network access.
+package scripts. Slice #2 is the hook counter above, and slice #3 the fake
+gateway the offline tests run against. Slice #5 made `bun run report` real — it
+renders run JSON into `report.html` and needs no credentials, no network and no
+gateway. `bun run probe` still prints `not implemented` and exits 1, and it
+checks its environment first, so the failure you see tells you which one you
+hit. `bun test` is real and must stay green without network access.

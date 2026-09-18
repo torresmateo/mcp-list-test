@@ -131,9 +131,14 @@ method = difference between consecutive snapshots.
 
 - `POST /access` — Arcade access-hook contract. Requires
   `Authorization: Bearer $HOOK_BEARER_TOKEN`, else 401 and **not counted**.
-  Body per Arcade schema: `{ user_id, toolkits: { <Toolkit>: { tools: { <Tool>: [ { version, metadata } ] } } } }`.
-  Response: the same shape with every toolkit whose name matches `/^gmail$/i`
-  removed. Reply immediately, no artificial delay.
+  Body per Arcade schema (`AccessHookRequest`):
+  `{ user_id, toolkits: { <Toolkit>: { tools: { <Tool>: [ { version, metadata } ] } } } }`.
+  Response per Arcade schema (`AccessHookResult`): `{ only?: Toolkits, deny?: Toolkits }`,
+  where `Toolkits` is the **same** map shape as the request's `toolkits`.
+  This hook returns `{ "deny": { <Toolkit>: <ToolkitInfo as received> } }` naming
+  every toolkit whose name matches `/^gmail$/i`, and `{}` when the request
+  carried none. It does **not** echo the request body.
+  Reply immediately, no artificial delay.
 - `GET /hits?user_id=<id>` → `{ "count": n, "hits": [ { "receivedAt", "payload" } ] }`.
 - `GET /healthz` → 200.
 - Every accepted hit is also appended as one JSON line to
@@ -179,9 +184,29 @@ browser's print dialog.
    correlation key. Serial execution plus a stable-count window attributes hits
    to the right method without gateway-side identifiers. Revisit when the
    hook-side interrogation (open question 1) says what else reaches the hook.
-6. **Hook policy: deny the Gmail toolkit, allow the rest.** A visible effect in
-   the listed tools proves the hook was consulted at all. Gmail count is
-   recorded, not asserted, because a non-zero value is a different bug.
+6. **Hook policy: deny the Gmail toolkit, allow the rest**, expressed as the
+   contract's `deny` list. A visible effect in the listed tools proves the hook
+   was consulted at all. Gmail count is recorded, not asserted, because a
+   non-zero value is a different bug.
+
+   **Amended 2026-09-18 (operator ruling, gate `gate_e8a9f8ad9971`).** This
+   decision previously specified the response as *the request body with Gmail
+   removed*. That was wrong, and wrong in the fail-open direction. The canonical
+   contract — `AccessHookResult` in `logic_extensions/http/1.0/schema.yaml` of
+   ArcadeAI/schemas, linked from Arcade's "build your own" guide — is
+   `{ only?: Toolkits, deny?: Toolkits }`, and the engine treats a response
+   carrying **neither** field as *no change*: every tool stays allowed. The old
+   response carried neither, so a filtered body that looked like a deny
+   expressed no opinion at all, and Gmail would have remained listed.
+
+   Found by the #6 reviewer while reviewing the runbook, and verified against
+   the published schema rather than the prose. The measurement this project
+   exists to take — how many times the hook fires on `tools/list` — is
+   unaffected either way: the hook is called, counts, and records its profile
+   regardless of what it answers. What it changes is whether the live run's
+   `gmailToolsListed` is interpretable. A non-zero value under the old response
+   would have meant "we never expressed a deny", which is far too easy to
+   misread as "the gateway ignored our deny".
 7. **Hook verifies a bearer token and does not count rejects.** The tunnel URL
    is public; scanners must not become hook hits.
 8. **In-memory store plus JSONL append.** The probe polls a read endpoint; the

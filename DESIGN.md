@@ -8,8 +8,15 @@ reasoning is recorded so a worker can tell when a decision no longer applies.
 
 Answer one question with evidence the Arcade engine team can act on: **how many
 times does an Arcade MCP gateway call a configured contextual-access hook per
-`tools/list` request**, for MCP protocol revisions `2025-11-25` and
-`2026-07-28`? The expected value is exactly one hook call per `tools/list`.
+`tools/list` request**? The expected value is exactly one hook call per
+`tools/list`.
+
+**Scope today: the `2025-11-25` revision, taken end to end against the real
+Arcade gateway.** `2026-07-28` was originally in scope alongside it and is
+deferred to a follow-up, for the reason recorded in decision 15: it is not a
+different version string but a different protocol **era**, with a different
+handshake. Everything here is written so that adding it later is a parameter and
+a slice, not a rewrite.
 A prior, unrelated project observed far more. A conclusive result is a set of
 JSON run files plus an HTML report showing, per revision and per fresh session,
 requests sent versus hook hits, with raw hook payloads attached.
@@ -20,10 +27,11 @@ Four parts. Workers build the first three; the operator owns the fourth.
 
 1. **Probe** (`src/probe.ts`, `bun run probe`). For each repetition it
    generates a fresh user id, opens a new MCP session against the gateway with
-   the official `@modelcontextprotocol/sdk` over Streamable HTTP, sends
-   `initialize` then one `tools/list`, and after each request polls the hook
-   counter for hits keyed by that user id. It writes one JSON file per run to
-   `results/`.
+   the official MCP TypeScript client over Streamable HTTP, sends `initialize`
+   then one `tools/list`, and after each request polls the hook counter for hits
+   keyed by that user id. It writes one JSON file per run to `results/`.
+   The `initialize`-then-`tools/list` shape is the **legacy era** flow and is
+   what we measure today; see decision 15.
 2. **Hook counter** (`src/hook-server/`, `bun run hook-server`). An HTTP
    server on `$PORT_WEB` that implements Arcade's access-hook contract at
    `POST /access`, verifies a bearer token, records every hit in memory keyed
@@ -140,9 +148,12 @@ browser's print dialog.
 2. **Probe issues `initialize` and one `tools/list` only.** Minimal surface
    gives the cleanest attribution. Repeat lists, prompts, resources and
    `tools/call` are out of scope until this number is known.
-3. **Official `@modelcontextprotocol/sdk`, Streamable HTTP only.** It is what
-   real clients use, so the count reflects what users experience. The SDK may
-   issue requests behind the caller's back, so decision 4 exists.
+3. **Official MCP TypeScript SDK, Streamable HTTP only.** It is what real
+   clients use, so the count reflects what users experience. The SDK may issue
+   requests behind the caller's back, so decision 4 exists.
+   The package is the **v2 scoped set** — `@modelcontextprotocol/client`,
+   `@modelcontextprotocol/server`, `@modelcontextprotocol/core` — not the frozen
+   v1 `@modelcontextprotocol/sdk`. See decision 16.
 4. **Log every outbound request via an injected `fetch`.** Requests sent and
    hook hits are reported side by side. An SDK retry shows up as two requests,
    not as a mysterious extra hit.
@@ -173,12 +184,36 @@ browser's print dialog.
     fake MCP server calls the hook N times per `tools/list`; tests assert the
     probe reports N and the negotiated version. The live probe is a separate
     command and is never mocked.
+15. **`2026-07-28` is a different era, not a different version string, and is
+    deferred.** The SDK names two behaviour families: `legacy`, covering
+    `2024-10-07` through `2025-11-25`, which opens with the `initialize`
+    handshake; and `modern`, starting at `2026-07-28`, which has **no
+    `initialize`** — it opens with a `server/discover` probe and carries a
+    `_meta` envelope on every request. That makes the two legs different flows
+    rather than one flow under two labels, so the probe contract, the run JSON
+    `requests[]` and the report's *hits on initialize* column are all
+    legacy-shaped today. Deferred so we get a real number against the live
+    gateway first. It also sharpens the eventual question: two different
+    handshakes may invoke the hook a different number of times, which is more
+    interesting than the same handshake twice.
+16. **Use the v2 scoped packages, from npm, not a vendored copy.** The SDK was
+    restructured at v2: `@modelcontextprotocol/sdk` is the frozen v1 name
+    (1.30.0, no `2026-07-28`), and the current published packages are
+    `@modelcontextprotocol/client`, `/server` and `/core` at 2.0.0, which carry
+    both revisions plus `versionNegotiation`, `mode: { pin: '2026-07-28' }` and
+    `getProtocolEra()`. Vendoring the SDK was considered and rejected: it is
+    published, and a local fork would undercut decision 3's justification that
+    we measure what real clients experience. Migrating is its own slice, done
+    before the probe is written, because the probe is the file the migration
+    would otherwise force a rewrite of.
 
 ## Non-goals
 
 - Pre-execution and post-execution hooks.
 - Measuring `tools/call`, `prompts/list`, or `resources/list`.
 - Legacy HTTP+SSE transport.
+- The `modern` era (`2026-07-28`) for now — deferred per decision 15, not
+  abandoned.
 - Fixing the gateway. This repo produces evidence only.
 - A long-lived deployment of the hook counter.
 - PDF generation via headless browsers.
@@ -189,6 +224,8 @@ Answers come from interrogating the hook-side (engine) repo in a separate
 session. Until answered, decision 5 stands.
 
 1. Which code paths invoke the access hook, and is `initialize` one of them?
+   Era-specific: `initialize` exists only in the legacy era. The modern-era
+   form of this question is whether `server/discover` invokes the hook.
 2. Is the hook called once per request, per toolkit, per tool, or per version?
 3. Is the access decision cached, keyed by what, with what TTL?
 4. Does the gateway retry the hook on timeout or 5xx, and how many times?
@@ -197,8 +234,10 @@ session. Until answered, decision 5 stands.
    would allow exact attribution instead of quiescence windows?
 7. Which header or claim becomes `user_id` for an MCP gateway call?
 8. Does the `tools/list` path differ between MCP revisions `2025-11-25` and
-   `2026-07-28`?
+   `2026-07-28`? Note these are different eras (decision 15), so any difference
+   may be the handshake rather than the list path itself.
 9. Does the gateway emit a per-invocation log or metric we can compare against?
 10. Is there an existing ticket about the hook firing too often?
-11. Does the test gateway actually offer both revisions? If not, which one
-    replaces `2026-07-28`?
+11. Does the test gateway actually offer `2026-07-28` at all? Answerable only
+    against the real gateway, and it decides whether the deferred modern-era
+    leg has anything to talk to. Record it in the live run's notes.

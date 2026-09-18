@@ -1,0 +1,21 @@
+{
+  "name": "mcp-list-test",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Counts how many times an Arcade MCP gateway calls a contextual-access hook per tools/list request.",
+  "scripts": {
+    "probe": "bun run src/probe.ts",
+    "hook-server": "bun run src/hook-server/index.ts",
+    "report": "bun run src/report.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.9.3"
+  }
+}

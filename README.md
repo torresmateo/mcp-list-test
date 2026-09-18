@@ -97,7 +97,7 @@ exactly three endpoints (`DESIGN.md` Contracts -> Hook counter HTTP API):
 | Endpoint            | Behaviour                                                                                  |
 | ------------------- | ------------------------------------------------------------------------------------------ |
 | `POST /access`      | Arcade's access-hook contract. Needs `Authorization: Bearer $HOOK_BEARER_TOKEN`, else 401 — and a 401 is **not** counted. Replies with the request body minus every toolkit whose name matches `/^gmail$/i`. |
-| `GET /hits?user_id=`| `{ "count": n, "hits": [ { "receivedAt", "payload" } ] }` for that user; an unknown user is `count: 0`, a request with no `user_id` is a 400. |
+| `GET /hits?user_id=`| `{ "count": n, "hits": [ <hit> ] }` for that user — see **What a hit records** below; an unknown user is `count: 0`, a request with no `user_id` is a 400. |
 | `GET /healthz`      | 200.                                                                                        |
 
 ```console
@@ -111,6 +111,45 @@ Every accepted hit appends one JSON line to `results/hook-log.jsonl` before the
 response goes out, so `wc -l` on that file and the count from `/hits` never
 disagree. `--log <path>` points it somewhere else. `PORT_WEB=0` binds an
 ephemeral port and the listening line reports the one it got.
+
+### What a hit records
+
+A count alone does not tell the engine team what an access hook costs them, so
+every hit carries the *shape and cost* of the invocation (`DESIGN.md`
+decision 17). `/hits` and each JSONL line hold the same record:
+
+```json
+{
+  "receivedAt": "2026-09-18T20:17:14.234Z",
+  "headers": { "authorization": "Bearer ...", "content-type": "application/json", "x-arcade-whatever": "a-header-nobody-allow-listed" },
+  "toolkitCount": 2,
+  "toolCount": 4,
+  "versionCount": 5,
+  "bodyBytes": 243,
+  "handlingMs": 0.428,
+  "payload": { "user_id": "probe-demo-1", "toolkits": { "Slack": { "tools": { "PostMessage": [ { "version": "1.0.0" }, { "version": "2.0.0" } ] } } } }
+}
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `receivedAt`   | ISO-8601 instant the request arrived, taken before any work on it. |
+| `headers`      | **Every** request header, verbatim, as the runtime presents them. Not an allow-list. |
+| `toolkitCount` | Toolkits in the payload as it arrived. |
+| `toolCount`    | Tool names across every toolkit. |
+| `versionCount` | **Total version entries across every tool** — not tools-that-have-versions, and not distinct version strings. |
+| `bodyBytes`    | Byte length of the raw request body, measured before parsing. |
+| `handlingMs`   | The server's *own* handling time: received to response ready. Not client-observed latency — the report shows the two separately. |
+| `payload`      | The body exactly as the gateway sent it, unfiltered — Gmail included. |
+
+The counts describe what arrived, not what went back: a Gmail toolkit that the
+policy strips from the response is still counted in the profile.
+
+`headers` is deliberately unfiltered, `authorization` included. We do not yet
+know which headers a real Arcade gateway sends, and a hit that cannot be tied
+back to the request that caused it is a hit you can only count, not explain.
+`results/` is gitignored; **scrub the bearer before copying a hit into
+`evidence/`.**
 
 Other code starts the counter directly instead of shelling out:
 

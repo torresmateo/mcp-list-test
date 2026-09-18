@@ -577,17 +577,17 @@ describe("the recorded profile — headers (criteria 1, 5)", () => {
     expect(hit.headers["x-request-id"]).toBe("req-abc-123");
   });
 
-  test("the capture is not a subset — routine headers and the bearer are there too", async () => {
+  test("the capture is not a subset — every header name is there, the bearer included", async () => {
     const h = harness();
     await h.post(shapedPayload("u1"));
 
     const hit = (await h.hits("u1")).hits[0]!;
     expect(hit.headers["content-type"]).toBe("application/json");
-    // Unfiltered means unfiltered: even the header a filter would be most
-    // tempted to strip. `results/` is gitignored; curated evidence is scrubbed
-    // by hand.
-    expect(hit.headers["authorization"]).toBe(`Bearer ${TOKEN}`);
     expect(hit.headers["host"]).toBe(new URL(h.server.url).host);
+    // No allow-list decides which headers are captured, so `authorization` is
+    // present — as a descriptor, never as the token. See the redaction block.
+    expect(hit.headers).toHaveProperty("authorization");
+    expect(hit.headers["authorization"]).not.toBe(`Bearer ${TOKEN}`);
     expect(Object.keys(hit.headers).length).toBeGreaterThanOrEqual(3);
   });
 });
@@ -722,5 +722,174 @@ describe("a rejected request records no profile at all (criterion 6)", () => {
     expect((await h.post("{not json")).status).toBe(400);
     expect((await h.post({ toolkits: {} })).status).toBe(400);
     expect(h.logLines()).toHaveLength(0);
+  });
+});
+
+/**
+ * Credential headers are redacted at capture, not cleaned up afterwards.
+ *
+ * The threat is not the gitignored JSONL on its own: a recorded value travels
+ * `GET /hits` -> the probe's `hookHits[]` -> `results/<run>.json` -> `evidence/`,
+ * which the operator commits to a **public** repository. So these tests search
+ * the *serialised text* of every place a hit is observable, not the object
+ * graph — a secret nested somewhere unexpected is still a published secret.
+ */
+describe("credential headers never reach disk", () => {
+  /** Every surface a recorded hit is readable from, as raw text. */
+  async function observableText(h: Harness, userId: string): Promise<Record<string, string>> {
+    const response = await fetch(`${h.server.url}/hits?user_id=${encodeURIComponent(userId)}`);
+    return {
+      "GET /hits body": await response.text(),
+      "the JSONL log": readFileSync(h.server.logPath, "utf8"),
+    };
+  }
+
+  test("the bearer is replaced by a descriptor and appears in no recorded text", async () => {
+    const h = harness();
+    await h.post(shapedPayload("u1"));
+
+    const hit = (await h.hits("u1")).hits[0]!;
+    // The scheme survives — it is shape, not secret — and the credential does not.
+    expect(hit.headers["authorization"]).toMatch(
+      /^Bearer <redacted len=\d+ sha256=[0-9a-f]{8}>$/,
+    );
+    expect(hit.headers["authorization"]).toContain(`len=${TOKEN.length}`);
+
+    for (const [surface, text] of Object.entries(await observableText(h, "u1"))) {
+      expect(`${surface}: ${text}`).not.toContain(TOKEN);
+    }
+    // And not in the serialised hit itself, wherever it might have been nested.
+    expect(JSON.stringify(hit)).not.toContain(TOKEN);
+  });
+
+  test.each([
+    ["proxy-authorization", "Basic cHJveHktc2VjcmV0LXZhbHVl"],
+    ["cookie", "session=cookie-secret-value; theme=dark"],
+    ["set-cookie", "session=another-cookie-secret; Path=/"],
+    ["x-api-key", "api-key-secret-value"],
+    ["X-API-Key", "uppercase-api-key-secret"],
+  ])("%s is redacted too, and the match is case-insensitive", async (name, value) => {
+    const h = harness();
+    await postWith(
+      h.server.url,
+      {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        [name]: value,
+      },
+      JSON.stringify(shapedPayload("u1")),
+    );
+
+    const hit = (await h.hits("u1")).hits[0]!;
+    const captured = hit.headers[name.toLowerCase()];
+    expect(captured).toBeDefined();
+    expect(captured).toContain("<redacted len=");
+    for (const text of Object.values(await observableText(h, "u1"))) {
+      expect(text).not.toContain(value);
+    }
+    // A cookie has no scheme, so it is redacted whole rather than split.
+    if (name === "cookie") expect(captured).not.toContain("theme=dark");
+  });
+
+  test("the same value yields the same descriptor on every hit", async () => {
+    const h = harness();
+    for (let i = 0; i < 3; i += 1) {
+      await postWith(
+        h.server.url,
+        {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+          "x-api-key": "one-steady-key",
+        },
+        JSON.stringify(shapedPayload("u1")),
+      );
+    }
+
+    const { hits } = await h.hits("u1");
+    expect(hits).toHaveLength(3);
+    // The one diagnostic the raw value would have given us: it was the same
+    // token every time. A bare `<redacted>` would have thrown this away.
+    const bearers = new Set(hits.map((hit) => hit.headers["authorization"]));
+    const keys = new Set(hits.map((hit) => hit.headers["x-api-key"]));
+    expect(bearers.size).toBe(1);
+    expect(keys.size).toBe(1);
+  });
+
+  test("a different value yields a different descriptor", async () => {
+    const h = harness();
+    for (const key of ["key-alpha", "key-beta-which-is-longer"]) {
+      await postWith(
+        h.server.url,
+        {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+          "x-api-key": key,
+        },
+        JSON.stringify(shapedPayload("u1")),
+      );
+    }
+
+    const { hits } = await h.hits("u1");
+    expect(hits[0]!.headers["x-api-key"]).not.toBe(hits[1]!.headers["x-api-key"]);
+    // Two bearers need two servers, since only the right one is ever recorded.
+    const other = "a-completely-different-hook-token";
+    const b = harness(other);
+    await postWith(
+      b.server.url,
+      { authorization: `Bearer ${other}`, "content-type": "application/json" },
+      JSON.stringify(shapedPayload("u1")),
+    );
+    const theirs = (await b.hits("u1")).hits[0]!.headers["authorization"];
+    expect(theirs).not.toBe(hits[0]!.headers["authorization"]);
+    expect(theirs).toMatch(/^Bearer <redacted len=\d+ sha256=[0-9a-f]{8}>$/);
+  });
+
+  test("non-credential headers are untouched, however odd their name or value", async () => {
+    const h = harness();
+    await postWith(
+      h.server.url,
+      {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        // What the instrument exists to discover: nothing here is guessed at,
+        // and no value is pattern-matched.
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "x-arcade-user-id": "probe-2025-11-25-1758210000000-1",
+        "x-authorization-ish": "not-a-credential-header-name",
+        "x-orca-arbitrary-header": "captured-verbatim-42",
+      },
+      JSON.stringify(shapedPayload("u1")),
+    );
+
+    const hit = (await h.hits("u1")).hits[0]!;
+    expect(hit.headers["traceparent"]).toBe(
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    );
+    expect(hit.headers["x-arcade-user-id"]).toBe("probe-2025-11-25-1758210000000-1");
+    // The list is names, exactly — not substrings of names.
+    expect(hit.headers["x-authorization-ish"]).toBe("not-a-credential-header-name");
+    expect(hit.headers["x-orca-arbitrary-header"]).toBe("captured-verbatim-42");
+  });
+
+  test("a 401 records nothing at all, its credential header included", async () => {
+    const h = harness();
+    const response = await postWith(
+      h.server.url,
+      {
+        authorization: "Bearer wrong-token-from-a-scanner",
+        "content-type": "application/json",
+        "x-api-key": "scanner-key-that-must-not-be-stored",
+      },
+      JSON.stringify(shapedPayload("scanner")),
+    );
+    expect(response.status).toBe(401);
+
+    expect(await h.count("scanner")).toBe(0);
+    const log = readFileSync(h.server.logPath, "utf8");
+    expect(log).toBe("");
+    // Not even a descriptor: a rejected request is not a measurement.
+    expect(log).not.toContain("<redacted");
+    expect(log).not.toContain("wrong-token-from-a-scanner");
+    expect(log).not.toContain("scanner-key-that-must-not-be-stored");
   });
 });

@@ -21,7 +21,7 @@
  * the server's own handling time — because a bare count does not tell the
  * engine team what an access hook costs them.
  */
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,15 +48,17 @@ export interface HookHit {
   /** ISO-8601 instant the request arrived, taken before any work on it. */
   receivedAt: string;
   /**
-   * Every request header that arrived, verbatim, exactly as the runtime
-   * presents them — no allow-list and no filtering.
+   * Every request header that arrived. No allow-list decides *which* headers
+   * are captured: we do not yet know which ones a real Arcade gateway sends,
+   * and a hit that cannot be tied back to the request that caused it is a hit
+   * we can only count, not explain.
    *
-   * Deliberately unfiltered: we do not yet know which headers a real Arcade
-   * gateway sends, and a hit that cannot be tied back to the request that
-   * caused it is a hit we can only count, not explain. An allow-list would
-   * freeze today's guess about what matters into the instrument. Note that
-   * this includes `authorization`, so the JSONL log holds the hook bearer —
-   * it is gitignored output, and curated evidence must be scrubbed by hand.
+   * Values are verbatim except for {@link CREDENTIAL_HEADERS}, whose secret is
+   * replaced by a descriptor at capture time — see {@link captureHeaders}. The
+   * secret therefore never reaches the store, the JSONL log or `/hits`, so it
+   * cannot travel on into a run file and into the public `evidence/` directory.
+   * Nothing real is lost: the server has already verified the bearer, so a
+   * recorded hit is by definition one that authenticated.
    */
   headers: Record<string, string>;
   /** Toolkits present in the payload as it arrived. */
@@ -135,6 +137,74 @@ function unauthorized(): Response {
       "www-authenticate": 'Bearer realm="access-hook"',
     },
   });
+}
+
+/**
+ * Headers whose value is a credential. Matched by name, case-insensitively.
+ *
+ * Deliberately short and about *names only*: these are the headers that carry
+ * a secret by definition. Nothing here pattern-matches on a value — a gateway's
+ * `traceparent`, `user-agent` or anything else we have never seen is exactly
+ * what this instrument exists to discover, and guessing at values would start
+ * redacting the evidence.
+ */
+const CREDENTIAL_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+]);
+
+/**
+ * The subset whose value begins with an auth scheme (RFC 7235). The scheme is
+ * kept in the clear because it is shape, not secret. A cookie has no scheme —
+ * its first token is already a value — so it is redacted whole.
+ */
+const SCHEMED_CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization"]);
+
+/** `Bearer <token>` -> scheme and credential; no match means "no scheme". */
+const AUTH_SCHEME = /^([A-Za-z][A-Za-z0-9._~+-]*)[ \t]+(\S[\s\S]*)$/;
+
+/** First 8 hex of SHA-256: stable across hits, useless for recovering the value. */
+function shortDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 8);
+}
+
+/**
+ * What a redacted value becomes: `<redacted len=43 sha256=1f3a9c2b>`.
+ *
+ * A descriptor rather than a bare `<redacted>`, because the three things we
+ * actually need from a credential header survive it — the header was present,
+ * it had a plausible shape, and it was *the same value on every hit*. That last
+ * one is the only diagnostic the raw bytes would have given us, and a constant
+ * placeholder would throw it away. `len` is the byte length of the portion that
+ * was removed, and the digest is over that same portion.
+ */
+function redact(secret: string): string {
+  return `<redacted len=${Buffer.byteLength(secret, "utf8")} sha256=${shortDigest(secret)}>`;
+}
+
+/**
+ * Every header that arrived, with credential values redacted before the record
+ * exists. There is no path by which the raw secret is stored and cleaned up
+ * later: it is replaced here, once, on the way in.
+ */
+function captureHeaders(headers: Headers): Record<string, string> {
+  const captured: Record<string, string> = {};
+  for (const [name, value] of headers) {
+    // The runtime lower-cases header names; `toLowerCase` makes the match
+    // independent of that rather than dependent on it.
+    const key = name.toLowerCase();
+    if (!CREDENTIAL_HEADERS.has(key)) {
+      captured[name] = value;
+      continue;
+    }
+    const schemed = SCHEMED_CREDENTIAL_HEADERS.has(key) ? AUTH_SCHEME.exec(value) : null;
+    captured[name] =
+      schemed === null ? redact(value) : `${schemed[1]} ${redact(schemed[2] as string)}`;
+  }
+  return captured;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -287,8 +357,8 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
     // the JSONL append cannot be inside the number it writes.
     record(userId, {
       receivedAt: received.iso,
-      // Verbatim, including `authorization`: see HookHit.headers.
-      headers: Object.fromEntries(request.headers),
+      // Every header name, credential values redacted: see HookHit.headers.
+      headers: captureHeaders(request.headers),
       ...profilePayload(body),
       bodyBytes,
       handlingMs: millisSince(received.at),

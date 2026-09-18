@@ -25,11 +25,45 @@ export interface RunRequest {
   method: string;
   sentAt: string;
   hookHitsAfter: number;
+  /**
+   * Client-observed round trip for this request, hook round trips included.
+   * Optional: a run file written before the probe measured it does not carry
+   * it, and `undefined` here means *absent*, never zero.
+   */
+  durationMs?: number;
 }
 
+/**
+ * One hook hit as the counter recorded it.
+ *
+ * Everything past `receivedAt`/`payload` is decision 17's profile, added by
+ * slice #15 and passed through whole by the probe. Each is optional for the
+ * same reason: a run recorded before the counter measured it has no value to
+ * show, and `undefined` is a different statement from `0`. The renderer never
+ * collapses the two — see {@link rangeCell} and {@link totalCell}.
+ */
 export interface HookHit {
   receivedAt: string;
   payload: unknown;
+  /**
+   * Every request header the hit arrived with, credential values already
+   * replaced by a descriptor at capture (`Bearer <redacted len=43
+   * sha256=1f3a9c2b>`). Rendered verbatim: the descriptor is the evidence that
+   * the header was present, had a plausible shape, and — because the digest is
+   * stable — carried the same value on every hit.
+   */
+  headers?: Record<string, string>;
+  toolkitCount?: number;
+  toolCount?: number;
+  versionCount?: number;
+  bodyBytes?: number;
+  /**
+   * The hook server's *own* received-to-answered time. It excludes the server's
+   * JSONL append, because the number has to be inside the line it writes, so it
+   * is neither what the hook cost the gateway nor what the client waited. The
+   * report shows it beside the client-observed time and never sums the two.
+   */
+  handlingMs?: number;
 }
 
 export interface Run {
@@ -49,6 +83,20 @@ export interface Run {
   toolsListed: number;
   gmailToolsListed: number;
   error: string | null;
+  /**
+   * How many `tools/list` requests actually went out. One `tools/list` call is
+   * not one request — the SDK client walks pagination itself — and a hook count
+   * that is high because the client fetched three pages is a different result
+   * from one that is high per request. Optional, and absent is not 1.
+   */
+  toolsListRequests?: number;
+  /** Whether any of those requests followed a `nextCursor`. */
+  cursorFollowed?: boolean;
+  /**
+   * Client-observed time spent on `tools/list`, summed over its requests.
+   * `null` when none went out; `undefined` when the run does not record it.
+   */
+  toolsListDurationMs?: number | null;
 }
 
 /** One run file: its basename (which becomes the section id) and its contents. */
@@ -103,6 +151,86 @@ function requireNullableString(
 }
 
 /**
+ * A field the run file may simply not carry.
+ *
+ * Absent is not zero. A run recorded before the probe measured `bodyBytes`
+ * has nothing to say about payload size; a run that measured it and got 0
+ * describes an empty body. Collapsing the two is the plausible-but-wrong
+ * rendering this whole report exists to avoid, so absence travels as
+ * `undefined` all the way to the cell that prints `not recorded`.
+ *
+ * A field that is *present* and the wrong type is still an error naming the
+ * file: optional means "may be missing", not "may be anything".
+ */
+function optionalNumber(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value)) fail(file, `${key} must be a number`);
+  return value;
+}
+
+/** As {@link optionalNumber}, but the probe also writes an explicit `null`. */
+function optionalNullableNumber(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): number | null | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    fail(file, `${key} must be a number or null`);
+  }
+  return value;
+}
+
+function optionalBoolean(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): boolean | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") fail(file, `${key} must be a boolean`);
+  return value;
+}
+
+/**
+ * The captured request headers: a flat name-to-value map.
+ *
+ * Values are taken exactly as the counter stored them, redaction descriptors
+ * included. The renderer adds no filter of its own — the secret never reached
+ * disk, and re-redacting the descriptor would destroy the one diagnostic it
+ * carries (the same value arrived on every hit).
+ */
+function optionalHeaders(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): Record<string, string> | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) fail(file, `${key} must be an object`);
+  const headers: Record<string, string> = {};
+  for (const [name, headerValue] of Object.entries(value)) {
+    if (typeof headerValue !== "string") fail(file, `${key}["${name}"] must be a string`);
+    headers[name] = headerValue;
+  }
+  return headers;
+}
+
+/** Drops keys whose value is `undefined`, so an absent field stays absent. */
+function defined<T extends Record<string, unknown>>(fields: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== undefined),
+  ) as Partial<T>;
+}
+
+/**
  * Parses one run file. Every deviation from the DESIGN.md schema is an error
  * naming the file: a run the report cannot read is a hole in the evidence, and
  * a hole that is skipped quietly reads exactly like a run that never happened.
@@ -135,6 +263,7 @@ export function parseRun(file: string, text: string): Run {
       method: requireString(file, entry, "method"),
       sentAt: requireString(file, entry, "sentAt"),
       hookHitsAfter: requireNumber(file, entry, "hookHitsAfter"),
+      ...defined({ durationMs: optionalNumber(file, entry, "durationMs") }),
     };
   });
 
@@ -146,6 +275,14 @@ export function parseRun(file: string, text: string): Run {
     return {
       receivedAt: requireString(file, entry, "receivedAt"),
       payload: entry["payload"],
+      ...defined({
+        headers: optionalHeaders(file, entry, "headers"),
+        toolkitCount: optionalNumber(file, entry, "toolkitCount"),
+        toolCount: optionalNumber(file, entry, "toolCount"),
+        versionCount: optionalNumber(file, entry, "versionCount"),
+        bodyBytes: optionalNumber(file, entry, "bodyBytes"),
+        handlingMs: optionalNumber(file, entry, "handlingMs"),
+      }),
     };
   });
 
@@ -161,6 +298,11 @@ export function parseRun(file: string, text: string): Run {
     toolsListed: requireNumber(file, parsed, "toolsListed"),
     gmailToolsListed: requireNumber(file, parsed, "gmailToolsListed"),
     error: requireNullableString(file, parsed, "error"),
+    ...defined({
+      toolsListRequests: optionalNumber(file, parsed, "toolsListRequests"),
+      cursorFollowed: optionalBoolean(file, parsed, "cursorFollowed"),
+      toolsListDurationMs: optionalNullableNumber(file, parsed, "toolsListDurationMs"),
+    }),
   };
 }
 
@@ -238,6 +380,176 @@ export function hitsForMethod(run: Run, method: string): number | undefined {
   return total;
 }
 
+/**
+ * A min/max over values that some of the records may not carry.
+ *
+ * `recorded` and `total` are part of the answer, not bookkeeping: a range over
+ * three of seven hits is a partial reading, and printing `10–12` without saying
+ * so would let four unmeasured hits disappear into a number that looks whole.
+ */
+export interface Range {
+  min: number;
+  max: number;
+  /** How many of the records carried the field. `0` means nothing was measured. */
+  recorded: number;
+  /** How many records were in scope, measured or not. */
+  total: number;
+}
+
+/** A sum over values some of the records may not carry. Same contract as {@link Range}. */
+export interface Total {
+  sum: number;
+  recorded: number;
+  total: number;
+}
+
+function rangeOf(values: (number | undefined)[]): Range {
+  const present = values.filter((value): value is number => value !== undefined);
+  return {
+    min: present.length === 0 ? 0 : Math.min(...present),
+    max: present.length === 0 ? 0 : Math.max(...present),
+    recorded: present.length,
+    total: values.length,
+  };
+}
+
+function totalOf(values: (number | undefined)[]): Total {
+  const present = values.filter((value): value is number => value !== undefined);
+  return {
+    sum: present.reduce((sum, value) => sum + value, 0),
+    recorded: present.length,
+    total: values.length,
+  };
+}
+
+/**
+ * The set of toolkits and tools a hook payload carried, as a comparable key.
+ *
+ * Names, not counts. "Every hit carried the same set" is a stronger statement
+ * than "every hit carried the same number", and only the second one survives a
+ * comparison of `toolCount`: two hits can both carry 51 tools and carry
+ * different ones. Versions are deliberately out — `versionCount` reports that
+ * axis, and folding it in here would report a version bump as a changed set.
+ *
+ * `null` when the payload is not shaped like the access-hook contract, which
+ * is a third answer ("cannot tell"), not a fourth set.
+ */
+export function toolSetSignature(payload: unknown): string | null {
+  if (!isRecord(payload)) return null;
+  const toolkits = payload["toolkits"];
+  if (!isRecord(toolkits)) return null;
+
+  const names: string[] = [];
+  for (const [toolkitName, toolkit] of Object.entries(toolkits)) {
+    if (!isRecord(toolkit)) return null;
+    const tools = toolkit["tools"];
+    if (!isRecord(tools)) return null;
+    const toolNames = Object.keys(tools);
+    // An empty toolkit is still part of the set: a hit that carried `Gmail`
+    // with no tools differs from one that did not carry `Gmail` at all.
+    if (toolNames.length === 0) names.push(`${toolkitName}:`);
+    for (const tool of toolNames) names.push(`${toolkitName}:${tool}`);
+  }
+  return names.sort().join("\u0000");
+}
+
+/**
+ * Whether every hit in scope carried the same toolkits and tools.
+ *
+ * `single` is its own answer because "identical across 1 hit" is not evidence
+ * of anything, and `not-comparable` is its own because a payload we cannot read
+ * must not be quietly counted as agreeing with the others.
+ */
+export type SetSameness = "none" | "single" | "identical" | "varies" | "not-comparable";
+
+export function setSameness(hits: HookHit[]): SetSameness {
+  if (hits.length === 0) return "none";
+  const signatures = hits.map((hit) => toolSetSignature(hit.payload));
+  if (signatures.some((signature) => signature === null)) return "not-comparable";
+  if (new Set(signatures).size > 1) return "varies";
+  return hits.length === 1 ? "single" : "identical";
+}
+
+/** What a group of hook hits carried, and what the hook server spent answering. */
+export interface HitProfile {
+  /** Hits in scope. */
+  hits: number;
+  toolkits: Range;
+  tools: Range;
+  versions: Range;
+  bytes: Total;
+  /** The hook server's own handling time, summed. Never added to client time. */
+  handlingMs: Total;
+  sameness: SetSameness;
+}
+
+export function profileHits(hits: HookHit[]): HitProfile {
+  return {
+    hits: hits.length,
+    toolkits: rangeOf(hits.map((hit) => hit.toolkitCount)),
+    tools: rangeOf(hits.map((hit) => hit.toolCount)),
+    versions: rangeOf(hits.map((hit) => hit.versionCount)),
+    bytes: totalOf(hits.map((hit) => hit.bodyBytes)),
+    handlingMs: totalOf(hits.map((hit) => hit.handlingMs)),
+    sameness: setSameness(hits),
+  };
+}
+
+/**
+ * How many `tools/list` requests a group of runs actually issued.
+ *
+ * `paged` is the number that changes what the hit counts *mean*: a run that
+ * issued three requests spreads its hits over three of them, so its hit count
+ * is not a per-request count. The report says which it is looking at rather
+ * than leaving the reader to divide.
+ */
+export interface ToolsListProfile {
+  /** Runs in scope. */
+  runs: number;
+  /** Runs that record the number at all. */
+  recorded: number;
+  /** Total requests across the runs that record it. */
+  requests: number;
+  min: number;
+  max: number;
+  /** Runs that issued more than one. */
+  paged: number;
+  /** Runs that followed a `nextCursor`. */
+  cursorFollowed: number;
+}
+
+export function profileToolsList(runs: Run[]): ToolsListProfile {
+  const counts = runs
+    .map((run) => run.toolsListRequests)
+    .filter((count): count is number => count !== undefined);
+  return {
+    runs: runs.length,
+    recorded: counts.length,
+    requests: counts.reduce((sum, count) => sum + count, 0),
+    min: counts.length === 0 ? 0 : Math.min(...counts),
+    max: counts.length === 0 ? 0 : Math.max(...counts),
+    paged: counts.filter((count) => count > 1).length,
+    cursorFollowed: runs.filter((run) => run.cursorFollowed === true).length,
+  };
+}
+
+/**
+ * Client-observed `tools/list` wall clock across runs.
+ *
+ * A run that recorded `null` measured nothing because nothing went out, which
+ * is a measurement: it counts as recorded and contributes 0. A run with no
+ * field at all contributes nothing and lowers `recorded`.
+ */
+export function clientToolsListMs(runs: Run[]): Total {
+  return totalOf(
+    runs.map((run) =>
+      run.toolsListDurationMs === undefined
+        ? undefined
+        : (run.toolsListDurationMs ?? 0),
+    ),
+  );
+}
+
 export interface RevisionSummary {
   revision: string;
   /** Every run for this revision, whatever its status. */
@@ -252,6 +564,21 @@ export interface RevisionSummary {
   errors: number;
   /** Distinct `gmailToolsListed` values across the ok runs, ascending. */
   gmailToolsListed: number[];
+  /** What the ok runs' hook hits carried, and what the hook server spent. */
+  hits: HitProfile;
+  /** `tools/list` requests the client actually issued across the ok runs. */
+  toolsList: ToolsListProfile;
+  /**
+   * Client-observed `tools/list` wall clock across the ok runs.
+   *
+   * Reported beside `hits.handlingMs` and never added to it: one is the hook
+   * server's own received-to-answered time (and it excludes the server's JSONL
+   * append), the other is the whole round trip the client waited on. The gap
+   * between them is tunnel, gateway, and the hook work that falls outside the
+   * hook's own measurement — which is the number a reader chasing latency is
+   * actually after.
+   */
+  clientToolsListMs: Total;
 }
 
 /**
@@ -303,6 +630,9 @@ export function summarize(loaded: LoadedRun[]): RevisionSummary[] {
       gmailToolsListed: [...new Set(ok.map((run) => run.gmailToolsListed))].sort(
         (a, b) => a - b,
       ),
+      hits: profileHits(ok.flatMap((run) => run.hookHits)),
+      toolsList: profileToolsList(ok),
+      clientToolsListMs: clientToolsListMs(ok),
     };
   });
 }
@@ -332,6 +662,39 @@ export function formatRevisionNegotiated(value: string | null): string {
 /** At most two decimals, with no trailing zeros: 2 renders as `2`, not `2.00`. */
 export function formatMean(value: number): string {
   return String(Math.round(value * 100) / 100);
+}
+
+/**
+ * Milliseconds to microsecond resolution.
+ *
+ * The hook counter keeps microseconds for a reason — a local hook answers in
+ * well under a millisecond, and rounding to an integer would print `0`, which a
+ * reader cannot tell from "not measured". Rounding here would undo that.
+ */
+export function formatMs(value: number): string {
+  return String(Math.round(value * 1000) / 1000);
+}
+
+/**
+ * How "every hit carried the same set" reads.
+ *
+ * Spelled out rather than left for the reader to infer from a min and a max
+ * that happen to match: equal counts are not an identical set, and the issue
+ * asks for the statement, not the coincidence.
+ */
+export function samenessText(sameness: SetSameness, hits: number): string {
+  switch (sameness) {
+    case "none":
+      return "no hits";
+    case "single":
+      return "1 hit only";
+    case "identical":
+      return `identical on all ${hits} hits`;
+    case "varies":
+      return `varies across ${hits} hits`;
+    case "not-comparable":
+      return "not comparable";
+  }
 }
 
 const STYLE = `
@@ -366,6 +729,16 @@ section.run { border-top: 1px solid #e2e4ec; padding-top: .5rem; margin-top: 2re
 .status-version-mismatch { background: #fdf0d5; color: #7a5200; }
 .status-error { background: #fbe3e3; color: #8a1c1c; }
 .empty { color: #8b90a0; }
+.callout {
+  margin: 1rem 0 1.25rem; padding: .7rem .9rem; border-radius: 4px;
+  border: 1px solid #d3d6e0; background: #f7f8fa; font-size: .88rem;
+}
+.callout ul { margin: .45rem 0 0; padding-left: 1.2rem; }
+.callout-warn { border-color: #e6c072; background: #fdf6e6; }
+.callout-ok { border-color: #a8dcb8; background: #f1faf3; }
+.callout-unknown { border-color: #c9ccd8; background: #f4f5f8; }
+table.hits td.headers { font-size: .72rem; line-height: 1.35; max-width: 26rem; }
+table.hits .hdr { word-break: break-all; }
 nav ol { margin: .25rem 0 0; padding-left: 1.4rem; font-size: .85rem; }
 nav a { color: #1f4fd8; }
 footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
@@ -389,6 +762,54 @@ function empty(): string {
   return `<td class="num empty">—</td>`;
 }
 
+/**
+ * The cell for a number nothing recorded.
+ *
+ * Deliberately not `0` and deliberately not the em dash the other empties use:
+ * "not recorded" is the whole point of the distinction, and a reader who sees
+ * `0` bytes or `0` ms will believe a measurement that never happened.
+ */
+function unmeasured(): string {
+  return `<td class="num empty">not recorded</td>`;
+}
+
+/** ` (3 of 7 hits)` when only some of the records carried the field. */
+function partial(recorded: number, total: number, noun: string): string {
+  return recorded === total ? "" : ` (${recorded} of ${total} ${noun})`;
+}
+
+function rangeCell(range: Range, noun: string): string {
+  if (range.recorded === 0) return unmeasured();
+  const value = range.min === range.max ? String(range.min) : `${range.min}–${range.max}`;
+  return num(`${value}${partial(range.recorded, range.total, noun)}`);
+}
+
+function totalCell(
+  total: Total,
+  noun: string,
+  format: (value: number) => string = String,
+): string {
+  if (total.recorded === 0) return unmeasured();
+  return num(`${format(total.sum)}${partial(total.recorded, total.total, noun)}`);
+}
+
+/**
+ * `tools/list` requests for a revision: the total, the per-run spread, and the
+ * word "paged" when any run issued more than one. The spread is not optional
+ * decoration — 6 requests over 6 runs and 6 over 2 are different measurements.
+ */
+function toolsListCell(profile: ToolsListProfile): string {
+  if (profile.recorded === 0) return unmeasured();
+  const spread =
+    profile.min === profile.max
+      ? `${profile.min} per run`
+      : `${profile.min}–${profile.max} per run`;
+  const paged = profile.paged > 0 ? ` — paged in ${profile.paged}` : "";
+  return num(
+    `${profile.requests} (${spread})${paged}${partial(profile.recorded, profile.runs, "runs")}`,
+  );
+}
+
 function summaryTable(summaries: RevisionSummary[]): string {
   const header = [
     ["text", "revision"],
@@ -400,6 +821,13 @@ function summaryTable(summaries: RevisionSummary[]): string {
     ["", "version-<br>mismatch"],
     ["", "error"],
     ["", "Gmail tools<br>listed"],
+    ["", "toolkits<br>per hook hit"],
+    ["", "tools<br>per hook hit"],
+    ["text", "tool set<br>across hits"],
+    ["", "bytes sent<br>to hook"],
+    ["", "tools/list<br>requests issued"],
+    ["", "hook server<br>handling (ms)"],
+    ["", "client-observed<br>tools/list (ms)"],
   ]
     .map(([cls, label]) => `<th class="${cls}">${label}</th>`)
     .join("");
@@ -418,6 +846,13 @@ function summaryTable(summaries: RevisionSummary[]): string {
         num(s.versionMismatches),
         num(s.errors),
         s.gmailToolsListed.length === 0 ? empty() : num(s.gmailToolsListed.join(", ")),
+        rangeCell(s.hits.toolkits, "hits"),
+        rangeCell(s.hits.tools, "hits"),
+        `<td class="text">${escapeHtml(samenessText(s.hits.sameness, s.hits.hits))}</td>`,
+        totalCell(s.hits.bytes, "hits"),
+        toolsListCell(s.toolsList),
+        totalCell(s.hits.handlingMs, "hits", formatMs),
+        totalCell(s.clientToolsListMs, "runs", formatMs),
         "</tr>",
       ].join("");
     })
@@ -426,6 +861,148 @@ function summaryTable(summaries: RevisionSummary[]): string {
   return [
     `<table id="summary">`,
     `<thead><tr>${header}</tr></thead>`,
+    `<tbody>\n${rows}\n</tbody>`,
+    `</table>`,
+  ].join("\n");
+}
+
+/**
+ * The `tools/list`-request banner (issue #16 criterion 4).
+ *
+ * Top of the document, not a footnote, because it changes what every hit count
+ * below it means: a run that issued three `tools/list` requests spread its hits
+ * over three of them, and a count that is high for that reason is a different
+ * result from one that is high per request. The reader must not have to derive
+ * which they are looking at, so the banner states it either way — including the
+ * case where no run records the number at all, which is a third answer and not
+ * a quiet "1".
+ */
+export function toolsListBanner(loaded: LoadedRun[]): string {
+  const paged = loaded.filter((entry) => (entry.run.toolsListRequests ?? 0) > 1);
+  const unrecorded = loaded.filter((entry) => entry.run.toolsListRequests === undefined);
+  const runs = loaded.length;
+
+  const item = (entry: LoadedRun): string => {
+    const count = entry.run.toolsListRequests ?? 0;
+    const cursor =
+      entry.run.cursorFollowed === true
+        ? ", following a cursor"
+        : entry.run.cursorFollowed === false
+          ? ", no cursor"
+          : "";
+    return (
+      `<li><a href="#${escapeHtml(entry.file)}">${escapeHtml(entry.file)}</a> — ` +
+      `${count} <code>tools/list</code> requests${cursor}</li>`
+    );
+  };
+
+  const missing =
+    unrecorded.length === 0
+      ? ""
+      : ` ${unrecorded.length} of ${runs} ` +
+        `${unrecorded.length === 1 ? "run does" : "runs do"} not record the number at all, ` +
+        `so their hit counts cannot be read as per-request either.`;
+
+  if (paged.length > 0) {
+    return [
+      `<div class="callout callout-warn" id="tools-list-requests">`,
+      `<strong>${paged.length} of ${runs} runs issued more than one <code>tools/list</code> request.</strong>`,
+      ` Their hook hits are spread across several requests, so the hit counts for those runs`,
+      ` are per <em>run</em>, not per request.${missing}`,
+      `<ul>`,
+      paged.map(item).join("\n"),
+      `</ul>`,
+      `</div>`,
+    ].join("");
+  }
+
+  if (unrecorded.length === runs) {
+    return (
+      `<div class="callout callout-unknown" id="tools-list-requests">` +
+      `<strong>No run records how many <code>tools/list</code> requests the client issued.</strong>` +
+      ` These run files predate that measurement, so a hit count here cannot be read as a` +
+      ` per-request count — it is per run, and the client may have paged.` +
+      `</div>`
+    );
+  }
+
+  return (
+    `<div class="callout callout-ok" id="tools-list-requests">` +
+    `<strong>Every run that records it issued exactly one <code>tools/list</code> request.</strong>` +
+    ` Hook hits per run are therefore hook hits per request.${missing}` +
+    `</div>`
+  );
+}
+
+/** The same fact, inside the run it belongs to. */
+function runToolsListNotice(run: Run): string {
+  const count = run.toolsListRequests;
+  if (count === undefined || count <= 1) return "";
+  const cursor = run.cursorFollowed === true ? " following a cursor" : "";
+  return (
+    `<div class="callout callout-warn">` +
+    `<strong>This run issued ${count} <code>tools/list</code> requests${cursor}.</strong>` +
+    ` Its hook hits are spread across them: the counts below are per run, not per request.` +
+    `</div>`
+  );
+}
+
+/**
+ * Captured request headers for one hit, verbatim.
+ *
+ * Credential values arrive already replaced by the counter's descriptor
+ * (`Bearer <redacted len=43 sha256=1f3a9c2b>`). The renderer adds nothing on
+ * top: the secret never reached disk, and a second pass of eliding would
+ * destroy the descriptor's one diagnostic — the same digest on every hit means
+ * the same value arrived every time. Repeated descriptors are printed in full,
+ * hit after hit, for exactly that reason.
+ */
+function headersCell(headers: Record<string, string> | undefined): string {
+  if (headers === undefined) return `<td class="text empty">not recorded</td>`;
+  const names = Object.keys(headers);
+  if (names.length === 0) return `<td class="text empty">none</td>`;
+  const lines = names
+    .map(
+      (name) =>
+        `<div class="hdr"><code>${escapeHtml(name)}</code>: ` +
+        `<code>${escapeHtml(headers[name]!)}</code></div>`,
+    )
+    .join("");
+  return `<td class="text headers">${lines}</td>`;
+}
+
+function hitNumberCell(value: number | undefined, format: (n: number) => string = String): string {
+  return value === undefined ? unmeasured() : num(format(value));
+}
+
+/**
+ * One row per hook hit: what it carried, how big it was, and what the hook
+ * server spent answering it (issue #16 criterion 3). The raw payloads still
+ * follow underneath — this table is the shape, not a replacement for the body.
+ */
+function hitTable(run: Run): string {
+  const rows = run.hookHits
+    .map((hit, index) =>
+      [
+        "<tr>",
+        num(index + 1),
+        `<td class="text">${escapeHtml(hit.receivedAt)}</td>`,
+        hitNumberCell(hit.toolkitCount),
+        hitNumberCell(hit.toolCount),
+        hitNumberCell(hit.versionCount),
+        hitNumberCell(hit.bodyBytes),
+        hitNumberCell(hit.handlingMs, formatMs),
+        headersCell(hit.headers),
+        "</tr>",
+      ].join(""),
+    )
+    .join("\n");
+
+  return [
+    `<table class="hits">`,
+    `<thead><tr><th>hit</th><th class="text">received at</th><th>toolkits</th><th>tools</th>` +
+      `<th>versions</th><th>bodyBytes</th><th>hook server<br>handling (ms)</th>` +
+      `<th class="text">captured request headers</th></tr></thead>`,
     `<tbody>\n${rows}\n</tbody>`,
     `</table>`,
   ].join("\n");
@@ -442,6 +1019,7 @@ function timelineTable(run: Run): string {
         `<td class="text">${escapeHtml(request.sentAt)}</td>`,
         num(request.hookHitsAfter),
         num(deltas[index] ?? 0),
+        request.durationMs === undefined ? unmeasured() : num(formatMs(request.durationMs)),
         "</tr>",
       ].join(""),
     )
@@ -450,14 +1028,21 @@ function timelineTable(run: Run): string {
   return [
     `<table class="timeline">`,
     `<thead><tr><th>id</th><th class="text">method</th><th class="text">sent at</th>` +
-      `<th>hookHitsAfter<br>(cumulative)</th><th>hook hits<br>(this request)</th></tr></thead>`,
+      `<th>hookHitsAfter<br>(cumulative)</th><th>hook hits<br>(this request)</th>` +
+      `<th>client-observed<br>round trip (ms)</th></tr></thead>`,
     `<tbody>\n${rows}\n</tbody>`,
     `</table>`,
   ].join("\n");
 }
 
+/** `not recorded` as a `<dd>` value, kept distinct from a measured value of 0. */
+function metaUnmeasured(): string {
+  return '<span class="empty">not recorded</span>';
+}
+
 function runSection(entry: LoadedRun): string {
   const { file, run } = entry;
+  const profile = profileHits(run.hookHits);
   const meta: [string, string][] = [
     ["revision requested", escapeHtml(run.revisionRequested)],
     ["revision negotiated", escapeHtml(formatRevisionNegotiated(run.revisionNegotiated))],
@@ -466,6 +1051,41 @@ function runSection(entry: LoadedRun): string {
     ["hook public url", escapeHtml(run.hookPublicUrl)],
     ["tools listed", escapeHtml(String(run.toolsListed))],
     ["Gmail tools listed", escapeHtml(String(run.gmailToolsListed))],
+    [
+      "tools/list requests issued",
+      run.toolsListRequests === undefined
+        ? metaUnmeasured()
+        : escapeHtml(String(run.toolsListRequests)),
+    ],
+    [
+      "cursor followed",
+      run.cursorFollowed === undefined ? metaUnmeasured() : run.cursorFollowed ? "yes" : "no",
+    ],
+    [
+      "client-observed tools/list",
+      run.toolsListDurationMs === undefined
+        ? metaUnmeasured()
+        : run.toolsListDurationMs === null
+          ? '<span class="empty">no tools/list request went out</span>'
+          : `${escapeHtml(formatMs(run.toolsListDurationMs))} ms`,
+    ],
+    [
+      "hook server handling (sum)",
+      profile.handlingMs.recorded === 0
+        ? metaUnmeasured()
+        : `${escapeHtml(formatMs(profile.handlingMs.sum))} ms` +
+          escapeHtml(partial(profile.handlingMs.recorded, profile.handlingMs.total, "hits")),
+    ],
+    [
+      "bytes sent to hook",
+      profile.bytes.recorded === 0
+        ? metaUnmeasured()
+        : escapeHtml(
+            String(profile.bytes.sum) +
+              partial(profile.bytes.recorded, profile.bytes.total, "hits"),
+          ),
+    ],
+    ["tool set across hits", escapeHtml(samenessText(profile.sameness, profile.hits))],
     ["error", run.error === null ? '<span class="empty">none</span>' : escapeHtml(run.error)],
   ];
 
@@ -483,11 +1103,15 @@ function runSection(entry: LoadedRun): string {
   return [
     `<section class="run" id="${escapeHtml(file)}">`,
     `<h3>${escapeHtml(file)}</h3>`,
+    runToolsListNotice(run),
     `<dl class="meta">`,
     ...meta.map(([term, value]) => `<dt>${term}</dt><dd>${value}</dd>`),
     `</dl>`,
     `<h4>request timeline</h4>`,
     timelineTable(run),
+    ...(run.hookHits.length === 0
+      ? []
+      : [`<h4>hook hits (${run.hookHits.length})</h4>`, hitTable(run)]),
     `<h4>raw hook payloads (${run.hookHits.length})</h4>`,
     payloads,
     `</section>`,
@@ -530,6 +1154,8 @@ ${loaded.length} run${loaded.length === 1 ? "" : "s"} from <code>${escapeHtml(op
 · generated ${escapeHtml(generatedAt)}
 </p>
 
+${toolsListBanner(loaded)}
+
 <h2>Summary by protocol revision</h2>
 ${summaryTable(summaries)}
 <p class="sub">
@@ -539,6 +1165,25 @@ counted in the version-mismatch and error columns and excluded from min/max/mean
 from the initialize total, and from the Gmail column. The initialize column is the
 total across this revision&#39;s <code>ok</code> runs; the Gmail column lists the distinct
 values those runs reported.
+</p>
+<p class="sub">
+The profile columns cover every hook hit recorded by this revision&#39;s <code>ok</code>
+runs. <em>tool set across hits</em> compares the toolkit and tool <em>names</em> each hit
+carried, not their counts: two hits can carry the same number of tools and not the same
+tools, so equal min and max is not the same statement as an identical set.
+A field no run file carries reads <em>not recorded</em> — never <code>0</code>, which
+would be a measurement.
+</p>
+<p class="sub">
+<strong>The two latency columns are separate numbers and are never summed.</strong>
+<em>hook server handling</em> is the hook counter&#39;s own received-to-answered time, and
+it excludes the counter&#39;s JSONL append — the number has to be inside the line it
+writes — so it is not what the hook cost the gateway.
+<em>client-observed tools/list</em> is the wall clock the client waited on its
+<code>tools/list</code> requests, hook round trips included because they are on the
+request path. The gap between the two is the tunnel, the gateway, and the hook work
+that falls outside the hook&#39;s own measurement; that gap is what a reader chasing
+latency is after, and one blended figure would hide it.
 </p>
 
 <h2>Runs</h2>

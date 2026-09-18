@@ -42,15 +42,16 @@ probe ──MCP over Streamable HTTP──▶ Arcade gateway ──POST /access�
   toolkit, allow everything else — zero Gmail tools in a `tools/list` result is
   how you know the hook was consulted at all.
 - **Report** (`bun run report`) reads `results/*.json` and writes a
-  self-contained `results/report.html`: requests sent versus hook hits, per
-  revision and per run, with the raw hook payloads attached. `--in <dir>` and
-  `--out <file>` point it elsewhere. Hook hits for a method are the difference
-  between consecutive `hookHitsAfter` snapshots, and runs whose status is not
-  `ok` are counted in the version-mismatch and error columns but kept out of
-  min/max/mean. With no run files to read it exits non-zero with
-  `no run files in <dir>` rather than writing an empty report. Nothing in the
-  HTML is fetched over the network, so it opens from a directory with no
-  connection; PDF is the browser's print dialog.
+  self-contained `results/report.html`: requests sent versus hook hits, what
+  each hit carried and what it cost, per revision and per run, with the raw
+  hook payloads attached. `--in <dir>` and `--out <file>` point it elsewhere.
+  Hook hits for a method are the difference between consecutive
+  `hookHitsAfter` snapshots, and runs whose status is not `ok` are counted in
+  the version-mismatch and error columns but kept out of min/max/mean. With no
+  run files to read it exits non-zero with `no run files in <dir>` rather than
+  writing an empty report. Nothing in the HTML is fetched over the network, so
+  it opens from a directory with no connection; PDF is the browser's print
+  dialog. See **The report** below.
 
 The gateway is remote and the hook counter is local, so Arcade's cloud has to
 reach your machine over a tunnel (ngrok or similar). Registering that tunnel URL
@@ -249,6 +250,62 @@ const hook = startHookServer({ port: 0, token, logPath: "/tmp/run/hook-log.jsonl
 await hook.close();
 ```
 
+## The report
+
+`bun run report` turns the run files into one HTML page. The summary table has
+a row per protocol revision; the run sections below it have the request
+timeline, a row per hook hit, and the raw payloads.
+
+| Summary column | What it says |
+| -------------- | ------------ |
+| min / max / mean hits on `tools/list` | Hook hits attributed to `tools/list`, as the difference between consecutive `hookHitsAfter` snapshots |
+| hits on `initialize` | The same attribution for the handshake |
+| toolkits / tools per hook hit | `toolkitCount` and `toolCount` across the revision's hits: one number when every hit agreed, `1–3` when they did not |
+| tool set across hits | Whether every hit carried the *same* toolkit and tool **names**, said outright — equal counts are not an identical set |
+| bytes sent to hook | Total `bodyBytes` over those hits |
+| `tools/list` requests issued | How many requests actually went out, and the spread per run |
+| hook server handling (ms) | The hook counter's own received-to-answered time, summed |
+| client-observed `tools/list` (ms) | The wall clock the client waited on its `tools/list` requests, summed |
+
+### The two latency numbers are never summed
+
+`hook server handling` is the counter's *own* time, and it excludes the
+counter's JSONL append, because the number has to be inside the line it writes.
+It is therefore neither what the hook cost the gateway nor what the client
+waited for. `client-observed tools/list` is the whole round trip, hook calls
+included because they sit on the request path.
+
+The gap between the two is the interesting number: the tunnel, the gateway, and
+the hook work that falls outside the hook's own measurement. One blended figure
+would hide where the time went, so the report prints both and adds them
+nowhere.
+
+### Paging is stated, not left to be derived
+
+A hook count that is high because the client fetched three pages is a different
+result from one that is high per request. The top of the report says which it
+is looking at before the summary table — naming the runs that issued more than
+one `tools/list` request, or saying plainly that every run issued exactly one —
+and each such run repeats it in its own section.
+
+### Absent is not zero
+
+A run file written before the probe and the counter measured any of this
+carries none of these fields, and those cells read `not recorded` rather than
+`0`: a zero here would be a measurement, from a run that never made one. When
+only some of a revision's runs carry a field, the cell says so —
+`612 (3 of 6 hits)`.
+
+### Per-hit detail
+
+Each run section lists its hits: `receivedAt`, toolkit/tool/version counts,
+`bodyBytes`, the hook server's `handlingMs`, and every captured request header.
+Credential headers arrive already redacted by the counter and are printed
+exactly as stored, on every hit — a repeated `Bearer <redacted len=43
+sha256=1f3a9c2b>` is the evidence that the same value arrived every time, so
+nothing is collapsed into "same as above". The raw payload still follows as
+pretty-printed JSON.
+
 ## The offline fake gateway
 
 `bun test` must be green without network access, so the tests run the probe
@@ -298,6 +355,9 @@ behaviour change, and slice #4 made `bun run probe` real: it is the measurement
 this repo exists for, and every command in the quickstart now does something,
 except `--protocol 2026-07-28`, which is deferred. `bun test` is real and must
 stay green without network access.
+
+Slice #16 extended the report to decision 17's profile: payload shape and size,
+`tools/list` requests actually issued, and the two latency numbers side by side.
 
 What has not happened yet is the part no test can stand in for: a run against
 the real Arcade gateway, with the hook counter behind a tunnel. Until then the

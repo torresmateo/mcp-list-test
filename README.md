@@ -21,10 +21,10 @@ probe ──MCP over Streamable HTTP──▶ Arcade gateway ──POST /access�
 ```
 
 - **Probe** (`bun run probe`) opens a fresh MCP session per repetition against
-  the gateway with the official `@modelcontextprotocol/sdk`, sends `initialize`
-  then one `tools/list`, and after each request polls the hook counter for hits
-  keyed by that repetition's generated user id. One JSON file per run lands in
-  `results/`.
+  the gateway with the official v2 MCP SDK (`@modelcontextprotocol/client`),
+  sends `initialize` then one `tools/list`, and after each request polls the
+  hook counter for hits keyed by that repetition's generated user id. One JSON
+  file per run lands in `results/`.
 - **Hook counter** (`bun run hook-server`) is the local HTTP server the gateway
   calls. It implements Arcade's access-hook contract at `POST /access` on
   `$PORT_WEB`, verifies a bearer token, counts every hit by `user_id`, appends
@@ -126,7 +126,7 @@ await hook.close();
 
 `bun test` must be green without network access, so the tests run the probe
 against a fake Arcade gateway instead of the real one. It is a Streamable HTTP
-MCP server (`@modelcontextprotocol/sdk`) that imitates the single behaviour
+MCP server (`@modelcontextprotocol/server`) that imitates the single behaviour
 under measurement: it calls the hook counter a configured number of times per
 MCP method, forwarding the caller's user id, and lists only the tools the
 hook's answer left standing.

@@ -73,14 +73,6 @@ export interface OutboundRequest {
   responseObserved: boolean;
   /** Cumulative hook hits for this user id after this request; `null` until snapshotted. */
   hookHitsAfter: number | null;
-  /**
-   * `performance.now()` at send and at reply — the same monotonic clock
-   * `durationMs` comes from, so a span across several requests can be computed
-   * without the millisecond rounding the ISO strings carry. Not part of the run
-   * JSON; `sentAt` and `finishedAt` are what a reader gets.
-   */
-  readonly startedAtHiRes: number;
-  finishedAtHiRes: number;
 }
 
 export interface RequestLogOptions {
@@ -288,21 +280,17 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         authorizationScheme: scheme,
         responseObserved: false,
         hookHitsAfter: null,
-        startedAtHiRes: startedAt,
-        finishedAtHiRes: startedAt,
       };
       entries.push(entry);
       return entry;
     });
 
     const settle = (observed: boolean): void => {
-      const now = performance.now();
-      const durationMs = Math.round((now - startedAt) * 1000) / 1000;
+      const durationMs = Math.round((performance.now() - startedAt) * 1000) / 1000;
       const finishedAt = new Date().toISOString();
       for (const entry of recorded) {
         entry.durationMs = durationMs;
         entry.finishedAt = finishedAt;
-        entry.finishedAtHiRes = now;
         entry.responseObserved = observed;
       }
     };

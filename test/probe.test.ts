@@ -431,6 +431,15 @@ describe("pagination", () => {
     // The aggregate is still one Slack tool: paging did not change the answer.
     expect(run.toolsListed).toBe(1);
     expect(run.gmailToolsListed).toBe(0);
+
+    // The reported tools/list time is the three round trips and nothing else.
+    // A first-sent-to-last-replied span would have swallowed the two 200 ms
+    // quiescence windows the probe itself waits between pages and reported
+    // them as the gateway's latency.
+    const listRequests = (run.requests as Loose[]).filter(r => r.method === "tools/list");
+    const sum = listRequests.reduce((total, r) => total + (r.durationMs as number), 0);
+    expect(run.toolsListDurationMs).toBeCloseTo(sum, 3);
+    expect(run.toolsListDurationMs).toBeLessThan(400);
   }, SPAWN_TIMEOUT_MS);
 
   test("an unpaged tools/list says so as a number, not as an absence", async () => {
@@ -473,8 +482,10 @@ describe("timing", () => {
       expect(request.durationMs).toBeLessThan(200);
       expect(request.responseObserved).toBe(true);
     }
+    // The tools/list total is the sum of the round trips, so it never picks up
+    // the quiescence window the probe waits out between pages.
     const list = (run.requests as Loose[]).filter(request => request.method === "tools/list");
-    expect(run.toolsListDurationMs).toBeGreaterThanOrEqual(list[0]!.durationMs);
+    expect(run.toolsListDurationMs).toBe(list[0]!.durationMs);
     expect(Date.parse(run.finishedAt)).toBeGreaterThanOrEqual(Date.parse(run.startedAt));
   }, SPAWN_TIMEOUT_MS);
 });
@@ -496,11 +507,14 @@ describe("a failure is never a zero", () => {
     expect(run.status).toBe("error");
     expect(run.error).toContain("hook counter unreachable");
     expect(run.revisionNegotiated).toBe(REVISION);
-    // The gateway really did call the hook; the probe simply could not read
-    // the counter. Reporting 0 here would have been the whole project's
-    // headline failure: a zero that means broken, read as a zero that means
-    // the hook never fired.
+    // The error names the counter and the URL it could not read, so the empty
+    // `hookHits` cannot be mistaken for "the hook never fired" — which is the
+    // whole project's headline failure. It stops at the first snapshot it
+    // cannot take, which is why `tools/list` never went out at all.
+    expect(run.error).toContain("/hits?user_id=");
     expect(run.hookHits).toEqual([]);
+    expect(run.toolsListRequests).toBe(0);
+    expect(fake.hookCalls).toEqual([]);
   }, SPAWN_TIMEOUT_MS);
 
   test("an unreachable gateway is an error run with revisionNegotiated null", async () => {

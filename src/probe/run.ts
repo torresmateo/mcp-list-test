@@ -76,7 +76,15 @@ export interface Run {
   toolsListRequests: number;
   /** Whether any of them followed a `nextCursor`. */
   cursorFollowed: boolean;
-  /** First `tools/list` sent to last `tools/list` complete; `null` if none went out. */
+  /**
+   * Client-observed time spent on `tools/list` requests: the sum of their
+   * round trips, hook round trips included because they are on the path.
+   * `null` when none went out.
+   *
+   * A sum rather than first-sent-to-last-replied. When the list pages, the
+   * probe's own quiescence window sits between the pages, and a span would
+   * report that wait as if the gateway had spent it.
+   */
   toolsListDurationMs: number | null;
   /** `legacy` or `modern` (DESIGN.md decision 15); `null` when no session was opened. */
   protocolEra: string | null;
@@ -219,8 +227,6 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
   }
 
   const toolsList = log.entries.filter(entry => entry.method === "tools/list");
-  const first = toolsList[0];
-  const last = toolsList.at(-1);
 
   return {
     schema: SCHEMA_VERSION,
@@ -236,13 +242,10 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
     error,
     toolsListRequests: toolsList.length,
     cursorFollowed: toolsList.some(entry => entry.cursor !== undefined),
-    // Measured on the monotonic clock the per-request durations come from, so
-    // a one-page list reports exactly its request's duration rather than a
-    // value a millisecond of ISO rounding below it.
     toolsListDurationMs:
-      first === undefined || last === undefined
+      toolsList.length === 0
         ? null
-        : Math.round((last.finishedAtHiRes - first.startedAtHiRes) * 1000) / 1000,
+        : Math.round(toolsList.reduce((total, entry) => total + entry.durationMs, 0) * 1000) / 1000,
     protocolEra,
     startedAt: startedAt.toISOString(),
     finishedAt: new Date().toISOString(),

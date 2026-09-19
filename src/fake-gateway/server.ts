@@ -50,6 +50,20 @@ export const DEFAULT_TOOLS = ["Gmail_SendEmail", "Gmail_ListEmails", "Slack_Post
 /** Every tool the catalogue reports carries a version, as Arcade's payload does. */
 const TOOL_VERSION = "1.0.0";
 
+/**
+ * A top-level field on each listed tool that the MCP spec does not name.
+ *
+ * **Not a claim that Arcade sends this field**, or any field — the name is
+ * obviously this fake's. It is here because the v2 *client* parses a
+ * `tools/list` result against the spec schema and silently drops every
+ * top-level key the spec does not name, so a probe that recorded
+ * `client.listTools()` would record a trimmed shape and nothing would say so.
+ * A gateway that sends something non-spec is the only way to prove the probe
+ * records the wire; what a real gateway actually sends is then whatever it
+ * sends, and it survives.
+ */
+const NON_SPEC_TOOL_FIELD = "fakeGatewayExtension";
+
 export interface StartFakeGatewayOptions {
   /** Listen port. `0` (the default) binds an ephemeral port. */
   port?: number;
@@ -78,6 +92,23 @@ export interface StartFakeGatewayOptions {
   protocolVersion?: string;
   /** Tool names, `Toolkit_Tool`. Defaults to {@link DEFAULT_TOOLS}. */
   tools?: readonly string[];
+  /**
+   * The tools this gateway submits to the access hook. Defaults to `tools` —
+   * every tool it can list, which is what a gateway that consults access
+   * control about its whole catalogue does.
+   *
+   * It is configurable because the live run of 2026-09-19 showed a gateway that
+   * does not: it listed 42 tools while offering the hook 40, so two tools were
+   * never submitted to access control and no policy could have denied them
+   * (DESIGN.md decision 18). A fake that could only ever offer its whole
+   * catalogue would leave that shape — the one `toolsNotOfferedToHook` exists
+   * to name — untestable.
+   *
+   * Tools left out are still listed: the decision is applied against the whole
+   * catalogue, so a tool the hook never heard about survives every `deny`.
+   * That is precisely the finding.
+   */
+  toolsOfferedToHook?: readonly string[];
   /**
    * Tools per `tools/list` page. Omit (the default) to answer in one page with
    * no `nextCursor`, which is what every existing caller gets.
@@ -244,6 +275,8 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
   const callsPerInitialize = options.hookCallsPerInitialize ?? 0;
   const tools = [...(options.tools ?? DEFAULT_TOOLS)];
   for (const name of tools) splitToolName(name); // fail at startup, not mid-request
+  const offeredToHook = [...(options.toolsOfferedToHook ?? tools)];
+  for (const name of offeredToHook) splitToolName(name);
   if (!Number.isInteger(callsPerList) || callsPerList < 0) {
     throw new Error("fake-gateway: hookCallsPerList must be a non-negative integer");
   }
@@ -286,7 +319,7 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
             authorization: `Bearer ${hookToken}`,
             "content-type": "application/json",
           },
-          body: JSON.stringify(accessPayload(userId, tools)),
+          body: JSON.stringify(accessPayload(userId, offeredToHook)),
         });
         record.status = response.status;
         const body: unknown = response.ok ? await response.json().catch(() => undefined) : undefined;
@@ -366,6 +399,7 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
             name,
             description: `${name} (fake)`,
             inputSchema: { type: "object" as const, properties: {} },
+            [NON_SPEC_TOOL_FIELD]: "not named by the MCP spec",
           })),
         ...(end < tools.length ? { nextCursor: String(end) } : {}),
       };

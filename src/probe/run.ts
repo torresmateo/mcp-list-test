@@ -21,10 +21,23 @@
  * `hookHits[]` is stored exactly as `GET /hits` returned it. Slice #15 is
  * extending what the counter records per hit; passing it through means this
  * slice does not get to decide what is interesting.
+ *
+ * `toolsListResult` is the other half of that pair (DESIGN.md decision 18):
+ * `hookHits` is what the gateway told the hook, `toolsListResult` is what the
+ * same gateway told the client in the same session. The live run of 2026-09-19
+ * listed 42 tools while offering the hook 40, and the instrument could report
+ * that the gap was *2* but not *which two* — this project's own "an absence is
+ * not evidence; an excerpt, not a count" rule turned against itself. Recording
+ * the result makes `toolsNotOfferedToHook` something a reader can recompute
+ * rather than something the run asserts.
  */
 import type { Client } from "@modelcontextprotocol/client";
 import { ARCADE_USER_ID_HEADER } from "../client/headers.ts";
-import { createRequestLog, type OutboundRequest } from "../client/request-log.ts";
+import {
+  createRequestLog,
+  type ListedTool,
+  type OutboundRequest,
+} from "../client/request-log.ts";
 import { openSession, RevisionMismatchError } from "../client/session.ts";
 import { type HitsClient, type HookHit } from "./hits.ts";
 
@@ -57,6 +70,9 @@ export interface RunRequest {
   hookHitsAfter: number;
 }
 
+/** Re-exported: the run JSON's `toolsListResult` entries are the wire entries. */
+export type { ListedTool };
+
 /** DESIGN.md Contracts -> Run JSON, with the decision 17 additions. */
 export interface Run {
   schema: number;
@@ -70,6 +86,38 @@ export interface Run {
   hookHits: HookHit[];
   toolsListed: number;
   gmailToolsListed: number;
+  /**
+   * The `tools/list` result as the gateway returned it, whole — no truncation,
+   * no sampling, no re-derived shape (DESIGN.md decision 18). When the list
+   * paged this is the concatenation the client assembled, page by page, in the
+   * order the replies arrived.
+   *
+   * Read off the wire rather than from `client.listTools()`, because the two
+   * are not the same list: the v2 client parses the result against the spec
+   * schema and drops every top-level field the spec does not name, so an Arcade
+   * tool carrying a vendor field would arrive here without it and nothing would
+   * say so. See `src/client/request-log.ts`.
+   *
+   * `null`, not `[]`, when no `tools/list` result was ever assembled — the run
+   * died first, or never got that far. `[]` is reserved for the real
+   * measurement "the gateway returned an empty list", which is what a hook that
+   * denied everything produces and is a different statement. Same reasoning as
+   * `toolsListDurationMs` above.
+   */
+  toolsListResult: ListedTool[] | null;
+  /**
+   * Tool names in `toolsListResult` that appear in **no** hook payload: the
+   * tools this gateway listed without ever submitting them to access control,
+   * so no policy could have denied them. Deduplicated and sorted, so two runs
+   * of the same gateway are diffable.
+   *
+   * `null` — never `[]` — when there is nothing to derive it from: no hook hits,
+   * or no `tools/list` result. A run that observed no hook hits says *nothing*
+   * about what was offered, and `[]` would read as "nothing bypassed the hook",
+   * which is a false statement dressed as a measurement. See
+   * {@link deriveToolsNotOfferedToHook}.
+   */
+  toolsNotOfferedToHook: string[] | null;
   /** `null` when `status` is `ok`; a plain string otherwise. Never an object. */
   error: string | null;
   /** How many `tools/list` requests actually went out. Not derived by the reader. */
@@ -138,6 +186,125 @@ export function isGmailTool(name: string): boolean {
   return /^gmail[._-]/i.test(name);
 }
 
+/**
+ * The matching rule between the two sides, stated once (DESIGN.md decision 18).
+ *
+ * The MCP side names a tool in one string, `Toolkit_Tool`. The hook side names
+ * the same tool in two, `toolkits: { <Toolkit>: { tools: { <Tool>: [...] } } }`.
+ * Comparing them therefore means reassembling a name, and **the separator is the
+ * whole risk**: if the assumption is wrong, nothing matches at all and the run
+ * reports that every listed tool bypassed the hook — a dramatic finding that is
+ * entirely an artefact of the join. So the key drops the separator instead of
+ * guessing it: `Gmail_SendEmail`, `Gmail.SendEmail` and `gmail-sendemail` all
+ * reduce to `gmailsendemail`. Same reasoning as {@link isGmailTool}, which
+ * matches the separator loosely for the same reason.
+ *
+ * Dropping the separator entirely rather than accepting a set of them is
+ * deliberate: a gateway that spelled the join with a character we did not think
+ * of would otherwise reproduce exactly the failure above.
+ */
+function toolMatchKey(name: string): string {
+  return name.replace(/[\s._\-]/g, "").toLowerCase();
+}
+
+/**
+ * Every tool name a hook payload named, as match keys.
+ *
+ * One key per `(toolkit, tool)` pair, chosen by a single rule: the reassembled
+ * `Toolkit` + `Tool` — the contract's shape, and the one Arcade sends — unless
+ * the tool name **already begins with the toolkit name**, in which case it is
+ * taken as already qualified and used as it stands. Without that exception a
+ * payload carrying `tools: { Gmail_SendEmail: [...] }` under toolkit `Gmail`
+ * would reassemble to `gmailgmailsendemail` and match nothing.
+ *
+ * The exception is a condition, not a wildcard: a bare `Ping` under toolkit `A`
+ * is only ever the key `aping`, so a listed `B_Ping` still counts as not
+ * offered rather than being silently matched to another toolkit's tool.
+ *
+ * Anything not shaped like the contract contributes nothing rather than
+ * throwing — the same rule the hook counter's own `profilePayload` follows. A
+ * malformed payload is evidence too, and it is visible in `hookHits`.
+ */
+function offeredToolKeys(hookHits: readonly HookHit[]): Set<string> {
+  const keys = new Set<string>();
+  for (const hit of hookHits) {
+    const payload = hit["payload"];
+    if (!isPlainObject(payload)) continue;
+    const toolkits = payload["toolkits"];
+    if (!isPlainObject(toolkits)) continue;
+    for (const [toolkit, info] of Object.entries(toolkits)) {
+      if (!isPlainObject(info)) continue;
+      const tools = info["tools"];
+      if (!isPlainObject(tools)) continue;
+      for (const tool of Object.keys(tools)) {
+        const toolkitKey = toolMatchKey(toolkit);
+        const toolKey = toolMatchKey(tool);
+        keys.add(toolKey.startsWith(toolkitKey) ? toolKey : `${toolkitKey}${toolKey}`);
+      }
+    }
+  }
+  return keys;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The tools a gateway listed but never submitted to access control.
+ *
+ * `null` — never `[]` — when the run has nothing to derive the answer from:
+ * no hook hits, or no `tools/list` result. That is criterion 3 of issue #26 and
+ * the reason this function exists as its own testable unit: `[]` would read as
+ * "nothing bypassed the hook", a confident statement produced by a run that in
+ * fact observed nothing. An absence is not evidence.
+ *
+ * `[]` therefore means one specific thing — the run *did* see hook payloads and
+ * every listed tool was in them.
+ */
+export function deriveToolsNotOfferedToHook(
+  listed: readonly ListedTool[] | null,
+  hookHits: readonly HookHit[],
+): string[] | null {
+  if (listed === null || hookHits.length === 0) return null;
+  const offered = offeredToolKeys(hookHits);
+  const missing = listedNames(listed).filter(name => !offered.has(toolMatchKey(name)));
+  return [...new Set(missing)].sort();
+}
+
+/**
+ * The names in a listed set.
+ *
+ * An entry that arrived without a string `name` is not a tool this can match on
+ * and is left out of the derived set rather than named as "not offered" — the
+ * entry itself is still in `toolsListResult`, which is where a reader sees it.
+ * The protocol says `name` is required, so this is defence against a gateway
+ * that broke it, not an expected case.
+ */
+function listedNames(listed: readonly ListedTool[]): string[] {
+  return listed.map(tool => tool.name).filter(name => typeof name === "string");
+}
+
+/**
+ * True when the hook was offered tools, the gateway listed tools, and *not one*
+ * of them matched — the shape {@link toolMatchKey} exists to guard against.
+ *
+ * It is a real possible finding, so it is not an error; but it is far more
+ * likely to be a broken join than a gateway that shares nothing between the two
+ * sides, and the probe says so out loud rather than printing "42 tools bypassed
+ * the hook" as if it were a discovery. Derived from the run's own fields, so a
+ * reader of the JSON can reach the same conclusion without this function.
+ */
+export function everyListedToolUnmatched(run: Run): boolean {
+  return (
+    run.toolsListResult !== null &&
+    listedNames(run.toolsListResult).length > 0 &&
+    run.toolsNotOfferedToHook !== null &&
+    run.toolsNotOfferedToHook.length === new Set(listedNames(run.toolsListResult)).size &&
+    offeredToolKeys(run.hookHits).size > 0
+  );
+}
+
 /** The report's `id` must be a number; the wire id is kept alongside it regardless. */
 function toRunRequest(entry: OutboundRequest): RunRequest {
   return {
@@ -185,6 +352,9 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
   let protocolEra: string | null = null;
   let toolsListed = 0;
   let gmailToolsListed = 0;
+  // `null` until a result actually comes back: "the gateway returned no tools"
+  // and "we never got a result" must not collapse into the same value.
+  let toolsListResult: ListedTool[] | null = null;
 
   let session: Awaited<ReturnType<typeof openSession>> | undefined;
   try {
@@ -206,8 +376,16 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
 
     const listed = await listTools(session.client);
     await log.flush();
+    // `toolsListed` and `gmailToolsListed` keep their meaning and their source:
+    // the tools the *client* ended up with, which is what every existing run
+    // file and every existing test means by them.
     toolsListed = listed.length;
     gmailToolsListed = listed.filter(isGmailTool).length;
+    // The recorded result is the wire's, not the client's, and it is recorded
+    // whole (DESIGN.md decision 18): the live gateway lists 12-42 tools,
+    // negligible beside the 1.6 MB catalogue payloads a run already carries per
+    // hook hit, so there is nothing to truncate or sample for.
+    toolsListResult = [...log.listedTools];
 
     // A request that went out without the user header makes every hook hit
     // unattributable, and the counter would answer 0 for a user id the gateway
@@ -260,6 +438,8 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
     hookHits,
     toolsListed,
     gmailToolsListed,
+    toolsListResult,
+    toolsNotOfferedToHook: deriveToolsNotOfferedToHook(toolsListResult, hookHits),
     error,
     toolsListRequests: toolsList.length,
     cursorFollowed: toolsList.some(entry => entry.cursor !== undefined),

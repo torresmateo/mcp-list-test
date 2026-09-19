@@ -8,7 +8,7 @@
  * up would report "one list call" where three requests went out, and a reader
  * would have no way to tell.
  *
- * Three things it records that a naive wrapper would not:
+ * Four things it records that a naive wrapper would not:
  *
  *  - **Completion, not just dispatch.** `fetch` resolves when the response
  *    *headers* arrive, which on a Streamable HTTP SSE response is before the
@@ -21,6 +21,16 @@
  *  - **The negotiated protocol version, off the wire.** The `initialize`
  *    result carries it. Reading it here means the probe does not depend on how
  *    the client reports — or rejects — a revision it does not implement.
+ *  - **The `tools/list` result, as the gateway sent it.** DESIGN.md decision 18
+ *    wants the MCP side of the session recorded, not only a count of it, and
+ *    "as the gateway returned it" has to mean the wire. The v2 client parses a
+ *    result against the spec schema and **drops every top-level field the spec
+ *    does not name**: a tool sent as
+ *    `{ name, description, inputSchema, arcadeToolkit }` reaches the caller
+ *    without `arcadeToolkit`, silently. Reading the entries here, off the same
+ *    frames the reply is observed in, is the only way the recorded result is
+ *    the gateway's and not the SDK's idea of it — and a vendor field is exactly
+ *    what the engine team would want to see.
  *  - **Which identity headers went out.** Header names and the user id only,
  *    never the API key. An absent `Arcade-User-Id` makes the gateway file its
  *    hook hits under a key nobody polls, and the probe would print a clean,
@@ -43,6 +53,24 @@ import { readArcadeUserId } from "./headers.ts";
 
 /** A JSON-RPC id as it appears on the wire. */
 export type JsonRpcId = string | number;
+
+/**
+ * One entry of a `tools/list` result, exactly as it arrived on the wire.
+ *
+ * The index signature is the courier rule this project applies to every
+ * recorded payload: `name` is the only field anything here reads, and whatever
+ * else the gateway chose to send travels through untouched. Naming the rest
+ * would start trimming the evidence, which is the failure mode that made this
+ * capture necessary in the first place.
+ *
+ * `name` is typed as a string because that is what the protocol says; an entry
+ * that arrived without one is still recorded, so readers that match on names
+ * check the type rather than assume it.
+ */
+export interface ListedTool {
+  name: string;
+  [field: string]: unknown;
+}
 
 /** One outbound JSON-RPC request, with everything observed about it. */
 export interface OutboundRequest {
@@ -95,6 +123,13 @@ export interface RequestLog {
    * `undefined` until one has been seen.
    */
   readonly negotiatedProtocolVersion: string | undefined;
+  /**
+   * Every `result.tools` entry seen in a reply to one of this session's own
+   * requests, concatenated in the order the replies arrived — so a paged
+   * `tools/list` reads as one list, page by page, exactly as the client
+   * assembled it.
+   */
+  readonly listedTools: readonly ListedTool[];
   /** The wrapping fetch to hand to the transport. */
   fetch: (url: string | URL, init?: RequestInit) => Promise<Response>;
   /**
@@ -159,6 +194,18 @@ function protocolVersionIn(message: unknown): string | undefined {
   return typeof version === "string" ? version : undefined;
 }
 
+/** `result.tools` if this JSON-RPC message carries one, raw and unparsed. */
+function listedToolsIn(message: unknown): ListedTool[] | undefined {
+  if (message === null || typeof message !== "object") return undefined;
+  const result = (message as Record<string, unknown>)["result"];
+  if (result === null || typeof result !== "object") return undefined;
+  const tools = (result as Record<string, unknown>)["tools"];
+  // Every element is kept, malformed ones included. Dropping an entry that did
+  // not look right would be the trimming this capture exists to avoid, and an
+  // entry the gateway sent is evidence whatever shape it is in.
+  return Array.isArray(tools) ? (tools as ListedTool[]) : undefined;
+}
+
 function idOf(message: unknown): JsonRpcId | undefined {
   if (message === null || typeof message !== "object") return undefined;
   const id = (message as Record<string, unknown>)["id"];
@@ -175,6 +222,7 @@ interface PendingCall {
 /** Creates the request log and the fetch that feeds it. */
 export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
   const entries: OutboundRequest[] = [];
+  const listedTools: ListedTool[] = [];
   const baseFetch = options.fetchImpl ?? globalThis.fetch;
   let negotiated: string | undefined;
   let pending: PendingCall | undefined;
@@ -214,7 +262,12 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         const version = protocolVersionIn(message);
         if (version !== undefined) negotiated = version;
         const id = idOf(message);
-        if (!replied && id !== undefined && wanted.has(id)) {
+        if (id === undefined || !wanted.has(id)) continue;
+        // Only replies to requests this session sent. A frame that belongs to
+        // someone else's request is not this run's tool list.
+        const tools = listedToolsIn(message);
+        if (tools !== undefined) listedTools.push(...tools);
+        if (!replied) {
           replied = true;
           onReply(true);
         }
@@ -328,6 +381,7 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
 
   return {
     entries,
+    listedTools,
     get negotiatedProtocolVersion() {
       return negotiated;
     },

@@ -27,7 +27,7 @@ import {
 } from "./env.ts";
 import { assertRequestableRevision, UnsupportedRevisionError } from "./client/session.ts";
 import { HitsClient, HitsError } from "./probe/hits.ts";
-import { runRepetition, type Run } from "./probe/run.ts";
+import { everyListedToolUnmatched, runRepetition, type Run } from "./probe/run.ts";
 
 export interface ProbeArgs {
   revision: string;
@@ -139,8 +139,38 @@ function summarise(run: Run): string {
     `    ${"method".padEnd(14)} ${"hits".padStart(5)}  duration`,
     ...rows,
     `    tools/list: ${pages}; ${run.toolsListed} tools listed, ${run.gmailToolsListed} Gmail`,
+    `    not offered to the hook: ${bypassed(run)}`,
+    // A run where *nothing* matched is far more likely to be a broken join
+    // between `Toolkit_Tool` and the hook's two-part naming than a gateway
+    // that shares nothing between the two sides. Printing the count alone
+    // would read as a discovery; this says what to check first.
+    ...(everyListedToolUnmatched(run)
+      ? [
+          `    !! no listed tool matched any hook payload tool. Before reading this as`,
+          `       ${run.toolsListed} tools bypassing the hook, check the name join: the MCP side`,
+          `       names a tool Toolkit_Tool, the hook payload names toolkit and tool apart.`,
+        ]
+      : []),
     ...(run.error === null ? [] : [`    error: ${run.error}`]),
   ].join("\n");
+}
+
+/**
+ * The `toolsNotOfferedToHook` line.
+ *
+ * `null` is spelled out rather than printed as an empty list, for the same
+ * reason the field is `null` in the JSON: a run with no hook hits says nothing
+ * about what was offered, and "none" would read as a clean bill of health.
+ */
+function bypassed(run: Run): string {
+  if (run.toolsNotOfferedToHook === null) {
+    return run.toolsListResult === null
+      ? "not measured (no tools/list result)"
+      : "not measured (no hook hits to compare against)";
+  }
+  return run.toolsNotOfferedToHook.length === 0
+    ? "none; every listed tool was in a hook payload"
+    : run.toolsNotOfferedToHook.join(", ");
 }
 
 export async function main(argv: string[]): Promise<number> {

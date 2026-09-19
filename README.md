@@ -164,6 +164,7 @@ results/20260918T203958539Z-2025-11-25-1.json
     initialize         0  13.0 ms
     tools/list         3  6.6 ms
     tools/list: 1 request, no cursor; 1 tools listed, 0 Gmail
+    not offered to the hook: none; every listed tool was in a hook payload
 ```
 
 | Flag                 | Default      | Meaning                                                      |
@@ -187,6 +188,30 @@ That matters in two places a count alone would mislead you:
   that filters a tool list has to answer before the list can come back, so its
   round trip is on the critical path; `durationMs` per request is where the
   cost of that shows up against the hook server's own handling time.
+- **The tool list is recorded, not just counted.** `toolsListResult` is the
+  `tools/list` result as the gateway put it on the wire — whole, in order,
+  across every page, and including fields the MCP spec does not name, which the
+  SDK's own parse would have dropped on the way to the caller. It sits beside
+  `hookHits`, which is what the same gateway told the hook in the same session,
+  so the two sides of the comparison are both in the file and a reader can
+  derive the difference instead of taking a count on trust
+  (`DESIGN.md` decision 18).
+
+`toolsNotOfferedToHook` is that difference, named: the tools the gateway listed
+that appear in **no** hook payload, sorted. No policy can deny a tool that was
+never submitted to access control, and the live run of 2026-09-19 found two of
+them among 42 — a gap the instrument could count but not name. It is **`null`,
+never `[]`**, when the run has nothing to derive it from: no hook hits, or no
+`tools/list` result. An empty array would read as "nothing bypassed the hook",
+which is a false statement dressed as a measurement.
+
+Matching the two sides means reassembling a name: MCP names a tool
+`Toolkit_Tool` in one string, the hook payload names toolkit and tool apart. The
+comparison drops separators and case rather than assuming one spelling, because
+a wrong assumption makes *every* tool fail to match and the run reports that the
+whole catalogue bypassed the hook — a dramatic finding that would be entirely an
+artefact of the join. When nothing matches at all, the probe says so in place of
+reporting it as a discovery.
 
 Nothing falls back to a plausible value. A missing credential, a revision the
 client cannot request, an unreachable gateway, an unreachable hook counter and

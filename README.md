@@ -176,6 +176,7 @@ results/20260918T203958539Z-2025-11-25-1.json
 | `--quiesce-ms`       | `2000`       | How long the hook count must hold still before a snapshot     |
 | `--poll-interval-ms` | a quarter of the window | Gap between reads of `GET /hits`                   |
 | `--hook-url`         | `http://127.0.0.1:$PORT_WEB` | Where to read the counter. `HOOK_PUBLIC_URL` is the tunnel *Arcade* calls and is recorded for provenance only |
+| `--request-timeout-ms` | the SDK's 60 s | How long one JSON-RPC request may wait for its reply. See **A gateway that stops answering** below |
 
 Every outbound JSON-RPC request goes through a wrapping `fetch`, so the run
 records what the client actually sent rather than what it was asked to send.
@@ -190,10 +191,11 @@ That matters in three places a count alone would mislead you:
   nobody drains stalls the branch the transport is reading and the session goes
   silent on the *next* request. Each chunk is handed on before it is looked at,
   so a chunked or streamed body terminates exactly as it would with no wrapper
-  at all. Frames are found at a blank line in **any** of the terminator
-  combinations SSE permits — `\n\n` and `\r\n\r\n` among them — because a scan
-  that knew only one of them would report a run where the gateway never
-  answered, which is indistinguishable from the measurement.
+  at all. An SSE body is cut at a blank line in **any** of the terminator
+  combinations the spec permits — `\n\n` and `\r\n\r\n` among them — and a
+  body that is not SSE is not cut at all. A scanner that knew only one shape
+  would report a run where the gateway never answered, which is
+  indistinguishable from the measurement.
 - **Latency is measured to the reply, not to the response headers.** A hook
   that filters a tool list has to answer before the list can come back, so its
   round trip is on the critical path; `durationMs` per request is where the
@@ -219,6 +221,47 @@ That matters in three places a count alone would mislead you:
   so the two sides of the comparison are both in the file and a reader can
   derive the difference instead of taking a count on trust
   (`DESIGN.md` decision 18).
+
+### How a response body is cut into messages
+
+**By the media type, never guessed from the bytes.** A blank line ends a frame
+in `text/event-stream` and means nothing at all in `application/json`, where a
+pretty-printer is free to emit one. Scanning for a blank line without asking
+what the body is splits a legal JSON document in half and loses the message.
+
+| `Content-Type` | Framing | What it does |
+| -------------- | ------- | ------------- |
+| `text/event-stream` | `sse` | Cut at a blank line — CRLF, LF, CR, or a mix; `data:` lines carry the message, per the spec's own rule |
+| `application/json`, `*/*+json` | `whole` | The entire body is one message and is never cut |
+| anything else, or absent | `unknown` | Taken whole. An undivided body is the shape that cannot lose data, and the row records `unknown` so a reader can see it was read under a rule nobody wrote for that media type |
+
+Which rule was applied is recorded per request as `responseFraming`, because it
+changes what every other field on the row means.
+
+**A frame the capture cannot read never becomes "no response".** When
+`responseFrame` is `null`, `responseFrameAbsence` says which of two things
+happened, and they are not interchangeable:
+
+- `unanswered` — the body ended with no message carrying this request's id. A
+  measurement about the gateway.
+- `unreadable` — bytes came back that could not be read as JSON under that
+  framing. A defect in this instrument's reading, not a finding about the
+  gateway, and the report says so in those words.
+
+### A gateway that stops answering
+
+If a gateway accepts a request and never replies, the response stream ends, the
+capture settles, and the **SDK** goes on waiting for a reply that can never
+arrive — `DEFAULT_REQUEST_TIMEOUT_MSEC`, 60 seconds, per request. The run still
+completes, still writes its file and still exits non-zero, so nothing is lost;
+but a repetition sitting silent for a minute is indistinguishable from a hang to
+whoever is watching, and five repetitions is five minutes of it.
+
+`--request-timeout-ms` bounds that wait. It is left at the SDK's default unless
+you ask for less, so a live run behaves exactly as it always has, and the probe
+prints the bound it is operating under at startup so a silent repetition is
+legible rather than alarming. `DESIGN.md` decision 13 is why a short one is safe
+here: the test project is dedicated and nothing else depends on it.
 
 `toolsNotOfferedToHook` is that difference, named: the tools the gateway listed
 that appear in **no** hook payload, sorted. No policy can deny a tool that was

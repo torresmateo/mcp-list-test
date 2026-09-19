@@ -324,7 +324,34 @@ Useful flags, all optional: `--repetitions N` (default 5), `--out <dir>`
 (default `results`), `--quiesce-ms MS` (default 2000, how long the hook count
 must hold still before a snapshot), `--poll-interval-ms MS`, `--hook-url URL`
 (default `http://127.0.0.1:$PORT_WEB`; `HOOK_PUBLIC_URL` is the tunnel *Arcade*
-calls and is recorded for provenance only).
+calls and is recorded for provenance only), `--request-timeout-ms MS` — see
+below before you reach for that last one.
+
+### A repetition can sit silent for a minute. That is not a broken tunnel
+
+The startup header prints the per-request wait the run is operating under:
+
+```
+probe: hook counter http://127.0.0.1:3410, quiescence 2000 ms, per-request wait 60000 ms (the SDK default; --request-timeout-ms overrides)
+```
+
+If a gateway accepts a request and never answers it — a stream that closes
+mid-frame, a tunnel that drops — the MCP client waits that long before giving
+up. **Nothing is lost when it does:** the repetition is recorded with
+`status: "error"`, the run JSON is still written, and the probe exits non-zero.
+Measured against a gateway closing mid-frame: 60 seconds, exit 1, one run file.
+
+So if a repetition goes quiet, wait it out once before you start restarting
+ngrok. The thing to check first is the hook counter — `curl
+"http://127.0.0.1:$PORT_WEB/healthz"` — because a silent repetition with a
+healthy counter is the gateway, not your machine.
+
+`--request-timeout-ms` shortens that wait. **Do not set it low for a normal
+run.** This project exists to find out whether the hook fires far more often
+than expected, and a `tools/list` that fans out to many hook calls over a tunnel
+legitimately takes a long time; a short deadline would turn the finding into a
+timeout error. Use it when you already know the endpoint is dead and you want
+the failure quickly.
 
 **If you do not:** the probe never falls back to a plausible value. A missing
 credential, an unreachable gateway, an unreachable counter, and a gateway that

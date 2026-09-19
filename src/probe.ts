@@ -3,6 +3,7 @@
  *
  *   bun run probe --protocol <revision> [--repetitions N] [--out results/]
  *                 [--quiesce-ms MS] [--poll-interval-ms MS] [--hook-url URL]
+ *                 [--request-timeout-ms MS]
  *
  * For each repetition it generates a fresh user id, opens a new MCP session
  * against the gateway over Streamable HTTP, sends `initialize` then one
@@ -35,6 +36,12 @@ export interface ProbeArgs {
   outputDir: string;
   quiesceMs: number;
   pollIntervalMs?: number;
+  /**
+   * How long one JSON-RPC request may wait for its reply. Omitted leaves the
+   * SDK's own 60 s default in place, which is what a live run gets unless the
+   * operator asks for less.
+   */
+  requestTimeoutMs?: number;
   /** Base URL of the hook counter. Defaults to `http://127.0.0.1:$PORT_WEB`. */
   hookUrl?: string;
 }
@@ -46,6 +53,38 @@ export class UsageError extends Error {
   }
 }
 
+/**
+ * The SDK's own `DEFAULT_REQUEST_TIMEOUT_MSEC`, restated so the startup line can
+ * name the bound a run is actually operating under.
+ *
+ * Not imported: it is the client's constant and this is a message to a human,
+ * so a drift between the two is a stale sentence rather than a changed wait.
+ * The bound itself is always the SDK's, whatever this says.
+ *
+ * ## Do not lower this default to make a stalled run look faster
+ *
+ * A gateway that accepts a request and never answers makes a repetition sit
+ * here for a minute, and that reads like a hang. It is not one: the run
+ * completes, writes its file and exits non-zero — measured against a gateway
+ * closing mid-frame, `exit=1`, one run file, at 60 s, and identically on `main`
+ * at `67c8dc4`, so the wait is the SDK's rather than anything this harness
+ * added. The temptation is to shorten it. Do not.
+ *
+ * **This project exists because the hook may fire far more often than anyone
+ * expects.** If one `tools/list` fans out to a hundred hook calls over a tunnel
+ * at a couple of hundred milliseconds each, that round trip *is* the
+ * measurement — and a short deadline would convert the very phenomenon under
+ * study into a timeout error, reported as a failed run rather than as the
+ * finding. A measurement tool must not have a deadline shorter than the effect
+ * it is looking for.
+ *
+ * `--request-timeout-ms` is the lever for anyone who needs a shorter one: the
+ * end-to-end termination tests use it to run in under a second, and an operator
+ * can pass it when a run is known to be against a dead endpoint. The default
+ * stays where the SDK put it.
+ */
+const SDK_DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+
 /** DESIGN.md Contracts -> Probe CLI: 5 repetitions, 2 s quiescence window. */
 export const DEFAULTS = { repetitions: 5, outputDir: "results", quiesceMs: 2000 } as const;
 
@@ -56,6 +95,7 @@ const FLAGS = [
   "--quiesce-ms",
   "--poll-interval-ms",
   "--hook-url",
+  "--request-timeout-ms",
 ] as const;
 
 function positiveInteger(flag: string, raw: string): number {
@@ -94,6 +134,9 @@ export function parseArgs(argv: string[]): ProbeArgs {
   const pollIntervalMs = values.has("--poll-interval-ms")
     ? positiveInteger("--poll-interval-ms", values.get("--poll-interval-ms")!)
     : undefined;
+  const requestTimeoutMs = values.has("--request-timeout-ms")
+    ? positiveInteger("--request-timeout-ms", values.get("--request-timeout-ms")!)
+    : undefined;
 
   return {
     revision,
@@ -101,6 +144,7 @@ export function parseArgs(argv: string[]): ProbeArgs {
     outputDir: values.get("--out") ?? DEFAULTS.outputDir,
     quiesceMs,
     ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
+    ...(requestTimeoutMs === undefined ? {} : { requestTimeoutMs }),
     ...(values.has("--hook-url") ? { hookUrl: values.get("--hook-url")! } : {}),
   };
 }
@@ -204,7 +248,14 @@ export async function main(argv: string[]): Promise<number> {
   console.log(
     `probe: ${args.repetitions} repetition${args.repetitions === 1 ? "" : "s"} of ${args.revision} against ${env.ARCADE_MCP_URL}`,
   );
-  console.log(`probe: hook counter ${hookUrl}, quiescence ${args.quiesceMs} ms`);
+  const waitBound =
+    args.requestTimeoutMs === undefined
+      ? `${SDK_DEFAULT_REQUEST_TIMEOUT_MS} ms (the SDK default; --request-timeout-ms overrides)`
+      : `${args.requestTimeoutMs} ms`;
+  console.log(
+    `probe: hook counter ${hookUrl}, quiescence ${args.quiesceMs} ms, ` +
+      `per-request wait ${waitBound}`,
+  );
 
   const runs: Run[] = [];
   for (let repetition = 1; repetition <= args.repetitions; repetition += 1) {
@@ -219,6 +270,9 @@ export async function main(argv: string[]): Promise<number> {
       apiKey: env.ARCADE_API_KEY,
       hookPublicUrl: env.HOOK_PUBLIC_URL,
       hits,
+      ...(args.requestTimeoutMs === undefined
+        ? {}
+        : { requestTimeoutMs: args.requestTimeoutMs }),
     });
     const file = join(args.outputDir, runFileName(new Date(run.startedAt), args.revision, repetition));
     // Never overwrite: a run file is evidence, and a lost one looks exactly

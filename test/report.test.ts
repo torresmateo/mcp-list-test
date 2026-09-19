@@ -2469,6 +2469,64 @@ describe("the wire capture renders, and absence still reads as absence (#31)", (
     }
   }, 30_000);
 
+  test("`we could not read it` and `it did not answer` are different sentences", async () => {
+    // Round 2 finding 2's rule, in the renderer: a frame the capture could not
+    // read must not print as the gateway failing to answer. One is a defect in
+    // this instrument, the other is a measurement about the gateway, and a
+    // reader deciding what to chase needs to know which.
+    const { html, file } = await render(
+      "unreadable",
+      runWith(
+        [
+          {
+            ...REQUEST_ROW,
+            responseObserved: false,
+            requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            responseFrame: null,
+            responseFraming: "unknown",
+            responseFrameAbsence: "unreadable",
+          },
+          {
+            ...REQUEST_ROW,
+            id: 2,
+            jsonRpcId: 2,
+            sentAt: "2026-09-19T00:00:03.000Z",
+            responseObserved: false,
+            requestFrame: '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+            responseFrame: null,
+            responseFraming: "sse",
+            responseFrameAbsence: "unanswered",
+          },
+        ],
+        [],
+      ),
+    );
+    const rows = wireTimeline(html, file).rows.filter((row) => row.side === "client");
+
+    expect(rows[0]!.detail).toContain("The reply could not be read");
+    expect(rows[0]!.detail).toContain("defect in the instrument");
+    expect(rows[0]!.detail).not.toContain("No reply carrying this request");
+    // The framing that produced it is on the row, because it changes what the
+    // absence means.
+    expect(rows[0]!.detail).toContain("<dt>response framing</dt><dd>unknown</dd>");
+
+    expect(rows[1]!.detail).toContain("No reply carrying this request");
+    expect(rows[1]!.detail).not.toContain("could not be read");
+    expect(rows[1]!.detail).toContain("<dt>response framing</dt><dd>sse</dd>");
+  }, 30_000);
+
+  test("a pre-#31 row still renders, with the framing simply not recorded", async () => {
+    // The new fields are additive and absent is still absent: a run file from
+    // before them must not gain a framing it never had.
+    const { html, file } = await render("no-framing", runWith([REQUEST_ROW], []));
+    const row = wireTimeline(html, file).rows.find((r) => r.side === "client")!;
+
+    expect(row.detail).toContain(
+      '<dt>response framing</dt><dd><span class="empty">not recorded</span></dd>',
+    );
+    expect(row.detail).not.toContain("could not be read");
+  }, 30_000);
+
   test("a tools/list row with a frame still points at the run's assembled result", async () => {
     // Criterion 7 leaves #25's row alone, and the two bodies it can show are
     // different things: the frame is this request's page, the result is the

@@ -385,8 +385,18 @@ describe("the run file holds both MCP frames, whole", () => {
 describe("capture happens inside the pass-through and always terminates", () => {
   const REQUEST_BODY = JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/list" });
 
-  /** A response whose body arrives as the given chunks, one microtask apart. */
-  function streaming(chunks: string[], status = 200): typeof fetch {
+  /**
+   * A response whose body arrives as the given chunks, one microtask apart.
+   *
+   * `contentType` is a parameter rather than a constant because it is what
+   * decides the framing: the same bytes are a stream of frames under
+   * `text/event-stream` and one indivisible document under `application/json`.
+   */
+  function streaming(
+    chunks: string[],
+    contentType = "text/event-stream",
+    status = 200,
+  ): typeof fetch {
     return (async () => {
       const encoder = new TextEncoder();
       const body = new ReadableStream<Uint8Array>({
@@ -398,10 +408,7 @@ describe("capture happens inside the pass-through and always terminates", () => 
           controller.close();
         },
       });
-      return new Response(body, {
-        status,
-        headers: { "content-type": "text/event-stream" },
-      });
+      return new Response(body, { status, headers: { "content-type": contentType } });
     }) as unknown as typeof fetch;
   }
 
@@ -475,9 +482,10 @@ describe("capture happens inside the pass-through and always terminates", () => 
   });
 
   test("a plain JSON body, with no SSE framing at all, is still captured", async () => {
-    const { log } = await send(streaming([LOSSY_FRAME]));
+    const { log } = await send(streaming([LOSSY_FRAME], "application/json"));
 
     expect(log.entries[0]!.responseObserved).toBe(true);
+    expect(log.entries[0]!.responseFraming).toBe("whole");
     expect(log.entries[0]!.responseFrame).toBe(LOSSY_FRAME);
   });
 
@@ -539,6 +547,80 @@ describe("capture happens inside the pass-through and always terminates", () => 
     expect(received).toContain("keep-alive");
     expect(completed).toEqual([7]);
     expect(log.entries[0]!.responseFrame).toBe('{"jsonrpc":"2.0","id":7,"result":{"ok":true}}');
+  });
+
+  /**
+   * Round 2 finding 2, verbatim: a legal, pretty-printed JSON body whose
+   * insignificant blank line the scanner treated as an SSE frame boundary.
+   */
+  const PRETTY_JSON_BODY = '{\n  "jsonrpc": "2.0",\n\n  "id": 7,\n  "result": {"ok": true}\n}\n';
+
+  test("a pretty-printed JSON body is never split at its blank line", async () => {
+    // `JSON.parse` accepts this body. Framing it as SSE cut it in half before
+    // `flush` ever saw it, and the log recorded `responseObserved: false,
+    // responseFrame: null` — a legal wire shape becoming a quiet "no response",
+    // the same class as the CRLF bug.
+    const { log } = await send(streaming([PRETTY_JSON_BODY], "application/json"));
+
+    const entry = log.entries[0]!;
+    expect(entry.responseFraming).toBe("whole");
+    expect(entry.responseObserved).toBe(true);
+    // Whole, including the blank line: this is the raw body, not a reflow of it.
+    expect(entry.responseFrame).toBe(PRETTY_JSON_BODY.trim());
+    expect(entry.responseFrame).toContain('"2.0",\n\n');
+    expect(entry.responseFrameAbsence).toBeNull();
+  });
+
+  test("the same bytes under text/event-stream are framed as SSE, not taken whole", async () => {
+    // The control for the test above. If the media type were being ignored,
+    // one of these two would be wrong — they are the same bytes.
+    const { log } = await send(streaming([PRETTY_JSON_BODY], "text/event-stream"));
+
+    const entry = log.entries[0]!;
+    expect(entry.responseFraming).toBe("sse");
+    // No `data:` line anywhere, so SSE framing finds no message. That is the
+    // correct reading of these bytes *as SSE*, and it is why the media type
+    // has to decide rather than the bytes.
+    expect(entry.responseFrame).toBeNull();
+    expect(entry.responseFrameAbsence).toBe("unanswered");
+  });
+
+  test("a media type with no rule is taken whole, and says which rule it used", async () => {
+    // Deliberate, documented, and recorded: an undivided body is the shape
+    // that cannot lose data, and the row reports `unknown` so a reader can see
+    // it was read under a rule nobody wrote for that media type.
+    for (const contentType of ["text/plain", "application/vnd.arcade+json"]) {
+      const { log } = await send(streaming([PRETTY_JSON_BODY], contentType));
+      const entry = log.entries[0]!;
+      expect(entry.responseFraming, contentType).toBe(
+        contentType.endsWith("+json") ? "whole" : "unknown",
+      );
+      expect(entry.responseFrame, contentType).toBe(PRETTY_JSON_BODY.trim());
+    }
+  });
+
+  test("bytes that cannot be read say so, instead of becoming `no response`", async () => {
+    // The rule this whole finding turns on: a frame the capture cannot parse
+    // must not silently become "no response observed". An HTML error page is a
+    // defect in the instrument's reading, not a finding about the gateway, and
+    // the two must never print as each other.
+    const { log } = await send(
+      streaming(["<html><body>502 Bad Gateway</body></html>"], "text/html"),
+    );
+
+    const entry = log.entries[0]!;
+    expect(entry.responseFraming).toBe("unknown");
+    expect(entry.responseFrame).toBeNull();
+    expect(entry.responseFrameAbsence).toBe("unreadable");
+    expect(entry.responseObserved).toBe(false);
+  });
+
+  test("an empty body is `unanswered`, not `unreadable`", async () => {
+    // The other side of that distinction: nothing arrived, so there was
+    // nothing to fail at reading.
+    const { log } = await send(streaming([], "application/json"));
+
+    expect(log.entries[0]!.responseFrameAbsence).toBe("unanswered");
   });
 
   test("a batch gives each request its own frames, never another request's", async () => {
@@ -860,5 +942,172 @@ describe("the report shows all four directions in the wire timeline", () => {
     expect(labels).toContain("MCP response frame");
     expect(labels).toContain("hook response");
     expect(labels).toContain("hook payload");
+  }, SPAWN_TIMEOUT_MS);
+});
+
+// ---------------------------------------------------------------------------
+// Criterion 4, end to end — the probe must terminate and still write
+// ---------------------------------------------------------------------------
+
+/**
+ * A gateway that stops talking, driven through the **real probe binary**.
+ *
+ * Round 2's reviewer found the failure these exist for, and found it the only
+ * way it could be found: the direct `createRequestLog` drive settled while the
+ * actual probe did not. A unit test that passes while the real thing hangs is
+ * worse than no test, so criterion 4's guarantee is asserted where it has to
+ * hold — a process that exits, non-zero, with its run file on disk.
+ *
+ * The bound that makes it exit is `--request-timeout-ms`. Without one the SDK
+ * waits `DEFAULT_REQUEST_TIMEOUT_MSEC` (60 s) for a reply that can never
+ * arrive: the run still completes and still writes, but a minute of silence per
+ * repetition is indistinguishable from a hang to whoever is watching. Measured
+ * on this branch and on `main` at `67c8dc4` alike — the wait is the SDK's, not
+ * this slice's.
+ */
+describe("the probe terminates and writes its evidence, whatever the gateway does", () => {
+  /** Ways a gateway can stop talking, and the complete stream for contrast. */
+  const CLOSINGS = {
+    "mid-frame": 'data: {"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25"',
+    "no reply at all": "",
+    "after a partial chunk": "event: message\n",
+  } as const;
+
+  /** An MCP endpoint that answers every POST with `body`, then closes. */
+  function closingGateway(body: string): { url: string; stop(): void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(request) {
+        if (request.method !== "POST") return new Response("", { status: 202 });
+        await request.text();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (body !== "") controller.enqueue(new TextEncoder().encode(body));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      },
+    });
+    cleanups.push(() => server.stop(true));
+    return { url: `http://127.0.0.1:${server.port}/mcp`, stop: () => server.stop(true) };
+  }
+
+  /**
+   * Spawns the real probe with a hard ceiling of its own.
+   *
+   * The ceiling is generous next to the 800 ms request bound and is not the
+   * thing under test — it is there so a regression fails this test in seconds
+   * instead of hanging the suite, which is the failure mode being guarded
+   * against in the first place.
+   */
+  async function probeAgainst(gatewayUrl: string, ceilingMs = 15_000) {
+    const hook = hookServer();
+    const out = scratchDir("wire-terminate-out-");
+    const child = Bun.spawn(
+      [
+        "bun", "run", "probe",
+        "--protocol", REVISION,
+        "--repetitions", "1",
+        "--out", out,
+        "--quiesce-ms", "20",
+        "--poll-interval-ms", "5",
+        "--request-timeout-ms", "800",
+        "--hook-url", hook.url,
+      ],
+      {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          ...PINNED_PROBE_ENV,
+          ARCADE_API_KEY: "probe-test-key",
+          ARCADE_MCP_URL: gatewayUrl,
+          HOOK_BEARER_TOKEN: HOOK_TOKEN,
+          HOOK_PUBLIC_URL: "https://wire-terminate.example",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    let killed = false;
+    const ceiling = setTimeout(() => {
+      killed = true;
+      child.kill(9);
+    }, ceilingMs);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    clearTimeout(ceiling);
+
+    const files = readdirSync(out).filter((name) => name.endsWith(".json"));
+    return {
+      killed,
+      exitCode,
+      stdout,
+      stderr,
+      files,
+      runs: files.map((name) => JSON.parse(readFileSync(join(out, name), "utf8")) as Loose),
+    };
+  }
+
+  for (const [name, body] of Object.entries(CLOSINGS)) {
+    test(`a gateway that closes ${name}: the probe exits non-zero and still writes`, async () => {
+      const gateway = closingGateway(body);
+
+      const result = await probeAgainst(gateway.url);
+
+      // Termination first, because a hang makes every other assertion moot.
+      expect(result.killed, `the probe had to be killed:\n${result.stdout}`).toBe(false);
+      expect(result.exitCode).not.toBe(0);
+      // …and the evidence is on disk, which is the other half of criterion 4:
+      // a run that terminates without writing is a failure nobody can read.
+      expect(result.files).toHaveLength(1);
+
+      const run = result.runs[0]!;
+      expect(run.schema).toBe(1);
+      expect(run.status).toBe("error");
+      expect(run.error).not.toBeNull();
+      // The request went out and is recorded even though nothing came back —
+      // that is the point of recording the outbound direction separately.
+      expect((run.requests as Loose[]).length).toBeGreaterThan(0);
+      const first = (run.requests as Loose[])[0]!;
+      expect(first.method).toBe("initialize");
+      expect(typeof first.requestFrame).toBe("string");
+      // No reply, said as a measurement rather than as an empty object.
+      expect(first.responseFrame).toBeNull();
+      // Which kind of nothing it was, named. A truncated frame is bytes we
+      // could not read; an empty body and a frame carrying no `data:` line are
+      // both "the gateway did not answer".
+      expect(first.responseFrameAbsence).toBe(
+        name === "mid-frame" ? "unreadable" : "unanswered",
+      );
+    }, SPAWN_TIMEOUT_MS);
+  }
+
+  test("a complete stream still exits 0 — the control for the three above", async () => {
+    // Without this, "exits non-zero" could be true of a probe that fails
+    // against everything, and the three tests above would prove nothing.
+    const hook = hookServer();
+    const fake = gateway(hook);
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      args: ["--repetitions", "1", "--request-timeout-ms", "5000"],
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.files).toHaveLength(1);
+    const run = result.runs[0]!;
+    expect(run.status).toBe("ok");
+    const init = (run.requests as Loose[])[0]!;
+    expect(init.responseFrameAbsence).toBeNull();
+    expect(typeof init.responseFrame).toBe("string");
   }, SPAWN_TIMEOUT_MS);
 });

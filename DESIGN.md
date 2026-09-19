@@ -125,12 +125,24 @@ repetition negotiated the requested revision. Per repetition the probe:
   "hookHits": [ { "receivedAt": "ISO", "payload": { "user_id": "...", "toolkits": {} } } ],
   "toolsListed": 42,
   "gmailToolsListed": 0,
+  "toolsListResult": [ { "name": "Slack_PostMessage", "...": "as the gateway returned it" } ],
+  "toolsNotOfferedToHook": ["Some_Default", "Another_Default"],
   "error": null
 }
 ```
 
 `hookHitsAfter` is cumulative for that user id at snapshot time. Hook hits per
 method = difference between consecutive snapshots.
+
+**Both sides of the comparison are recorded** (decision 18). `hookHits` is what
+the gateway told the hook; `toolsListResult` is what the same gateway returned
+to the client for the same session. A reader can derive the difference rather
+than take a count on trust.
+
+`toolsNotOfferedToHook` is the derived set: tool names present in
+`toolsListResult` that appear in **no** hook payload. It is `null` — never `[]` —
+when `hookHits` is empty, because a run with no hook hits says nothing about
+what was offered, and an empty array would read as "nothing bypassed the hook".
 
 ### Hook counter HTTP API
 
@@ -253,6 +265,16 @@ browser's print dialog.
     we measure what real clients experience. Migrating is its own slice, done
     before the probe is written, because the probe is the file the migration
     would otherwise force a rewrite of.
+18. **Record the MCP side, not only the hook side.** The probe holds the
+    `tools/list` result already and reduced it to two integers. The live run of
+    2026-09-19 showed why that is not enough: the gateway listed 42 tools while
+    offering the hook 40, so two tools were never submitted to access control —
+    and the instrument could report the *count* of the gap but not *which*
+    tools, which is the project's own "an absence is not evidence; an excerpt,
+    not a count" rule turned against itself. Storing the result makes the
+    comparison checkable by a reader instead of asserted by whoever ran it.
+    Operator decision, 2026-09-19.
+
 17. **Measure size and latency, not just count.** A bare invocation count does
     not tell the engine team what an access hook costs them. Each recorded hit
     carries how many toolkits, tools and tool-versions arrived and how many

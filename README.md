@@ -446,14 +446,24 @@ directory with no network, so nothing is fetched. With scripting off, every
 payload is still there, whole, inside `<details><summary>raw JSON</summary>` —
 the explorer is an enhancement over evidence that is already on the page.
 
-Each distinct payload is embedded **once**. The live run's 1.6 MB catalogue
-payload was byte-identical across all five runs and was inlined five times; now
-one copy is embedded and every other hit points at it, showing its sha-256 and
-naming the hit that carries it. The comparison is over the payload bytes, not
-over `bodyBytes` or the tool counts: a payload that differs anywhere — by one
-tool — is embedded in full, and a test covers exactly that case, because a
-report that quietly hid a difference between two hits would be the failure this
-whole project exists to catch.
+Each distinct payload is embedded **once**: later hits carrying the same bytes
+show their sha-256 and name the hit that carries the copy. The comparison is
+over the payload bytes, not over `bodyBytes` or the tool counts — a payload that
+differs anywhere, by one tool, is embedded in full, and a test covers exactly
+that case, because a report that quietly hid a difference between two hits would
+be the failure this whole project exists to catch.
+
+That is not enough on its own, because the live run's five 1.6 MB catalogue
+payloads are **not** identical: they differ in `user_id` and nowhere else, so
+whole-payload deduplication rightly declines to collapse them and the report
+carried five copies of one `toolkits` object for the sake of five id strings. So
+a large `toolkits` object shared by more than one payload is stored once too,
+and each payload still shows its own fields. Nothing is rewritten — no `$ref` is
+invented inside evidence JSON; the payload's own bytes and the shared object's
+bytes are both on the page, and the explorer puts them back together into
+exactly what the gateway sent. Equality there is computed over the object's
+bytes, the same as for a whole payload, and a test covers two same-length
+`toolkits` objects that differ by one tool and must both be stored in full.
 
 Above 64 KiB the embedded copy is stored compact rather than pretty-printed.
 Compact means whitespace removed and nothing else; nothing is ever truncated.

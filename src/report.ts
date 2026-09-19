@@ -925,6 +925,11 @@ export function toolsListAnchor(file: string): string {
   return `${file}--tools-list`;
 }
 
+/** The id of the `<pre>` holding one hit's shared `toolkits` object. */
+export function toolkitsStoreId(file: string, hitIndex: number): string {
+  return `${file}--toolkits-${hitIndex + 1}`;
+}
+
 /**
  * The id of the `<pre>` holding the embedded copy, distinct from
  * {@link toolsListAnchor}.
@@ -964,6 +969,49 @@ export function toolsListLabel(file: string): string {
  */
 export const PRETTY_PAYLOAD_MAX_BYTES = 65_536;
 
+/**
+ * Above this many bytes, a `toolkits` object shared by more than one payload is
+ * stored once and referenced, instead of being re-embedded inside each payload.
+ *
+ * The live evidence is the reason. Its five catalogue payloads are **not**
+ * byte-identical — they differ in `user_id` — so whole-payload deduplication
+ * correctly declines to collapse them, and the report carried five copies of
+ * the same 1.6 MB `toolkits` object for the sake of five different id strings.
+ * Splitting the shared part out recovers that without collapsing anything the
+ * payloads actually disagree about.
+ *
+ * Only worth it when the shared part is large: below this, the reference costs
+ * more than the object, and splitting a small payload into two pieces would
+ * make it harder to read for no gain. 64 KiB, the same line
+ * {@link PRETTY_PAYLOAD_MAX_BYTES} draws, so a payload is either small and
+ * whole and indented, or large and stored the economical way.
+ */
+export const TOOLKITS_STORE_MIN_BYTES = 65_536;
+
+/** The key whose value is eligible to be stored once and shared. */
+const SHARED_KEY = "toolkits";
+
+/**
+ * A large `toolkits` object stored once, outside the payloads that carry it.
+ *
+ * The payload is still shown whole: its own fields are rendered from its own
+ * bytes and the shared object from the store's, so nothing is rewritten and no
+ * `$ref` is invented inside evidence JSON. The explorer reassembles the two
+ * into the exact payload the gateway sent.
+ */
+export interface SharedToolkits {
+  /** Which key was stored separately. Always `toolkits` today. */
+  key: string;
+  /** id of the `<pre>` holding the one copy. */
+  storeId: string;
+  /** sha-256 of the shared object's bytes. */
+  digest: string;
+  /** True when this payload's block is the one that emits the store. */
+  emitsStore: boolean;
+  /** Where the copy is, when this payload is not the one that emits it. */
+  sameAs?: { anchor: string; label: string };
+}
+
 /** Where one hook payload is rendered, and whether it is a repeat of another. */
 export interface PayloadPlacement {
   /** This occurrence's own anchor id, so a repeat can be linked to as well. */
@@ -982,6 +1030,18 @@ export interface PayloadPlacement {
    * is where the body is stored. `undefined` means this occurrence carries it.
    */
   sameAs?: { anchor: string; label: string };
+  /**
+   * Set when this payload's `toolkits` object is large and shared with another
+   * payload, so it lives in its own store and {@link storedAt} holds only this
+   * payload's remaining fields.
+   */
+  sharedToolkits?: SharedToolkits;
+}
+
+/** How many bodies of one kind were embedded, and how many were repeats. */
+export interface BodyCount {
+  occurrences: number;
+  repeats: number;
 }
 
 export interface PayloadPlan {
@@ -993,14 +1053,24 @@ export interface PayloadPlan {
    * repeated across repetitions of the same gateway is embedded once too.
    */
   toolsListPerRun: (PayloadPlacement | null)[];
-  /** Payload occurrences across the whole report. */
+  /**
+   * Counted by kind, because the sentence the report prints names a kind.
+   * Lumping `tools/list` results in with hook payloads and calling the total
+   * "hook payloads" is a wrong number in a rendered report, which is the one
+   * defect class this slice exists to remove.
+   */
+  hookPayloads: BodyCount;
+  toolsListResults: BodyCount;
+  /** Shared `toolkits` objects: how many were stored, and how many payloads reference them. */
+  sharedToolkits: { stores: number; references: number };
+  /** Every embedded body, whatever its kind. */
   occurrences: number;
-  /** Distinct payload bodies — how many are rendered in full. */
+  /** Distinct bodies — how many are embedded at all. */
   distinct: number;
-  /** Occurrences that are repeats and therefore render no body. */
+  /** Occurrences that are repeats and therefore embed nothing. */
   repeats: number;
   /**
-   * Characters of escaped, pretty-printed JSON the repeats did not re-emit.
+   * Characters of escaped, stored JSON the repeats did not re-emit.
    * The measurement behind "the report shrank", kept here so a test can pin it
    * instead of trusting that a smaller file means the right thing happened.
    */
@@ -1028,27 +1098,101 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
   const seen = new Map<string, { anchor: string; label: string; digest: string }>();
   const perRun: PayloadPlacement[][] = [];
   const toolsListPerRun: (PayloadPlacement | null)[] = [];
+  const hookPayloads: BodyCount = { occurrences: 0, repeats: 0 };
+  const toolsListResults: BodyCount = { occurrences: 0, repeats: 0 };
+  const toolkitsStores = new Set<string>();
+  let toolkitsReferences = 0;
   let occurrences = 0;
   let repeats = 0;
   let charsSaved = 0;
 
+  /**
+   * How many hook payloads in the whole report carry each large `toolkits`
+   * object, worked out before anything is placed.
+   *
+   * Splitting a payload is only worth doing when the object is actually shared,
+   * and that is a property of the document, not of the payload in hand — so it
+   * cannot be decided while walking the payloads one at a time.
+   */
+  const sharedCounts = new Map<string, number>();
+  for (const { run } of loaded) {
+    for (const hit of run.hookHits) {
+      const text = shareableToolkitsText(hit.payload);
+      if (text !== undefined) sharedCounts.set(text, (sharedCounts.get(text) ?? 0) + 1);
+    }
+  }
+
   /** Places one body in the shared store, or points it at the copy already there. */
-  const place = (value: unknown, anchor: string, label: string): PayloadPlacement => {
+  const place = (
+    body: string,
+    anchor: string,
+    label: string,
+    displayDigest?: string,
+  ): PayloadPlacement => {
     occurrences += 1;
-    const body = payloadText(value);
     const earlier = seen.get(body);
     if (earlier === undefined) {
       const digest = createHash("sha256").update(body).digest("hex");
       seen.set(body, { anchor, label, digest });
-      return { anchor, digest, storedAt: anchor };
+      return { anchor, digest: displayDigest ?? digest, storedAt: anchor };
     }
     repeats += 1;
-    charsSaved += escapeHtml(storedPayload(value)).length;
+    charsSaved += escapeHtml(storedText(body)).length;
     return {
       anchor,
-      digest: earlier.digest,
+      digest: displayDigest ?? earlier.digest,
       storedAt: earlier.anchor,
       sameAs: { anchor: earlier.anchor, label: earlier.label },
+    };
+  };
+
+  /**
+   * One hook payload, split in two when its `toolkits` object is large and
+   * carried by more than one payload in this report.
+   *
+   * Split means *stored* in two parts, never *shown* in two: the payload's own
+   * fields come from its own bytes, the shared object from the store's, and the
+   * explorer puts them back together into exactly what the gateway sent.
+   * Nothing is rewritten — inventing a `$ref` inside evidence JSON would make
+   * the raw block stop being the gateway's bytes, which is the failure this
+   * report is an instrument against.
+   */
+  const placeHookPayload = (
+    payload: unknown,
+    file: string,
+    index: number,
+  ): PayloadPlacement => {
+    hookPayloads.occurrences += 1;
+    const whole = payloadText(payload);
+    const wholeDigest = createHash("sha256").update(whole).digest("hex");
+    const anchor = payloadAnchor(file, index);
+    const label = payloadLabel(file, index);
+    const toolkits = shareableToolkitsText(payload);
+
+    if (toolkits === undefined || (sharedCounts.get(toolkits) ?? 0) < 2) {
+      const placement = place(whole, anchor, label, wholeDigest);
+      if (placement.sameAs !== undefined) hookPayloads.repeats += 1;
+      return placement;
+    }
+
+    // Own fields first, keyed on their own bytes: two payloads that agree on
+    // everything but the shared object share this store too, and one that does
+    // not gets its own.
+    const own = place(withoutShared(payload), anchor, `the own fields of ${label}`, wholeDigest);
+    if (own.sameAs !== undefined) hookPayloads.repeats += 1;
+
+    const store = place(toolkits, toolkitsStoreId(file, index), `the toolkits of ${label}`);
+    toolkitsStores.add(toolkits);
+    toolkitsReferences += 1;
+    return {
+      ...own,
+      sharedToolkits: {
+        key: SHARED_KEY,
+        storeId: store.storedAt,
+        digest: store.digest,
+        emitsStore: store.sameAs === undefined,
+        ...(store.sameAs === undefined ? {} : { sameAs: store.sameAs }),
+      },
     };
   };
 
@@ -1056,26 +1200,56 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     // Hook payloads first, then the run's `tools/list` result: the same order
     // the run section renders them in, so "the first occurrence carries the
     // body" means the first one a reader meets.
-    perRun.push(
-      run.hookHits.map((hit, index) =>
-        place(hit.payload, payloadAnchor(file, index), payloadLabel(file, index)),
-      ),
+    perRun.push(run.hookHits.map((hit, index) => placeHookPayload(hit.payload, file, index)));
+
+    if (!Array.isArray(run.toolsListResult)) {
+      toolsListPerRun.push(null);
+      continue;
+    }
+    toolsListResults.occurrences += 1;
+    const placement = place(
+      payloadText(run.toolsListResult),
+      toolsListStoreId(file),
+      toolsListLabel(file),
     );
-    toolsListPerRun.push(
-      Array.isArray(run.toolsListResult)
-        ? place(run.toolsListResult, toolsListStoreId(file), toolsListLabel(file))
-        : null,
-    );
+    if (placement.sameAs !== undefined) toolsListResults.repeats += 1;
+    toolsListPerRun.push(placement);
   }
 
   return {
     perRun,
     toolsListPerRun,
+    hookPayloads,
+    toolsListResults,
+    sharedToolkits: { stores: toolkitsStores.size, references: toolkitsReferences },
     occurrences,
     distinct: seen.size,
     repeats,
     charsSaved,
   };
+}
+
+/**
+ * The payload's `toolkits` value as JSON, when it is big enough to be worth
+ * storing apart. `undefined` when the payload is not shaped like the
+ * access-hook contract, or when the object is small enough that splitting it
+ * would cost more than it saves.
+ */
+function shareableToolkitsText(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const toolkits = payload[SHARED_KEY];
+  if (!isRecord(toolkits)) return undefined;
+  const text = payloadText(toolkits);
+  return Buffer.byteLength(text, "utf8") >= TOOLKITS_STORE_MIN_BYTES ? text : undefined;
+}
+
+/** The payload as JSON with the shared key removed, key order otherwise intact. */
+function withoutShared(payload: unknown): string {
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload as Record<string, unknown>)) {
+    if (key !== SHARED_KEY) rest[key] = value;
+  }
+  return payloadText(rest);
 }
 
 /**
@@ -1103,10 +1277,25 @@ function payloadTextOf(value: unknown): string {
  * document no matter which form it took.
  */
 export function storedPayload(payload: unknown): string {
-  const compact = payloadText(payload);
+  return storedText(payloadText(payload));
+}
+
+/**
+ * {@link storedPayload} for a body the caller already serialised.
+ *
+ * The plan works in JSON text — that is what it compares and digests — so it
+ * must not have to parse a body back into a value just to ask how long the
+ * stored form would be.
+ */
+export function storedText(compact: string): string {
   return Buffer.byteLength(compact, "utf8") > PRETTY_PAYLOAD_MAX_BYTES
     ? compact
-    : (JSON.stringify(payload, null, 2) ?? "null");
+    : prettyText(compact);
+}
+
+/** Re-indents compact JSON. Same bytes, same order, whitespace added. */
+function prettyText(compact: string): string {
+  return JSON.stringify(JSON.parse(compact), null, 2) ?? "null";
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,6 +1533,20 @@ const EXPLORER = `
     if (value === undefined) {
       mount.appendChild(span("c", "payload could not be parsed - the raw JSON below is the evidence"));
       return;
+    }
+    // A payload whose large shared object is stored apart is put back together
+    // here, so the tree is the whole payload the gateway sent. The copy is
+    // shallow: the cached own-fields object is shared by every payload that has
+    // the same ones, and must not be mutated.
+    var sharedId = mount.getAttribute("data-shared");
+    if (sharedId !== null && value !== null && typeof value === "object") {
+      var sharedValue = payloadOf(sharedId);
+      if (sharedValue !== undefined) {
+        var merged = {};
+        for (var key in value) merged[key] = value[key];
+        merged[mount.getAttribute("data-shared-key")] = sharedValue;
+        value = merged;
+      }
     }
     var tree = node(null, value);
     if (tree.tagName === "DETAILS") tree.open = true;
@@ -1644,9 +1847,15 @@ function payloadSummaryLine(hit: HookHit, placement: PayloadPlacement): string {
  * without the document carrying the payload twice.
  */
 function payloadDetail(hit: HookHit, placement: PayloadPlacement): string {
-  const mount = `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"></div>`;
+  const shared = placement.sharedToolkits;
+  const mount =
+    `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"` +
+    (shared === undefined
+      ? ""
+      : ` data-shared-key="${escapeHtml(shared.key)}" data-shared="${escapeHtml(shared.storeId)}"`) +
+    `></div>`;
 
-  if (placement.sameAs !== undefined) {
+  if (placement.sameAs !== undefined && shared === undefined) {
     return [
       mount,
       `<p class="repeat-note">Byte-identical to ` +
@@ -1656,12 +1865,55 @@ function payloadDetail(hit: HookHit, placement: PayloadPlacement): string {
         `<code>${escapeHtml(placement.digest)}</code>.</p>`,
     ].join("\n");
   }
+
+  if (shared === undefined) {
+    return [
+      mount,
+      `<details class="raw"><summary>raw JSON</summary>`,
+      `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(storedPayload(hit.payload))}</pre>`,
+      `</details>`,
+    ].join("\n");
+  }
+
+  // Stored in two parts, shown as one. Neither part is rewritten: the own
+  // fields are this payload's bytes with the shared key left out, and the
+  // shared object is the gateway's bytes in the store. The explorer above puts
+  // them back together; a reader with no scripting reads them in sequence.
+  const own = payloadText(hit.payload);
+  const ownPart =
+    placement.storedAt === placement.anchor
+      ? `<pre id="${escapeHtml(placement.anchor)}">` +
+        `${escapeHtml(storedText(withoutShared(hit.payload)))}</pre>`
+      : `<p class="repeat-note">This hit’s own fields are byte-identical to those of ` +
+        `<a href="#${escapeHtml(placement.sameAs!.anchor)}">` +
+        `${escapeHtml(placement.sameAs!.label)}</a>.</p>`;
+
+  const sharedPart = shared.emitsStore
+    ? `<pre id="${escapeHtml(shared.storeId)}">${escapeHtml(storedText(sharedToolkitsTextOf(hit.payload)))}</pre>`
+    : `<p class="repeat-note">Byte-identical to ` +
+      `<a href="#${escapeHtml(shared.sameAs!.anchor)}">${escapeHtml(shared.sameAs!.label)}</a>, ` +
+      `which carries the one embedded copy. Compared byte for byte; sha-256 of the ` +
+      `<code>${escapeHtml(shared.key)}</code> object is <code>${escapeHtml(shared.digest)}</code>.</p>`;
+
   return [
     mount,
-    `<details class="raw"><summary>raw JSON</summary>`,
-    `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(storedPayload(hit.payload))}</pre>`,
+    `<p class="sub">Stored in two parts because this payload’s ` +
+      `<code>${escapeHtml(shared.key)}</code> object is shared with other hits: its own fields ` +
+      `below, and that object once. Nothing is rewritten and nothing is dropped — the whole ` +
+      `payload is sha-256 <code>${escapeHtml(placement.digest)}</code>, ` +
+      `${Buffer.byteLength(own, "utf8")} B.</p>`,
+    `<details class="raw"><summary>raw JSON — this hit’s own fields</summary>`,
+    ownPart,
+    `</details>`,
+    `<details class="raw"><summary>raw JSON — the shared <code>${escapeHtml(shared.key)}</code> object</summary>`,
+    sharedPart,
     `</details>`,
   ].join("\n");
+}
+
+/** The shared object's JSON, for the block that emits the store. */
+function sharedToolkitsTextOf(payload: unknown): string {
+  return payloadText((payload as Record<string, unknown>)[SHARED_KEY]);
 }
 
 /** One `<dt>`/`<dd>` pair, with `not recorded` for anything the run file lacks. */
@@ -2012,24 +2264,53 @@ export function toolsNotOfferedText(run: Run): string {
 }
 
 /**
- * What the reader is told about repeated payloads, stated whether or not there
+ * What the reader is told about repeated bodies, stated whether or not there
  * were any: "nothing was collapsed" is as much a result as a saving.
+ *
+ * It counts **by kind**. An earlier version added the `tools/list` results to
+ * the hook payloads and called the total "hook payloads", so a report holding
+ * twelve payloads and four results announced sixteen of the former. A wrong
+ * number in a rendered report is the defect this whole slice exists to remove,
+ * and it does not get an exemption for being in the prose.
  */
 export function payloadDedupeNote(plan: PayloadPlan): string {
-  if (plan.occurrences === 0) return `<p class="sub">No hook payloads in this report.</p>`;
-  if (plan.repeats === 0) {
-    return (
-      `<p class="sub">No two of the ${plan.occurrences} hook payloads in this report are ` +
-      `byte-identical, so every one is embedded in full.</p>`
-    );
-  }
+  const { hookPayloads, toolsListResults, sharedToolkits } = plan;
+  if (plan.occurrences === 0) return `<p class="sub">No payloads in this report.</p>`;
+
+  const plural = (count: number, one: string, many: string): string =>
+    `${count} ${count === 1 ? one : many}`;
+  const kinds = [
+    plural(hookPayloads.occurrences, "hook payload", "hook payloads"),
+    ...(toolsListResults.occurrences === 0
+      ? []
+      : [plural(toolsListResults.occurrences, "tools/list result", "tools/list results")]),
+  ].join(" and ");
+
+  const body =
+    plan.repeats === 0
+      ? `<p class="sub">This report embeds ${plural(plan.occurrences, "body", "bodies")} ` +
+        `— ${kinds} — and no two of them are byte-identical, so every one is embedded ` +
+        `in full.</p>`
+      : `<p class="sub">This report embeds ${plural(plan.occurrences, "body", "bodies")} ` +
+        `— ${kinds}. <strong>${plan.repeats}</strong> of them are byte-identical repeats of ` +
+        `an earlier body; ${plural(plan.distinct, "distinct body is", "distinct bodies are")} ` +
+        `embedded once each, and every repeat shows its digest and links the one that carries ` +
+        `the copy. The comparison is over the bytes, not over <code>bodyBytes</code> or the ` +
+        `toolkit and tool counts: a body that differs anywhere is embedded in full, so nothing ` +
+        `a hit carried can be hidden by this.</p>`;
+
+  if (sharedToolkits.stores === 0) return body;
+
   return (
-    `<p class="sub">${plan.repeats} of the ${plan.occurrences} hook payloads are ` +
-    `<strong>byte-identical repeats</strong> of an earlier hit; ${plan.distinct} distinct ` +
-    `payloads are embedded once each, and every repeat shows its digest, links the hit that ` +
-    `carries the copy, and expands from that same copy. The comparison is over the payload ` +
-    `bytes, not over <code>bodyBytes</code> or the toolkit and tool counts: a payload that ` +
-    `differs anywhere is embedded in full, so nothing a hit carried can be hidden by this.</p>`
+    body +
+    `\n<p class="sub">${plural(sharedToolkits.references, "hook payload", "hook payloads")} ` +
+    `${sharedToolkits.references === 1 ? "carries" : "carry"} a large ` +
+    `<code>toolkits</code> object that other payloads carry too. Those payloads are ` +
+    `<strong>not</strong> identical — they differ elsewhere, in the live evidence only in ` +
+    `<code>user_id</code> — so nothing is collapsed: ` +
+    `${plural(sharedToolkits.stores, "object is", "objects are")} stored once and referenced, ` +
+    `and each payload still shows its own fields. Equality is computed over the object’s ` +
+    `bytes, the same as for a whole body.</p>`
   );
 }
 

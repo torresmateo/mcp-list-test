@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { hitsForMethod, parseRun } from "../src/report.ts";
 import {
   CATALOGUE_BODY_BYTES,
+  CATALOGUE_STORED_CHARS,
   CATALOGUE_TOOLS,
   CATALOGUE_TOOLKITS,
   SMALL_BODY_BYTES,
@@ -512,6 +513,16 @@ function toolSetOf(payload: unknown): string[] {
   return Object.entries(toolkits ?? {})
     .flatMap(([toolkit, entry]) => Object.keys(entry.tools ?? {}).map((tool) => `${toolkit}:${tool}`))
     .sort();
+}
+
+/** The inverse of {@link escaped}, for reading an embedded body back. */
+function unescaped(value: string): string {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&amp;", "&");
 }
 
 /** The renderer escapes what it prints; a header value read back is escaped too. */
@@ -1300,8 +1311,31 @@ describe("byte-identical payloads are stored once", () => {
     expect(withRepeats).toContain("embedded once each");
 
     const { html: without } = await renderDir(PROFILE_DIRS.varied, "dedupe-note-none.html");
-    expect(without).toContain("No two of the 3 hook payloads");
+    expect(without).toContain("no two of them are byte-identical");
     expect(without).not.toContain("byte-identical repeats");
+  });
+
+  test("the count sentence names each kind, and never calls a tools/list result a hook payload", async () => {
+    // Round 1's finding: `PayloadPlan.occurrences` counted hook payloads and
+    // `toolsListResult` arrays together and the sentence called the total
+    // "hook payloads", so this fixture — 12 payloads and 4 results — announced
+    // "16 hook payloads". A wrong number in a rendered report is the defect
+    // this slice exists to remove; prose gets no exemption.
+    const { html } = await renderDir(TOOLS_LIST_DIR, "dedupe-note-kinds.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const payloads = loaded.reduce((sum, { run }) => sum + run.hookHits.length, 0);
+    const results = loaded.filter(({ run }) => Array.isArray(run.toolsListResult)).length;
+
+    const note = stripTags(/<p class="sub">This report embeds[\s\S]*?<\/p>/.exec(html)![0]);
+
+    expect(payloads).toBe(12);
+    expect(results).toBe(4);
+    expect(note).toContain(`${payloads} hook payloads`);
+    expect(note).toContain(`${results} tools/list results`);
+    expect(note).toContain(`${payloads + results} bodies`);
+    // The exact wrong sentence, pinned so it cannot come back.
+    expect(note).not.toContain(`${payloads + results} hook payloads`);
+    expect(note).not.toMatch(/\b16 hook payloads\b/);
   });
 });
 
@@ -1520,6 +1554,84 @@ describe("the inline JSON explorer", () => {
     expect(versionsNode.children).toHaveLength(8259);
   });
 
+  test("a payload stored in two parts is put back together whole", async () => {
+    // The split stores a payload's own fields and its shared `toolkits` object
+    // separately. If the explorer showed only the own fields, a reader would
+    // open a hook hit and see a payload with no toolkits at all — a report that
+    // looks fine and hides everything the hit carried.
+    const { html } = await renderDir(PROFILE_DIRS.identical, "explorer-rejoin.html");
+    const payload = {
+      user_id: "probe-1",
+      toolkits: { Gmail: { tools: { SendEmail: [{ version: "1.0.0" }] } } },
+    };
+    const document = new FakeDocument();
+    const row = document.appendChild(new FakeElement("details"));
+    row.className = "event";
+    const mount = row.appendChild(new FakeElement("div"));
+    mount.className = "json";
+    mount.setAttribute("data-payload", "own");
+    mount.setAttribute("data-shared", "shared");
+    mount.setAttribute("data-shared-key", "toolkits");
+
+    const own = new FakeElement("pre");
+    own.textContent = JSON.stringify({ user_id: payload.user_id });
+    document.register("own", own);
+    const shared = new FakeElement("pre");
+    shared.textContent = JSON.stringify(payload.toolkits);
+    document.register("shared", shared);
+
+    new Function("document", explorerSource(html))(document);
+    expect(mount.children).toHaveLength(0); // still lazy
+    row.open = true;
+
+    const root = mount.children[0]!;
+    expect(root.tagName).toBe("DETAILS");
+    // Both halves are in the tree, and the payload's own field is not lost to
+    // the shared one.
+    expect(root.textContent).toContain("user_id");
+    expect(root.textContent).toContain('"probe-1"');
+    const toolkitsNode = root.find("toolkits")[0]!;
+    expect(toolkitsNode.children[0]!.textContent).toBe("toolkits: {1 key}");
+    toolkitsNode.open = true;
+    expect(toolkitsNode.find("Gmail")).toHaveLength(1);
+  });
+
+  test("the shared store is read, not copied, and one payload cannot poison another", async () => {
+    // Two payloads sharing one `toolkits` store: the explorer merges into a
+    // fresh object rather than mutating the cached own-fields value, so the
+    // second payload does not inherit the first one's id.
+    const { html } = await renderDir(PROFILE_DIRS.identical, "explorer-rejoin-two.html");
+    const document = new FakeDocument();
+    const shared = new FakeElement("pre");
+    shared.textContent = JSON.stringify({ Slack: { tools: {} } });
+    document.register("shared", shared);
+
+    const mounts = ["a", "b"].map((id, index) => {
+      const own = new FakeElement("pre");
+      own.textContent = JSON.stringify({ user_id: `probe-${index + 1}` });
+      document.register(id, own);
+      const row = document.appendChild(new FakeElement("details"));
+      row.className = "event";
+      const mount = row.appendChild(new FakeElement("div"));
+      mount.className = "json";
+      mount.setAttribute("data-payload", id);
+      mount.setAttribute("data-shared", "shared");
+      mount.setAttribute("data-shared-key", "toolkits");
+      return { row, mount };
+    });
+
+    new Function("document", explorerSource(html))(document);
+    for (const { row } of mounts) row.open = true;
+
+    expect(mounts[0]!.mount.children[0]!.textContent).toContain('"probe-1"');
+    expect(mounts[1]!.mount.children[0]!.textContent).toContain('"probe-2"');
+    expect(mounts[1]!.mount.children[0]!.textContent).not.toContain('"probe-1"');
+    // …and both still carry the shared object.
+    for (const { mount } of mounts) {
+      expect(mount.children[0]!.find("toolkits")).toHaveLength(1);
+    }
+  });
+
   test("every mount points at an embedded payload that is on the page and parses", async () => {
     const { html } = await renderDir(PROFILE_DIRS.identical, "explorer-wiring.html");
     const loaded = await loadDir(PROFILE_DIRS.identical);
@@ -1582,11 +1694,41 @@ describe("the inline JSON explorer", () => {
 // ---------------------------------------------------------------------------
 
 describe("report size on the live-evidence shape", () => {
-  test("embeds the duplicated catalogue once, whole, and the report shrinks by the difference", async () => {
-    // `test/fixtures/real-shape.ts` rebuilds what the live run produced: five
-    // sessions of four hits, a 1,598,220 B catalogue payload byte-identical
-    // across all five, and three 15,340 B payloads per session identical to
-    // each other. That duplication is what made the operator's report 26.0 MB.
+  test("the fixture reproduces the shape the real run files actually have", async () => {
+    // Corrected in round 2. The issue told me the catalogue payload was
+    // byte-identical across all five runs; it is not. On the operator's real
+    // files the five payloads have five different digests and one shared
+    // `toolkits` digest — they differ in `user_id` and nowhere else. A fixture
+    // encoding the wrong premise measures a shape that does not occur and
+    // flatters the feature, which is worse than having no fixture.
+    const dir = join(scratch, "real-shape-shape");
+    const files = await writeRealShapeRuns(dir, 5);
+    const loaded = await Promise.all(
+      files.map(async (file) => parseRun(file, await Bun.file(join(dir, file)).text())),
+    );
+    const catalogues = loaded.map(
+      (run) => run.hookHits.find((hit) => hit.bodyBytes === CATALOGUE_BODY_BYTES)!.payload,
+    ) as Record<string, unknown>[];
+
+    expect(catalogues).toHaveLength(5);
+    // Five different payloads…
+    expect(new Set(catalogues.map((payload) => JSON.stringify(payload))).size).toBe(5);
+    // …one `toolkits` object…
+    expect(new Set(catalogues.map((payload) => JSON.stringify(payload["toolkits"]))).size).toBe(1);
+    // …and `user_id` is the only field they disagree about.
+    expect(new Set(catalogues.map((payload) => JSON.stringify(payload["user_id"]))).size).toBe(5);
+    for (const payload of catalogues) expect(Object.keys(payload).sort()).toEqual([
+      "toolkits",
+      "user_id",
+    ]);
+
+    // Calibrated to what one catalogue costs the real report as a stored
+    // block, so the saving measured here is the saving the real file gets.
+    const stored = escaped(JSON.stringify(catalogues[0]));
+    expect(Math.abs(stored.length - CATALOGUE_STORED_CHARS)).toBeLessThan(1_000);
+  }, 60_000);
+
+  test("the shared toolkits object is stored once and the report shrinks by the difference", async () => {
     const dir = join(scratch, "real-shape");
     const files = await writeRealShapeRuns(dir, 5);
     const { html } = await renderDir(dir, "real-shape.html");
@@ -1595,53 +1737,98 @@ describe("report size on the live-evidence shape", () => {
     );
     const hits = loaded.flatMap((run) => run.hookHits);
 
-    expect(files).toHaveLength(5);
     expect(hits).toHaveLength(20);
     expect(hits.filter((hit) => hit.bodyBytes === CATALOGUE_BODY_BYTES)).toHaveLength(5);
     expect(hits.filter((hit) => hit.bodyBytes === SMALL_BODY_BYTES)).toHaveLength(15);
 
-    // Twenty payload occurrences, six distinct bodies: the catalogue is shared
-    // across runs and the three small hits share within each run.
-    const distinct = new Set(hits.map((hit) => JSON.stringify(hit.payload)));
-    expect(distinct.size).toBe(6);
+    // Whole-payload deduplication correctly declines the five catalogues —
+    // they differ — so exactly one `toolkits` store carries what they share.
     const embedded = [...html.matchAll(/<pre id="([^"]*)">([\s\S]*?)<\/pre>/g)];
-    expect(embedded).toHaveLength(distinct.size);
-    expect(html.match(/<div class="json" data-payload=/g)).toHaveLength(20);
+    const stores = embedded.filter(([, id]) => id!.includes("--toolkits-"));
+    expect(stores).toHaveLength(1);
+    expect(html.match(/data-shared="[^"]*"/g)).toHaveLength(5);
 
-    // What a pre-#25 report spent on payloads alone: one escaped,
-    // pretty-printed copy per hit.
+    // Every catalogue payload still shows its own `user_id`, in its own bytes.
+    for (const run of loaded) {
+      expect(html).toContain(escaped(`"user_id": "${run.userId}"`));
+    }
+
     const before = hits.reduce(
       (sum, hit) => sum + escaped(JSON.stringify(hit.payload, null, 2)).length,
       0,
     );
     const after = Buffer.byteLength(html, "utf8");
-    // A ceiling rather than a ratio, so this is a regression guard: the whole
-    // document, chrome and explorer included, must stay under 3.2 MB on a shape
-    // whose payloads alone used to cost over 22 MB.
-    expect(after).toBeLessThan(3_200_000);
+    // A ceiling, not a ratio: a regression guard on the whole document.
+    expect(after).toBeLessThan(3_000_000);
     expect(before).toBeGreaterThan(20_000_000);
-    expect(before / after).toBeGreaterThan(7);
 
-    // Nothing was truncated to get there. The catalogue's embedded copy is
-    // whole — it parses back to a payload with every toolkit and every tool.
-    const catalogue = embedded
-      .map((match) => match[2]!)
-      .reduce((longest, body) => (body.length > longest.length ? body : longest), "");
-    const decoded = catalogue
-      .replaceAll("&quot;", '"')
-      .replaceAll("&#39;", "'")
-      .replaceAll("&gt;", ">")
-      .replaceAll("&lt;", "<")
-      .replaceAll("&amp;", "&");
-    const parsed = JSON.parse(decoded) as { toolkits: Record<string, { tools: object }> };
-    expect(Object.keys(parsed.toolkits)).toHaveLength(CATALOGUE_TOOLKITS);
+    // Nothing was truncated to get there: the store parses back to the whole
+    // catalogue, and each payload's own fields plus that store reconstruct the
+    // payload byte for byte.
+    const storedToolkits = JSON.parse(unescaped(stores[0]![2]!));
+    expect(Object.keys(storedToolkits)).toHaveLength(CATALOGUE_TOOLKITS);
     expect(
-      Object.values(parsed.toolkits).reduce(
+      Object.values(storedToolkits as Record<string, { tools: object }>).reduce(
         (sum, toolkit) => sum + Object.keys(toolkit.tools).length,
         0,
       ),
     ).toBe(CATALOGUE_TOOLS);
-    expect(Buffer.byteLength(JSON.stringify(parsed), "utf8")).toBe(CATALOGUE_BODY_BYTES);
+
+    const ownFields = embedded.filter(([, id]) => /--payload-2$/.test(id!));
+    expect(ownFields.length).toBeGreaterThan(0);
+    const rebuilt = { ...JSON.parse(unescaped(ownFields[0]![2]!)), toolkits: storedToolkits };
+    const original = loaded[0]!.hookHits[1]!.payload;
+    expect(JSON.stringify(rebuilt)).toBe(JSON.stringify(original));
+    expect(Buffer.byteLength(JSON.stringify(rebuilt), "utf8")).toBe(CATALOGUE_BODY_BYTES);
+  }, 60_000);
+
+  test("a toolkits object that differs is never folded into a shared store", async () => {
+    // The trap, one level down from the whole-payload one. Run 3's `toolkits`
+    // is byte-for-byte the same *length* as the other two and differs by one
+    // tool name, so a split that compared sizes — or trusted that catalogues
+    // "look alike" — would erase a real difference in a report whose entire
+    // subject is a hook whose behaviour is invisible unless measured.
+    const dir = join(scratch, "real-shape-differs");
+    const files = await writeRealShapeRuns(dir, 3);
+    const third = join(dir, files[2]!);
+    const run = JSON.parse(await Bun.file(third).text()) as {
+      hookHits: { payload: { toolkits: Record<string, { tools: Record<string, unknown> }> } }[];
+    };
+    const toolkits = run.hookHits[1]!.payload.toolkits;
+    const name = Object.keys(toolkits)[0]!;
+    const tools = toolkits[name]!.tools;
+    const renamed = Object.keys(tools)[0]!;
+    // Same length, different name: `Tool_0000` becomes `Tool_9000`.
+    const swapped = `Tool_9${renamed.slice(6)}`;
+    expect(swapped).toHaveLength(renamed.length);
+    tools[swapped] = tools[renamed]!;
+    delete tools[renamed];
+    await Bun.write(third, JSON.stringify(run));
+
+    const reread = parseRun(files[2]!, await Bun.file(third).text());
+    const changed = reread.hookHits[1]!.payload as { toolkits: unknown };
+    const original = (
+      parseRun(files[0]!, await Bun.file(join(dir, files[0]!)).text()).hookHits[1]!.payload as {
+        toolkits: unknown;
+      }
+    ).toolkits;
+    // Equal length, unequal bytes — the whole point of the fixture.
+    expect(JSON.stringify(changed.toolkits)).toHaveLength(JSON.stringify(original).length);
+    expect(JSON.stringify(changed.toolkits)).not.toBe(JSON.stringify(original));
+
+    const { html } = await renderDir(dir, "real-shape-differs.html");
+    const stores = [...html.matchAll(/<pre id="([^"]*--toolkits-[^"]*)">([\s\S]*?)<\/pre>/g)];
+
+    // Runs 1 and 2 share one object, so one store with two references. Run 3
+    // shares with nobody, so it is embedded whole and references nothing.
+    expect(stores).toHaveLength(1);
+    expect(html.match(/data-shared="[^"]*"/g)).toHaveLength(2);
+    expect(stores[0]![2]).not.toContain(swapped);
+
+    // …and the tool that differs is on the page, in full, which is what a
+    // collapse would have destroyed.
+    expect(html).toContain(swapped);
+    expect(unescaped(html)).toContain(JSON.stringify(changed.toolkits).slice(0, 200));
   }, 60_000);
 
   test("large payloads are embedded compact and small ones stay pretty-printed", async () => {

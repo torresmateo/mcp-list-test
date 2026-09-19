@@ -1,27 +1,29 @@
 /**
  * The shape the live run actually produced, rebuilt on demand.
  *
- * Issue #25 was filed against measured evidence, not a hunch: five runs against
- * the real Arcade gateway produced a 26.0 MB `results/report.html` with twenty
- * `<pre>` blocks, five of them 5,061,881 characters each. Per session there are
- * **four hook hits**:
+ * Issue #25 was filed against measured evidence: five runs against the real
+ * Arcade gateway produced a 26.09 MB `results/report.html`. Per session there
+ * are **four hook hits** — `initialize` causes two, one 15,340 B hit carrying
+ * 2 toolkits and 40 tools and one 1,598,220 B hit carrying 125 toolkits and
+ * 8,258 tools; `tools/list` causes two, both 15,340 B — and three of the four
+ * payloads in a session are byte-identical to each other.
  *
- * - `initialize` causes two — one 15,340 B hit carrying 2 toolkits and 40
- *   tools, and one 1,598,220 B hit carrying 125 toolkits and 8,258 tools;
- * - `tools/list` causes two, both 15,340 B.
+ * **Corrected 2026-09-19.** An earlier version of this file encoded the claim
+ * that the catalogue payload is *byte-identical across all five runs*. It is
+ * not. Verified on the operator's real run files:
  *
- * Three of the four payloads in a session are byte-identical to each other (the
- * small ones, which carry the session's own `user_id`), and **the catalogue
- * payload is byte-identical across runs** — that last property is the one the
- * 20 MB of duplication came from, and it is reproduced here deliberately: the
- * catalogue hit carries a `user_id` that does not vary by session, because that
- * is what "byte-identical across all five runs" means. Why the gateway sends it
- * that way is a question for the engine team, not for the renderer.
+ * ```
+ * full payload sha : 6745972720, 7df6d57d53, 4b72142c07, ec99e22d00, 0711875b38
+ * toolkits sha     : da65f51679 x5
+ * payload keys     : ["toolkits", "user_id"]
+ * ```
  *
- * One caveat, stated so nobody reads more into the measurement than is there:
- * this payload's structure inflates slightly less under pretty-printing and
- * HTML escaping than the operator's did (2.77x against 3.17x), so the saving it
- * measures is a little **conservative** — the real file gains more, not less.
+ * The five payloads differ, and they differ **only in `user_id`** — their
+ * `toolkits` objects are identical. Whole-payload deduplication is therefore
+ * right to decline collapsing them, and the saving comes from storing the
+ * shared `toolkits` object once instead. The old fixture measured a shape that
+ * does not occur and flattered the feature, which is worse than having no
+ * fixture at all.
  *
  * This is a builder rather than committed JSON because the files are ~1.7 MB
  * each: committing five of them would put 8 MB of generated data in a repo
@@ -41,13 +43,20 @@ export const CATALOGUE_TOOLKITS = 125;
 export const CATALOGUE_TOOLS = 8_258;
 
 /**
- * The `user_id` on the catalogue payload.
+ * What one catalogue payload costs the report as a stored `<pre>`: compact JSON
+ * with the HTML escape applied, measured at 2,610,190 characters on the real
+ * file (five of them, 13.05 MB of a 13.37 MB report).
  *
- * Constant across sessions on purpose — see the file header. Without it the
- * catalogue payloads would differ by one field and the cross-run duplication
- * issue #25 measured could not be reproduced at all.
+ * Compact size alone does not predict that — escaping charges five characters
+ * for every `"` — so the generated catalogue is calibrated to land on it, by
+ * giving a deterministic fraction of tools an extra field. Without the
+ * calibration the fixture would understate what the real file pays and so
+ * understate what the saving is worth.
  */
-const CATALOGUE_USER_ID = "probe-2025-11-25-catalogue";
+export const CATALOGUE_STORED_CHARS = 2_610_190;
+
+/** How often a tool carries the extra `tags` field. See {@link CATALOGUE_STORED_CHARS}. */
+const TAGGED_EVERY = 9;
 
 type ToolVersions = {
   version: string;
@@ -55,8 +64,8 @@ type ToolVersions = {
     scopes: string[];
     category: string;
     deprecated: boolean;
-    requiresAuth: boolean;
     description: string;
+    tags?: string[];
   };
 }[];
 type Toolkits = Record<string, { tools: Record<string, ToolVersions> }>;
@@ -78,8 +87,11 @@ function toolkits(toolkitCount: number, toolCount: number): Toolkits {
           scopes: ["read", "write"],
           category: "operations",
           deprecated: false,
-          requiresAuth: true,
           description: "",
+          // Not every tool carries the same fields in a real catalogue, and the
+          // quote count is what the HTML escape charges for. See
+          // CATALOGUE_STORED_CHARS.
+          ...(index % TAGGED_EVERY === 0 ? { tags: ["beta"] } : {}),
         },
       },
     ];
@@ -139,13 +151,27 @@ function description(n: number): string {
   return words.repeat(Math.ceil(n / words.length)).slice(0, n);
 }
 
-/** The catalogue payload, built once: every session sends the same bytes. */
-const cataloguePayload = payload(
-  CATALOGUE_USER_ID,
+/**
+ * The catalogue `toolkits` object, built once and shared by every session — the
+ * one thing the real runs genuinely have in common.
+ *
+ * Padded against a reference `user_id`, and every generated id is the same
+ * length, so each session's catalogue payload serialises to exactly
+ * {@link CATALOGUE_BODY_BYTES} while differing from the others in that field
+ * alone. That is the measured shape: five payloads, five digests, one
+ * `toolkits`.
+ */
+const catalogueToolkits = payload(
+  probeUserId(1),
   CATALOGUE_TOOLKITS,
   CATALOGUE_TOOLS,
   CATALOGUE_BODY_BYTES,
-);
+).toolkits;
+
+/** One session's catalogue payload: its own id, everyone's `toolkits`. */
+function cataloguePayload(userId: string): Payload {
+  return { user_id: userId, toolkits: catalogueToolkits };
+}
 
 function hit(receivedAt: string, body: Payload, toolkitCount: number, toolCount: number) {
   return {
@@ -164,9 +190,19 @@ function hit(receivedAt: string, body: Payload, toolkitCount: number, toolCount:
   };
 }
 
+/**
+ * The generated user id for one repetition.
+ *
+ * Fixed width on purpose: the catalogue payloads must differ in this field and
+ * agree on their byte count, which is exactly what the real run files do.
+ */
+function probeUserId(repetition: number): string {
+  return `probe-2025-11-25-178976880000${repetition}-${repetition}`;
+}
+
 /** One run file in the measured shape: 4 hits, 2 on `initialize`, 2 on `tools/list`. */
 export function realShapeRun(repetition: number) {
-  const userId = `probe-2025-11-25-178976880000${repetition}-${repetition}`;
+  const userId = probeUserId(repetition);
   const small = payload(userId, SMALL_TOOLKITS, SMALL_TOOLS, SMALL_BODY_BYTES);
   const stamp = (offsetMs: number) =>
     new Date(Date.UTC(2026, 8, 18, 22, 0, repetition, offsetMs)).toISOString();
@@ -211,7 +247,7 @@ export function realShapeRun(repetition: number) {
     ],
     hookHits: [
       hit(stamp(60), small, SMALL_TOOLKITS, SMALL_TOOLS),
-      hit(stamp(120), cataloguePayload, CATALOGUE_TOOLKITS, CATALOGUE_TOOLS),
+      hit(stamp(120), cataloguePayload(userId), CATALOGUE_TOOLKITS, CATALOGUE_TOOLS),
       hit(stamp(380), small, SMALL_TOOLKITS, SMALL_TOOLS),
       hit(stamp(440), small, SMALL_TOOLKITS, SMALL_TOOLS),
     ],

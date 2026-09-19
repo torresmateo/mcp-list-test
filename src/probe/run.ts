@@ -26,8 +26,10 @@
  * itself (DESIGN.md decision 19). The timeline used to hold only metadata about
  * a request — method, id, timing — so the report could say *when* a frame
  * crossed and never *what* crossed, and printed `body not recorded` for every
- * row. Both are read inside the request log's existing pass-through, so neither
- * clones nor buffers the response the transport is reading.
+ * row. Both are the **raw frame text**, redacted at capture, read inside the
+ * request log's existing pass-through — so neither clones nor buffers the
+ * response the transport is reading, and neither is a re-serialisation of a
+ * parse of the message.
  *
  * `toolsListResult` is the other half of that pair (DESIGN.md decision 18):
  * `hookHits` is what the gateway told the hook, `toolsListResult` is what the
@@ -61,14 +63,20 @@ export interface RunRequest {
   jsonRpcId: string | number;
   method: string;
   /**
-   * The JSON-RPC request frame the probe put on the wire, whole (DESIGN.md
-   * decision 19). Recorded, never rebuilt: `src/client/request-log.ts` parses
-   * the bytes the transport handed `fetch`, so every key travels.
+   * The JSON-RPC request frame the probe put on the wire — **the raw text**,
+   * with credential values redacted at capture (DESIGN.md decision 19).
+   *
+   * A string, not an object, and the difference is the criterion: a frame that
+   * has been through `JSON.parse` and back out is a re-serialisation, and a
+   * re-serialisation has already dropped a duplicate key and normalised the
+   * spacing. `src/client/request-log.ts` parses the bytes only to match an id
+   * and a method; what it stores is the source slice.
    */
-  requestFrame: unknown;
+  requestFrame: string;
   /**
-   * The JSON-RPC reply frame the gateway sent back, whole, or `null` when the
-   * response stream ended without a reply carrying this request's id.
+   * The JSON-RPC reply frame the gateway sent back — the raw text as it
+   * arrived, redacted — or `null` when the response stream ended without a
+   * reply carrying this request's id.
    *
    * `null` is the measurement "no reply was observed", the same condition
    * `responseObserved: false` reports, and it is deliberately not `{}` — an
@@ -80,7 +88,7 @@ export interface RunRequest {
    * trimmed to the fields the spec names — the loss #26 measured for
    * `arcadeToolkit`. See `src/client/request-log.ts`.
    */
-  responseFrame: unknown;
+  responseFrame: string | null;
   /** Present only when this request followed a pagination cursor. */
   cursor?: string;
   sentAt: string;

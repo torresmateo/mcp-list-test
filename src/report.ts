@@ -57,24 +57,30 @@ export interface RunRequest {
   /** Written only when this `tools/list` request followed a `nextCursor`. */
   cursor?: string;
   /**
-   * The JSON-RPC request frame the probe put on the wire, whole (#31,
-   * DESIGN.md decision 19).
+   * The JSON-RPC request frame the probe put on the wire: **the raw text**,
+   * credential values already redacted at capture (#31, DESIGN.md decision 19).
+   *
+   * A string rather than a parsed value, because the probe stores the source
+   * slice rather than a re-serialisation of it, and this renderer shows it the
+   * same way — verbatim, never pretty-printed through `JSON.parse`. A round
+   * trip here would undo the capture one level further out and drop exactly
+   * what the capture exists to keep.
    *
    * `undefined` is a run file written before that capture existed and says
    * nothing at all — the row still renders and still says so in words. It is
    * the reason this is optional rather than required: the operator has evidence
    * from before this slice and it has to stay readable.
    */
-  requestFrame?: unknown;
+  requestFrame?: string;
   /**
-   * The JSON-RPC reply frame, whole, or `null` when the stream ended without a
-   * reply carrying this request's id.
+   * The JSON-RPC reply frame as raw text, or `null` when the stream ended
+   * without a reply carrying this request's id.
    *
    * Three states, three different sentences, and none of them is `{}`:
    * `undefined` is a pre-#31 run file; `null` is the measurement "no reply was
-   * observed"; anything else is the frame the gateway sent.
+   * observed"; a string is the frame the gateway sent.
    */
-  responseFrame?: unknown;
+  responseFrame?: string | null;
 }
 
 /**
@@ -340,6 +346,31 @@ function optionalBody(holder: Record<string, unknown>, key: string): unknown {
   return key in holder ? holder[key] : undefined;
 }
 
+/**
+ * A recorded **frame**: the raw JSON text that crossed the wire.
+ *
+ * Three states, and absence is decided by whether the key is present rather
+ * than by whether the value is nullish, because `null` is a real answer here —
+ * "no reply carrying this request's id was seen". A key that *is* there and
+ * holds something other than text is an error naming the file: optional means
+ * "may be missing", not "may be anything", and a frame that is not text is a
+ * frame somebody re-serialised.
+ */
+function optionalFrameText(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+  nullable: boolean,
+): string | null | undefined {
+  if (!(key in holder)) return undefined;
+  const value = holder[key];
+  if (value === null && nullable) return null;
+  if (typeof value !== "string") {
+    fail(file, `${key} must be the raw frame text (a string)${nullable ? " or null" : ""}`);
+  }
+  return value;
+}
+
 function optionalBoolean(
   file: string,
   holder: Record<string, unknown>,
@@ -424,8 +455,10 @@ export function parseRun(file: string, text: string): Run {
         authorizationScheme: optionalString(file, entry, "authorizationScheme"),
         responseObserved: optionalBoolean(file, entry, "responseObserved"),
         cursor: optionalString(file, entry, "cursor"),
-        requestFrame: optionalBody(entry, "requestFrame"),
-        responseFrame: optionalBody(entry, "responseFrame"),
+        // A request frame has no null state: the probe holds the bytes it sent.
+        // A response frame does — `null` is "no reply carrying this id was seen".
+        requestFrame: optionalFrameText(file, entry, "requestFrame", false) ?? undefined,
+        responseFrame: optionalFrameText(file, entry, "responseFrame", true),
       }),
     };
   });
@@ -1273,6 +1306,14 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     anchor: string,
     label: string,
     displayDigest?: string,
+    /**
+     * How this body's embedded copy is written. Defaults to {@link storedText},
+     * which indents a small body for the no-script reader. A **raw frame** uses
+     * identity instead: it is stored as it arrived, and indenting it would mean
+     * parsing and re-emitting it, which is the loss the capture exists to
+     * prevent — one level further out.
+     */
+    storedAs: (text: string) => string = storedText,
   ): PayloadPlacement => {
     const tally = bodies[kind];
     tally.occurrences += 1;
@@ -1283,7 +1324,7 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
       return { anchor, digest: displayDigest ?? digest, storedAt: anchor };
     }
     tally.repeats += 1;
-    charsSaved += escapeHtml(storedText(body)).length;
+    charsSaved += escapeHtml(storedAs(body)).length;
     return {
       anchor,
       digest: displayDigest ?? earlier.digest,
@@ -1382,8 +1423,19 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
         hookResponseLabel(file, index),
       ),
     );
+    // A frame is already JSON *text*, so it is its own store key: running it
+    // through `payloadText` would JSON-encode the string and change both the
+    // digest and the bytes on the page.
+    const placeFrame = (
+      kind: BodyKind,
+      text: string | null | undefined,
+      anchor: string,
+      label: string,
+    ): PayloadPlacement | null =>
+      typeof text === "string" ? place(kind, text, anchor, label, undefined, rawText) : null;
+
     const mcpFrames = run.requests.map((request, index): McpFramePlacement => ({
-      request: placeOptional(
+      request: placeFrame(
         "mcp-request-frame",
         request.requestFrame,
         requestFrameAnchor(file, index),
@@ -1391,15 +1443,12 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
       ),
       // A `null` frame is the measurement "no reply was observed" and has no
       // body to embed; the row says so in words rather than storing a `null`.
-      response:
-        request.responseFrame === null
-          ? null
-          : placeOptional(
-              "mcp-response-frame",
-              request.responseFrame,
-              responseFrameAnchor(file, index),
-              responseFrameLabel(file, index),
-            ),
+      response: placeFrame(
+        "mcp-response-frame",
+        request.responseFrame,
+        responseFrameAnchor(file, index),
+        responseFrameLabel(file, index),
+      ),
     }));
     const toolsListResult = Array.isArray(run.toolsListResult)
       ? place(
@@ -1484,6 +1533,19 @@ export function storedPayload(payload: unknown): string {
  * must not have to parse a body back into a value just to ask how long the
  * stored form would be.
  */
+/**
+ * A body stored exactly as it arrived.
+ *
+ * The identity function, named so the call site says *why* it is not
+ * {@link storedText}: a raw frame is the bytes off the wire, and pretty-printing
+ * it means `JSON.parse` followed by `JSON.stringify`, which would drop a
+ * duplicate key and normalise the spacing in the one copy a reader checks.
+ * Nothing is truncated either way.
+ */
+export function rawText(text: string): string {
+  return text;
+}
+
 export function storedText(compact: string): string {
   return Buffer.byteLength(compact, "utf8") > PRETTY_PAYLOAD_MAX_BYTES
     ? compact
@@ -2161,9 +2223,37 @@ function sharedToolkitsTextOf(payload: unknown): string {
  * copy of this shape is how the dedupe sentence went wrong twice before.
  */
 function bodyBlock(body: unknown, placement: PayloadPlacement, heading: string): string {
+  return renderBody(storedPayload(body), payloadTextOf(body), placement, heading);
+}
+
+/**
+ * A **raw frame**, embedded as the bytes that crossed the wire.
+ *
+ * The `<pre>` holds the frame text verbatim: no indentation, because indenting
+ * it would mean parsing and re-emitting it, and a frame that has been through
+ * that round trip is missing a duplicate key and its original spacing — the
+ * exact loss the capture exists to prevent (#31 criterion 3). The explorer
+ * beside it *does* parse, so a duplicate key shows as its last value in the
+ * tree; the `<pre>` is the evidence and the tree is the convenience, which is
+ * the same division this report has always drawn.
+ */
+function rawFrameBlock(text: string, placement: PayloadPlacement, heading: string): string {
+  return renderBody(text, text, placement, heading);
+}
+
+/** The shared shape: a summary line, the explorer mount, and the one copy. */
+function renderBody(
+  stored: string,
+  measured: string,
+  placement: PayloadPlacement,
+  heading: string,
+): string {
   const mount = `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"></div>`;
-  const size = Buffer.byteLength(payloadTextOf(body), "utf8");
-  const summary = [heading, `${size} B`, `sha256 ${placement.digest}`]
+  const summary = [
+    heading,
+    `${Buffer.byteLength(measured, "utf8")} B`,
+    `sha256 ${placement.digest}`,
+  ]
     .concat(placement.sameAs === undefined ? [] : [`identical to ${placement.sameAs.label}`])
     .map(escapeHtml)
     .join(" \u00b7 ");
@@ -2172,7 +2262,7 @@ function bodyBlock(body: unknown, placement: PayloadPlacement, heading: string):
     placement.sameAs === undefined
       ? [
           `<details class="raw"><summary>raw JSON</summary>`,
-          `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(storedPayload(body))}</pre>`,
+          `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(stored)}</pre>`,
           `</details>`,
         ].join("\n")
       : `<p class="repeat-note">Byte-identical to ` +
@@ -2180,11 +2270,7 @@ function bodyBlock(body: unknown, placement: PayloadPlacement, heading: string):
         `${escapeHtml(placement.sameAs.label)}</a>, which carries the one embedded copy. ` +
         `Compared byte for byte; sha-256 is <code>${escapeHtml(placement.digest)}</code>.</p>`;
 
-  return [
-    `<p class="repeat-note">${summary}</p>`,
-    mount,
-    embedded,
-  ].join("\n");
+  return [`<p class="repeat-note">${summary}</p>`, mount, embedded].join("\n");
 }
 
 /** One `<dt>`/`<dd>` pair, with `not recorded` for anything the run file lacks. */
@@ -2255,12 +2341,12 @@ function mcpFrameBlocks(request: RunRequest, frames: McpFramePlacement): string 
       `<p class="empty">not recorded \u2014 this run file predates the MCP frame capture.</p>`,
     );
   } else {
-    parts.push(bodyBlock(request.requestFrame, frames.request, "request frame"));
+    parts.push(rawFrameBlock(request.requestFrame!, frames.request, "request frame"));
   }
 
   parts.push(`<h5>gateway \u2192 probe (MCP response frame)</h5>`);
   if (frames.response !== null) {
-    parts.push(bodyBlock(request.responseFrame, frames.response, "response frame"));
+    parts.push(rawFrameBlock(request.responseFrame!, frames.response, "response frame"));
   } else if (request.responseFrame === null) {
     parts.push(
       `<p class="empty">No reply carrying this request\u2019s JSON-RPC id was seen on the ` +
@@ -2774,10 +2860,15 @@ function runSection(entry: LoadedRun, placements: RunPlacements): string {
     `</dl>`,
     `<h4>wire timeline (${run.requests.length} requests, ${run.hookHits.length} hook hits)</h4>`,
     `<p class="sub">Every request the client sent and every hit the counter received, in one` +
-      ` sequence, oldest first. Each row expands: a hook hit shows its payload and its headers,` +
-      ` an MCP request shows what the run JSON holds for it. Expanding needs no network, and no` +
-      ` scripting — the explorer is an enhancement over a plain <code>&lt;pre&gt;</code> that is` +
-      ` already there.</p>`,
+      ` sequence, oldest first. Each row expands: a hook hit shows the payload it carried, its` +
+      ` headers and the answer this hook sent back; an MCP request shows both JSON-RPC frames,` +
+      ` as the bytes that crossed the wire rather than a re-serialisation of them. Expanding` +
+      ` needs no network, and no scripting — the explorer is an enhancement over a plain` +
+      ` <code>&lt;pre&gt;</code> that is already there.` +
+      ` A value under an <code>authorization</code>, <code>proxy-authorization</code>,` +
+      ` <code>cookie</code>, <code>set-cookie</code> or <code>x-api-key</code> key reads as` +
+      ` <code>&lt;redacted len=… sha256=…&gt;</code> wherever it appears: the key name is` +
+      ` evidence, the secret was replaced at capture and never reached this file.</p>`,
     timeline,
     toolsListResultBlock(entry, placements.toolsListResult),
     `</section>`,

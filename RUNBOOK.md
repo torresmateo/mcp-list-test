@@ -55,8 +55,11 @@ echo "PORT_WEB=$PORT_WEB"
 bun test
 ```
 
-**You should see** a port number, and a green suite. It is `138 pass`, `0 fail`
-today. `bun test` needs no network and no credentials.
+**You should see** a port number, and a green suite: **`0 fail`, `0 skipped`**.
+The count today is `165 pass`, and it grows as slices land — so treat `0 fail`
+as the check and the count as a footnote, not the other way round. A count that
+is merely *different* from this line is this line being out of date; a non-zero
+`fail`, or any `skip`, is not. `bun test` needs no network and no credentials.
 
 **If you do not:** an empty `PORT_WEB` means `scripts/orca-setup.sh` has not run
 in this worktree; run it. A failing suite is a code problem, not an operator

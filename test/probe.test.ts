@@ -468,6 +468,40 @@ describe("attribution", () => {
     expect(result.stdout).not.toContain("probe-2025-11-25");
   }, SPAWN_TIMEOUT_MS);
 
+  test("a whitespace-only prefix exits non-zero instead of quietly using `probe`", async () => {
+    /**
+     * Review round 1, finding 1, pinned end to end.
+     *
+     * `ARCADE_USER_ID_PREFIX=" "` used to reach here as `probe`: exit 0, a run
+     * file, a hook hit, every number plausible — and every one of them measured
+     * under an id the operator never chose. That is this project's signature
+     * failure, not a formatting quibble: `probe` is a real key that really
+     * works, so nothing anywhere in the output would have looked wrong.
+     *
+     * Supplied-but-blank is a mistake, not an omission. `ARCADE_USER_ID_PREFIX=`
+     * (the empty string) is the omission, and it still defaults — the test above
+     * covers that, and criterion 6 depends on it.
+     */
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerList: 1 });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      env: { ARCADE_USER_ID_PREFIX: " " },
+      args: ["--repetitions", "1"],
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("ARCADE_USER_ID_PREFIX");
+    expect(result.files).toEqual([]);
+    expect(fake.hookCalls).toEqual([]);
+    // The specific regression: not one byte of output mentions the default it
+    // used to fall back to.
+    expect(result.stdout).not.toContain("probe-2025-11-25");
+    expect(result.stderr).not.toContain("probe-2025-11-25");
+  }, SPAWN_TIMEOUT_MS);
+
   test("the run file carries every field the counter records per hit", async () => {
     // The cross-slice check neither side's suite could have made. The probe was
     // written against a counter that recorded `receivedAt` and `payload`;

@@ -17,8 +17,9 @@ export const REQUIRED_PROBE_ENV = [
 ] as const;
 
 /**
- * The one optional entry in the DESIGN.md Environment table. Absent, the
- * default applies; it never causes an exit. A *bad* value does.
+ * The one optional entry in the DESIGN.md Environment table. Absent or empty,
+ * the default applies; it never causes an exit. A value that was *supplied* and
+ * is bad does — whitespace-only included.
  */
 export const USER_ID_PREFIX_ENV = "ARCADE_USER_ID_PREFIX";
 
@@ -89,19 +90,30 @@ export function loadEnv<const T extends readonly string[]>(
  * The `<prefix>` of the generated `user_id` (DESIGN.md Contracts -> Probe CLI
  * step 1): `$ARCADE_USER_ID_PREFIX`, or `probe`.
  *
- * Unset, empty, or whitespace-only means "I have not filled this in" and gets
- * the default — the same reading `loadEnv` gives a blank required variable.
- * Anything else is validated against {@link USER_ID_PREFIX_PATTERN} as written,
- * untrimmed, and a value that fails throws `InvalidEnvError` naming the
- * variable. It is never trimmed, repaired, or quietly swapped for the default:
- * a run that used `probe` while the operator believed it used their prefix
- * would poll a key the gateway never saw and report an empty `hookHits`.
+ * Two cases, and the line between them is the whole point:
+ *
+ *  - **Absent or empty** (unset, or `ARCADE_USER_ID_PREFIX=`). The variable was
+ *    not supplied, so the default applies and nothing about the run changes.
+ *  - **Supplied but invalid** — `" "`, a tab, or anything else failing
+ *    {@link USER_ID_PREFIX_PATTERN}. The operator meant something and got it
+ *    wrong, so this throws `InvalidEnvError` naming the variable.
+ *
+ * Whitespace-only is the *second* case, not the first. `loadEnv` reads a blank
+ * required variable as "I have not filled this in" and that is right for a
+ * credential, where the next thing that happens is a loud `missing <VAR>`.
+ * Here the next thing that happens would be a completed run under `probe`,
+ * which is not the prefix the operator asked for. The value is never trimmed,
+ * repaired, or quietly swapped for the default: the prefix goes out in an HTTP
+ * header and comes back in a `GET /hits?user_id=` query, so a run that used
+ * `probe` while the operator believed it used theirs polls a key the gateway
+ * never saw and reports an empty `hookHits` — a clean zero indistinguishable
+ * from "the hook never fired", which is the measurement.
  */
 export function loadUserIdPrefix(
   env: Record<string, string | undefined> = process.env,
 ): string {
   const raw = env[USER_ID_PREFIX_ENV];
-  if (raw === undefined || raw.trim() === "") return DEFAULT_USER_ID_PREFIX;
+  if (raw === undefined || raw === "") return DEFAULT_USER_ID_PREFIX;
   if (!USER_ID_PREFIX_PATTERN.test(raw)) {
     throw new InvalidEnvError(
       USER_ID_PREFIX_ENV,

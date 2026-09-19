@@ -95,7 +95,7 @@ names are fixed by the Environment table in `DESIGN.md`:
 | `ARCADE_MCP_URL`        | operator                | Streamable HTTP endpoint of the test gateway        |
 | `HOOK_BEARER_TOKEN`     | operator                | Token the gateway sends; hook rejects anything else |
 | `HOOK_PUBLIC_URL`       | operator                | ngrok URL, recorded in run JSON for provenance      |
-| `ARCADE_USER_ID_PREFIX` | operator, **optional**  | Replaces `probe` in the generated `user_id`. Unset, the default applies and nothing else changes |
+| `ARCADE_USER_ID_PREFIX` | operator, **optional**  | Replaces `probe` in the generated `user_id`. Unset or empty, the default applies and nothing else changes. Supplied and invalid — `" "` included — is an exit, not a fallback |
 
 Nothing skips when a variable is absent. Every command that needs one loads it
 through `loadEnv()` in `src/env.ts`, which exits non-zero and prints
@@ -113,7 +113,21 @@ missing ARCADE_API_KEY
 ```console
 $ ARCADE_USER_ID_PREFIX="my probe" bun run probe --protocol 2025-11-25
 invalid ARCADE_USER_ID_PREFIX="my probe": must match ^[A-Za-z0-9._-]+$
+
+$ ARCADE_USER_ID_PREFIX=" " bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX=" ": must match ^[A-Za-z0-9._-]+$
 ```
+
+Two cases, and the line between them is the whole point:
+
+| `.env.local` says | What happens |
+| --- | --- |
+| nothing, or `ARCADE_USER_ID_PREFIX=` | The variable was not supplied. `probe` applies and nothing about the run changes |
+| `ARCADE_USER_ID_PREFIX=" "`, or anything else failing the rule | The variable *was* supplied and is wrong. Exit 1 naming it |
+
+A lone space is the second case. It is the easiest version of this mistake to
+make and the hardest to spot in a `.env.local`, and treating it as an omission
+would produce a completed run under `probe` with every number looking healthy.
 
 The alphabet is narrow because the prefix ends up in two places that do not
 agree on what survives: the Arcade user header, and the `GET /hits?user_id=`
@@ -125,7 +139,8 @@ clean zero indistinguishable from "the hook never fired", which is the thing
 this repo exists to measure. So a bad value is a non-zero exit naming the
 variable, and it never falls back to `probe`: a run that quietly measured the
 default while the operator believed it measured their prefix is the same wrong
-answer wearing a different hat.
+answer wearing a different hat — and `probe` is a real key that really works, so
+nothing in the output would look wrong.
 
 ## The probe
 

@@ -246,7 +246,7 @@ it.** `ARCADE_USER_ID_PREFIX` replaces the literal `probe` at the front of the
 generated user ids, so a run is recognisable as yours in the hook log:
 
 ```sh
-ARCADE_USER_ID_PREFIX=mateo-2026-09-18   # optional; `probe` if you omit it
+ARCADE_USER_ID_PREFIX=mateo-2026-09-18   # optional; `probe` if you omit the line
 ```
 
 Set it and the ids read `mateo-2026-09-18-2025-11-25-<timestamp>-1` through
@@ -277,10 +277,12 @@ defaults. A variable set to an empty value counts as missing, so a stray
 `ARCADE_API_KEY=` is the same as no line at all.
 
 `ARCADE_USER_ID_PREFIX` is the one exception to "missing is an error" — and the
-only one. Omit it and you get `probe`, silently and by design. Set it to
-something the header and the query would not agree on and the probe refuses
-before it sends a byte, rather than measuring under the default and letting you
-believe otherwise:
+only one. Omit the line, or leave it as a bare `ARCADE_USER_ID_PREFIX=`, and you
+get `probe`, silently and by design.
+
+**Supplying a bad value is a different thing from not supplying one, and the
+probe treats it differently.** It refuses before it sends a byte, rather than
+measuring under the default and letting you believe otherwise:
 
 ```console
 $ ARCADE_USER_ID_PREFIX="my probe" bun run probe --protocol 2025-11-25
@@ -288,6 +290,20 @@ invalid ARCADE_USER_ID_PREFIX="my probe": must match ^[A-Za-z0-9._-]+$
 ```
 
 Exit 1, no run file, no session. Fix the value or delete the line.
+
+**A line holding only spaces or a tab is a bad value, not an omission**, and it
+refuses the same way:
+
+```console
+$ ARCADE_USER_ID_PREFIX=" " bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX=" ": must match ^[A-Za-z0-9._-]+$
+```
+
+That is deliberate, and it is the one case here worth slowing down for. A stray
+space is invisible in `.env.local`, and the alternative — quietly falling back
+to `probe` — would give you a run that finished, wrote its files and filled in
+every number, all under an id you did not choose. Nothing in step 6 would flag
+it, because `probe` is a real key the counter really answers for.
 
 ---
 

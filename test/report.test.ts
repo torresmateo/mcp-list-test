@@ -5,6 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hitsForMethod, parseRun } from "../src/report.ts";
 import {
+  TOOLS_LIST_RESULT,
+  sharedPayloads,
+  smallPayload,
+  writeShape,
+} from "./fixtures/body-kinds.ts";
+import {
   CATALOGUE_BODY_BYTES,
   CATALOGUE_STORED_CHARS,
   CATALOGUE_TOOLS,
@@ -1311,7 +1317,7 @@ describe("byte-identical payloads are stored once", () => {
     expect(withRepeats).toContain("embedded once each");
 
     const { html: without } = await renderDir(PROFILE_DIRS.varied, "dedupe-note-none.html");
-    expect(without).toContain("no two of them are byte-identical");
+    expect(without).toContain("No two of them are byte-identical");
     expect(without).not.toContain("byte-identical repeats");
   });
 
@@ -2148,4 +2154,123 @@ describe("every anchor in the document is unique and every mount resolves", () =
       }
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// The dedupe sentence: every counted placement is named, for every shape
+// ---------------------------------------------------------------------------
+
+/**
+ * The sentence's own arithmetic, read back off the rendered page.
+ *
+ * Deliberately generic. It does not know which kinds exist — it reads the total
+ * the report announces and the parts it names, whatever they are called, so it
+ * keeps working when a kind is added and fails when one is counted without
+ * being named. Enumerating today's kinds here is what let two of them through.
+ */
+function bodySentence(html: string): { total: number; parts: { count: number; label: string }[] } {
+  const paragraph = /<p class="sub">This report embeds[\s\S]*?<\/p>/.exec(html);
+  if (paragraph === null) throw new Error("no body-count sentence in the report");
+  const text = stripTags(paragraph[0]);
+  const match = /This report embeds (\d+) bod(?:y|ies) — ([^.]+)\./.exec(text);
+  if (match === null) throw new Error(`body-count sentence did not parse: ${text.slice(0, 160)}`);
+  const parts = match[2]!
+    .split(/, | and /)
+    .map((part) => /^(\d+) (.+)$/.exec(part.trim()))
+    .map((found, index) => {
+      if (found === null) throw new Error(`part ${index + 1} is not "<count> <label>": ${text}`);
+      return { count: Number(found[1]), label: found[2]! };
+    });
+  return { total: Number(match[1]), parts };
+}
+
+describe("the body-count sentence reconciles", () => {
+  /**
+   * The two axes that decide which kinds a report holds: whether a `tools/list`
+   * result is present, and whether two hook payloads share a large `toolkits`
+   * object. Every combination, including neither — round 2's finding was one of
+   * these four and had no fixture.
+   */
+  const SHAPES = [
+    { name: "hook-only-no-shared", hookPayloads: [smallPayload("a")], toolsListResult: null },
+    {
+      name: "both-no-shared",
+      hookPayloads: [smallPayload("a")],
+      toolsListResult: TOOLS_LIST_RESULT,
+    },
+    { name: "hook-only-shared", hookPayloads: sharedPayloads(), toolsListResult: null },
+    { name: "both-shared", hookPayloads: sharedPayloads(), toolsListResult: TOOLS_LIST_RESULT },
+    { name: "neither", hookPayloads: [], toolsListResult: null },
+  ] as const;
+
+  /** Renders one shape through the real CLI and returns the page. */
+  async function renderShape(shape: (typeof SHAPES)[number]) {
+    const dir = await writeShape(join(scratch, "shapes"), shape.name, {
+      hookPayloads: [...shape.hookPayloads],
+      toolsListResult: shape.toolsListResult === null ? null : [...shape.toolsListResult],
+    });
+    const { html } = await renderDir(dir, `shape-${shape.name}.html`);
+    return html;
+  }
+
+  test("a report with no bodies at all says so", async () => {
+    const html = await renderShape(SHAPES[4]);
+    expect(html).toContain("No payloads in this report.");
+    expect(html).not.toContain("This report embeds");
+  });
+
+  test.each([
+    ["hook-only-no-shared", 1, ["1 hook payload"]],
+    ["both-no-shared", 2, ["1 hook payload", "1 tools/list result"]],
+    // The two round-2 found false: the shared `toolkits` object was counted in
+    // the total and named nowhere, so the sentence announced four bodies and
+    // accounted for two.
+    ["hook-only-shared", 4, ["2 hook payloads", "2 shared toolkits objects"]],
+    [
+      "both-shared",
+      5,
+      ["2 hook payloads", "2 shared toolkits objects", "1 tools/list result"],
+    ],
+  ] as const)("%s announces %i bodies and names every one", async (name, total, expected) => {
+    const shape = SHAPES.find((candidate) => candidate.name === name)!;
+    const html = await renderShape(shape);
+    const sentence = bodySentence(html);
+
+    expect(sentence.total).toBe(total);
+    expect(sentence.parts.map((part) => `${part.count} ${part.label}`)).toEqual([...expected]);
+    // The property the two false shapes broke, asserted directly.
+    expect(sentence.parts.reduce((sum, part) => sum + part.count, 0)).toBe(sentence.total);
+  }, 30_000);
+
+  test("the total is the sum of the named parts, whatever the kinds are", async () => {
+    // The structural guard. It names no kind, so a placement kind added later
+    // and counted without being named fails here even with no fixture of its
+    // own — which is exactly how the last two findings reached a reviewer.
+    const dirs = [
+      FIXTURE_DIR,
+      PROFILE_DIRS.identical,
+      PROFILE_DIRS.varied,
+      PROFILE_DIRS.paged,
+      ISSUE_25_DIRS.differs,
+      TOOLS_LIST_DIR,
+      await writeShape(join(scratch, "shapes"), "reconcile-shared", {
+        hookPayloads: sharedPayloads(),
+        toolsListResult: [...TOOLS_LIST_RESULT],
+      }),
+    ];
+
+    for (const dir of dirs) {
+      const { html } = await renderDir(dir, `reconcile-${dir.replaceAll("/", "-")}.html`);
+      const { total, parts } = bodySentence(html);
+
+      expect(parts.length, `${dir}: no parts named`).toBeGreaterThan(0);
+      expect(parts.reduce((sum, part) => sum + part.count, 0), `${dir} does not reconcile`).toBe(
+        total,
+      );
+      // No kind is named with nothing to show, and none is named twice — either
+      // would let the arithmetic agree while the sentence misled.
+      for (const part of parts) expect(part.count, `${dir}: "${part.label}"`).toBeGreaterThan(0);
+      expect(new Set(parts.map((part) => part.label)).size).toBe(parts.length);
+    }
+  }, 60_000);
 });

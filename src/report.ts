@@ -1038,7 +1038,39 @@ export interface PayloadPlacement {
   sharedToolkits?: SharedToolkits;
 }
 
-/** How many bodies of one kind were embedded, and how many were repeats. */
+/**
+ * Every kind of body this report can place, with the words it is counted in.
+ *
+ * **One table, two jobs.** The keys are the kinds the plan tallies and the
+ * values are the nouns the sentence prints, so the total and the named parts
+ * cannot drift apart: both are derived from this. A kind cannot be counted
+ * without being nameable, because {@link BodyKind} *is* the key set — adding a
+ * placement kind without a label here is a type error, not a quietly wrong
+ * number.
+ *
+ * That is the point. Round 1's finding was `tools/list` results counted as hook
+ * payloads; round 2's was shared `toolkits` objects counted as nothing at all.
+ * Both came from a sentence assembled by hand beside a total assembled
+ * separately. Two special cases invited a third, so there are no special cases
+ * now.
+ *
+ * The shared object is **named rather than excluded**: it is a real `<pre>` on
+ * the page with its own bytes and its own digest, and a total called "bodies"
+ * that silently left some bodies out would be the same class of untruth in the
+ * other direction. Insertion order is print order.
+ */
+export const BODY_KINDS = {
+  "hook-payload": { one: "hook payload", many: "hook payloads" },
+  "shared-toolkits": { one: "shared toolkits object", many: "shared toolkits objects" },
+  "tools-list-result": { one: "tools/list result", many: "tools/list results" },
+} as const;
+
+export type BodyKind = keyof typeof BODY_KINDS;
+
+/** The kinds in print order, from the one table that defines them. */
+export const BODY_KIND_ORDER = Object.keys(BODY_KINDS) as BodyKind[];
+
+/** How many bodies of one kind were placed, and how many were repeats. */
 export interface BodyCount {
   occurrences: number;
   repeats: number;
@@ -1054,20 +1086,15 @@ export interface PayloadPlan {
    */
   toolsListPerRun: (PayloadPlacement | null)[];
   /**
-   * Counted by kind, because the sentence the report prints names a kind.
-   * Lumping `tools/list` results in with hook payloads and calling the total
-   * "hook payloads" is a wrong number in a rendered report, which is the one
-   * defect class this slice exists to remove.
+   * Every placement, tallied by kind — the single structure both the total and
+   * the printed sentence are derived from. See {@link BODY_KINDS}.
    */
-  hookPayloads: BodyCount;
-  toolsListResults: BodyCount;
-  /** Shared `toolkits` objects: how many were stored, and how many payloads reference them. */
-  sharedToolkits: { stores: number; references: number };
-  /** Every embedded body, whatever its kind. */
+  bodies: Record<BodyKind, BodyCount>;
+  /** Every placement, whatever its kind. Always the sum over {@link bodies}. */
   occurrences: number;
   /** Distinct bodies — how many are embedded at all. */
   distinct: number;
-  /** Occurrences that are repeats and therefore embed nothing. */
+  /** Placements that are repeats and therefore embed nothing. */
   repeats: number;
   /**
    * Characters of escaped, stored JSON the repeats did not re-emit.
@@ -1075,6 +1102,13 @@ export interface PayloadPlan {
    * instead of trusting that a smaller file means the right thing happened.
    */
   charsSaved: number;
+}
+
+/** An empty tally with an entry for every kind, so none can be forgotten. */
+function emptyBodies(): Record<BodyKind, BodyCount> {
+  return Object.fromEntries(
+    BODY_KIND_ORDER.map((kind) => [kind, { occurrences: 0, repeats: 0 }]),
+  ) as Record<BodyKind, BodyCount>;
 }
 
 /**
@@ -1098,12 +1132,7 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
   const seen = new Map<string, { anchor: string; label: string; digest: string }>();
   const perRun: PayloadPlacement[][] = [];
   const toolsListPerRun: (PayloadPlacement | null)[] = [];
-  const hookPayloads: BodyCount = { occurrences: 0, repeats: 0 };
-  const toolsListResults: BodyCount = { occurrences: 0, repeats: 0 };
-  const toolkitsStores = new Set<string>();
-  let toolkitsReferences = 0;
-  let occurrences = 0;
-  let repeats = 0;
+  const bodies = emptyBodies();
   let charsSaved = 0;
 
   /**
@@ -1122,21 +1151,30 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     }
   }
 
-  /** Places one body in the shared store, or points it at the copy already there. */
+  /**
+   * Places one body in the shared store, or points it at the copy already
+   * there, and tallies it under its kind.
+   *
+   * Every placement goes through here and every placement declares a kind, so
+   * the total the report prints is the sum of the parts it names. There is no
+   * second path that could add to one without the other.
+   */
   const place = (
+    kind: BodyKind,
     body: string,
     anchor: string,
     label: string,
     displayDigest?: string,
   ): PayloadPlacement => {
-    occurrences += 1;
+    const tally = bodies[kind];
+    tally.occurrences += 1;
     const earlier = seen.get(body);
     if (earlier === undefined) {
       const digest = createHash("sha256").update(body).digest("hex");
       seen.set(body, { anchor, label, digest });
       return { anchor, digest: displayDigest ?? digest, storedAt: anchor };
     }
-    repeats += 1;
+    tally.repeats += 1;
     charsSaved += escapeHtml(storedText(body)).length;
     return {
       anchor,
@@ -1156,13 +1194,15 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
    * Nothing is rewritten — inventing a `$ref` inside evidence JSON would make
    * the raw block stop being the gateway's bytes, which is the failure this
    * report is an instrument against.
+   *
+   * The split adds a second placement, of a second kind. It is counted as one,
+   * named as one, and neither of those is optional.
    */
   const placeHookPayload = (
     payload: unknown,
     file: string,
     index: number,
   ): PayloadPlacement => {
-    hookPayloads.occurrences += 1;
     const whole = payloadText(payload);
     const wholeDigest = createHash("sha256").update(whole).digest("hex");
     const anchor = payloadAnchor(file, index);
@@ -1170,20 +1210,25 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     const toolkits = shareableToolkitsText(payload);
 
     if (toolkits === undefined || (sharedCounts.get(toolkits) ?? 0) < 2) {
-      const placement = place(whole, anchor, label, wholeDigest);
-      if (placement.sameAs !== undefined) hookPayloads.repeats += 1;
-      return placement;
+      return place("hook-payload", whole, anchor, label, wholeDigest);
     }
 
     // Own fields first, keyed on their own bytes: two payloads that agree on
     // everything but the shared object share this store too, and one that does
     // not gets its own.
-    const own = place(withoutShared(payload), anchor, `the own fields of ${label}`, wholeDigest);
-    if (own.sameAs !== undefined) hookPayloads.repeats += 1;
-
-    const store = place(toolkits, toolkitsStoreId(file, index), `the toolkits of ${label}`);
-    toolkitsStores.add(toolkits);
-    toolkitsReferences += 1;
+    const own = place(
+      "hook-payload",
+      withoutShared(payload),
+      anchor,
+      `the own fields of ${label}`,
+      wholeDigest,
+    );
+    const store = place(
+      "shared-toolkits",
+      toolkits,
+      toolkitsStoreId(file, index),
+      `the toolkits of ${label}`,
+    );
     return {
       ...own,
       sharedToolkits: {
@@ -1202,29 +1247,28 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     // body" means the first one a reader meets.
     perRun.push(run.hookHits.map((hit, index) => placeHookPayload(hit.payload, file, index)));
 
-    if (!Array.isArray(run.toolsListResult)) {
-      toolsListPerRun.push(null);
-      continue;
-    }
-    toolsListResults.occurrences += 1;
-    const placement = place(
-      payloadText(run.toolsListResult),
-      toolsListStoreId(file),
-      toolsListLabel(file),
+    toolsListPerRun.push(
+      Array.isArray(run.toolsListResult)
+        ? place(
+            "tools-list-result",
+            payloadText(run.toolsListResult),
+            toolsListStoreId(file),
+            toolsListLabel(file),
+          )
+        : null,
     );
-    if (placement.sameAs !== undefined) toolsListResults.repeats += 1;
-    toolsListPerRun.push(placement);
   }
 
+  // Derived, never accumulated alongside: the total is the sum of exactly the
+  // parts the sentence names, by construction rather than by agreement.
+  const counts = BODY_KIND_ORDER.map((kind) => bodies[kind]);
   return {
     perRun,
     toolsListPerRun,
-    hookPayloads,
-    toolsListResults,
-    sharedToolkits: { stores: toolkitsStores.size, references: toolkitsReferences },
-    occurrences,
+    bodies,
+    occurrences: counts.reduce((sum, count) => sum + count.occurrences, 0),
     distinct: seen.size,
-    repeats,
+    repeats: counts.reduce((sum, count) => sum + count.repeats, 0),
     charsSaved,
   };
 }
@@ -2264,51 +2308,62 @@ export function toolsNotOfferedText(run: Run): string {
 }
 
 /**
- * What the reader is told about repeated bodies, stated whether or not there
- * were any: "nothing was collapsed" is as much a result as a saving.
+ * What the reader is told about the bodies this report holds.
  *
- * It counts **by kind**. An earlier version added the `tools/list` results to
- * the hook payloads and called the total "hook payloads", so a report holding
- * twelve payloads and four results announced sixteen of the former. A wrong
- * number in a rendered report is the defect this whole slice exists to remove,
- * and it does not get an exemption for being in the prose.
+ * **The total and the named parts are the same data.** Both come from
+ * {@link BODY_KINDS} by way of `plan.bodies`, so "N bodies — a of these and b of
+ * those" reconciles for every shape, including shapes nobody has built a
+ * fixture for. Two rounds of review found this sentence wrong in two different
+ * ways — `tools/list` results counted as hook payloads, then shared `toolkits`
+ * objects counted as nothing — and both times the cause was a sentence written
+ * by hand next to a total accumulated separately. A kind that is counted is
+ * named because the same table supplies both, and a kind that cannot be named
+ * cannot exist: {@link BodyKind} is that table's key set.
  */
 export function payloadDedupeNote(plan: PayloadPlan): string {
-  const { hookPayloads, toolsListResults, sharedToolkits } = plan;
   if (plan.occurrences === 0) return `<p class="sub">No payloads in this report.</p>`;
 
   const plural = (count: number, one: string, many: string): string =>
     `${count} ${count === 1 ? one : many}`;
-  const kinds = [
-    plural(hookPayloads.occurrences, "hook payload", "hook payloads"),
-    ...(toolsListResults.occurrences === 0
-      ? []
-      : [plural(toolsListResults.occurrences, "tools/list result", "tools/list results")]),
-  ].join(" and ");
+
+  // Every kind present, in the table's own order. Nothing is enumerated here
+  // by hand, so a kind added to the table joins the sentence with it.
+  const named = BODY_KIND_ORDER.filter((kind) => plan.bodies[kind].occurrences > 0).map((kind) =>
+    plural(plan.bodies[kind].occurrences, BODY_KINDS[kind].one, BODY_KINDS[kind].many),
+  );
+  const parts =
+    named.length === 1
+      ? named[0]!
+      : `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]!}`;
+
+  const head =
+    `This report embeds ${plural(plan.occurrences, "body", "bodies")} — ${parts}.`;
 
   const body =
     plan.repeats === 0
-      ? `<p class="sub">This report embeds ${plural(plan.occurrences, "body", "bodies")} ` +
-        `— ${kinds} — and no two of them are byte-identical, so every one is embedded ` +
+      ? `<p class="sub">${head} No two of them are byte-identical, so every one is embedded ` +
         `in full.</p>`
-      : `<p class="sub">This report embeds ${plural(plan.occurrences, "body", "bodies")} ` +
-        `— ${kinds}. <strong>${plan.repeats}</strong> of them are byte-identical repeats of ` +
-        `an earlier body; ${plural(plan.distinct, "distinct body is", "distinct bodies are")} ` +
-        `embedded once each, and every repeat shows its digest and links the one that carries ` +
-        `the copy. The comparison is over the bytes, not over <code>bodyBytes</code> or the ` +
-        `toolkit and tool counts: a body that differs anywhere is embedded in full, so nothing ` +
-        `a hit carried can be hidden by this.</p>`;
+      : `<p class="sub">${head} <strong>${plan.repeats}</strong> of them are byte-identical ` +
+        `repeats of an earlier body; ` +
+        `${plural(plan.distinct, "distinct body is", "distinct bodies are")} embedded once ` +
+        `each, and every repeat shows its digest and links the one that carries the copy. The ` +
+        `comparison is over the bytes, not over <code>bodyBytes</code> or the toolkit and tool ` +
+        `counts: a body that differs anywhere is embedded in full, so nothing a hit carried can ` +
+        `be hidden by this.</p>`;
 
-  if (sharedToolkits.stores === 0) return body;
+  const toolkits = plan.bodies["shared-toolkits"];
+  if (toolkits.occurrences === 0) return body;
 
+  // Derived from the same tally rather than tracked beside it: a reference that
+  // found an earlier copy is a repeat, so the rest are the stores.
+  const stores = toolkits.occurrences - toolkits.repeats;
   return (
     body +
-    `\n<p class="sub">${plural(sharedToolkits.references, "hook payload", "hook payloads")} ` +
-    `${sharedToolkits.references === 1 ? "carries" : "carry"} a large ` +
-    `<code>toolkits</code> object that other payloads carry too. Those payloads are ` +
-    `<strong>not</strong> identical — they differ elsewhere, in the live evidence only in ` +
-    `<code>user_id</code> — so nothing is collapsed: ` +
-    `${plural(sharedToolkits.stores, "object is", "objects are")} stored once and referenced, ` +
+    `\n<p class="sub">${plural(toolkits.occurrences, "hook payload", "hook payloads")} ` +
+    `${toolkits.occurrences === 1 ? "carries" : "carry"} a large <code>toolkits</code> object ` +
+    `that another payload carries too. Those payloads are <strong>not</strong> identical — ` +
+    `they differ elsewhere, in the live evidence only in <code>user_id</code> — so nothing ` +
+    `is collapsed: ${plural(stores, "object is", "objects are")} stored once and referenced, ` +
     `and each payload still shows its own fields. Equality is computed over the object’s ` +
     `bytes, the same as for a whole body.</p>`
   );

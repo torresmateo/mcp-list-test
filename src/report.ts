@@ -40,11 +40,13 @@ export interface RunRequest {
    * written before the probe recorded a field carries nothing for it, and
    * `undefined` is *absent*, not a value.
    *
-   * There is no MCP request or response **body** here, and that is not an
-   * oversight to paper over: `src/client/request-log.ts` deliberately pipes the
-   * response through instead of cloning it, so nothing ever captured one. The
-   * row says `body not recorded` rather than rendering `{}` as though it were
-   * the payload.
+   * The MCP request and response **bodies** are here too, as of #31. They were
+   * not, and the row said `body not recorded` in those words, because
+   * `src/client/request-log.ts` pipes the response through rather than cloning
+   * it and nothing captured one. The capture now happens inside that same
+   * pass-through, so the row prints the frames where a run file carries them
+   * and keeps saying `body not recorded` — honestly — where it does not.
+   *
    */
   jsonRpcId?: number;
   finishedAt?: string;
@@ -54,6 +56,44 @@ export interface RunRequest {
   responseObserved?: boolean;
   /** Written only when this `tools/list` request followed a `nextCursor`. */
   cursor?: string;
+  /**
+   * The JSON-RPC request frame the probe put on the wire: **the raw text**,
+   * credential values already redacted at capture (#31, DESIGN.md decision 19).
+   *
+   * A string rather than a parsed value, because the probe stores the source
+   * slice rather than a re-serialisation of it, and this renderer shows it the
+   * same way — verbatim, never pretty-printed through `JSON.parse`. A round
+   * trip here would undo the capture one level further out and drop exactly
+   * what the capture exists to keep.
+   *
+   * `undefined` is a run file written before that capture existed and says
+   * nothing at all — the row still renders and still says so in words. It is
+   * the reason this is optional rather than required: the operator has evidence
+   * from before this slice and it has to stay readable.
+   */
+  requestFrame?: string;
+  /**
+   * The JSON-RPC reply frame as raw text, or `null` when the stream ended
+   * without a reply carrying this request's id.
+   *
+   * Three states, three different sentences, and none of them is `{}`:
+   * `undefined` is a pre-#31 run file; `null` is the measurement "no reply was
+   * observed"; a string is the frame the gateway sent.
+   */
+  responseFrame?: string | null;
+  /**
+   * The rule used to cut this response into messages — `sse`, `whole` or
+   * `unknown` — recorded by the probe from the `Content-Type` (#31 round 2).
+   * `undefined` on a run file written before it existed.
+   */
+  responseFraming?: string;
+  /**
+   * Why `responseFrame` is `null`. `"unanswered"` is "the gateway did not
+   * answer"; `"unreadable"` is "we could not read what it sent", which is a
+   * different finding and must not render as the first one. `undefined` on a
+   * run file that predates the distinction.
+   */
+  responseFrameAbsence?: string;
 }
 
 /**
@@ -80,6 +120,21 @@ export interface HookHit {
   toolCount?: number;
   versionCount?: number;
   bodyBytes?: number;
+  /**
+   * The HTTP status this hook answered the hit with (#31, decision 19).
+   * `undefined` is a run file from before the hook recorded its own answer —
+   * never a 0, and never an assumed 200.
+   */
+  responseStatus?: number;
+  /**
+   * The body this hook sent back: the `AccessHookResult` that carried the deny.
+   *
+   * `undefined` is absent and says nothing. `{}` is the real measurement "this
+   * hook expressed no opinion" — row three of the contract, *no change* — and
+   * it is exactly the value that made #21's fail-open invisible, so it must
+   * never render as "not recorded".
+   */
+  responseBody?: unknown;
   /**
    * The hook server's *own* received-to-answered time. It excludes the server's
    * JSONL append, because the number has to be inside the line it writes, so it
@@ -285,6 +340,50 @@ function optionalNullableStringArray(
   });
 }
 
+/**
+ * A recorded **body**: any JSON value, taken as it stands.
+ *
+ * Nothing about its shape is validated. These are the gateway's bytes and this
+ * hook's own answer travelling through the renderer the way they travelled
+ * through the probe; checking them would start trimming the evidence, which is
+ * the failure #31 exists to close.
+ *
+ * Absence and `null` are different answers and both are real here, so absence
+ * is decided by whether the **key is present**, not by whether the value is
+ * nullish: `responseFrame: null` is the measurement "no reply was observed",
+ * and a missing `responseFrame` is a run file written before the capture. JSON
+ * has no `undefined`, so `undefined` out of this function can only ever mean
+ * "the key was not there".
+ */
+function optionalBody(holder: Record<string, unknown>, key: string): unknown {
+  return key in holder ? holder[key] : undefined;
+}
+
+/**
+ * A recorded **frame**: the raw JSON text that crossed the wire.
+ *
+ * Three states, and absence is decided by whether the key is present rather
+ * than by whether the value is nullish, because `null` is a real answer here —
+ * "no reply carrying this request's id was seen". A key that *is* there and
+ * holds something other than text is an error naming the file: optional means
+ * "may be missing", not "may be anything", and a frame that is not text is a
+ * frame somebody re-serialised.
+ */
+function optionalFrameText(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+  nullable: boolean,
+): string | null | undefined {
+  if (!(key in holder)) return undefined;
+  const value = holder[key];
+  if (value === null && nullable) return null;
+  if (typeof value !== "string") {
+    fail(file, `${key} must be the raw frame text (a string)${nullable ? " or null" : ""}`);
+  }
+  return value;
+}
+
 function optionalBoolean(
   file: string,
   holder: Record<string, unknown>,
@@ -369,6 +468,15 @@ export function parseRun(file: string, text: string): Run {
         authorizationScheme: optionalString(file, entry, "authorizationScheme"),
         responseObserved: optionalBoolean(file, entry, "responseObserved"),
         cursor: optionalString(file, entry, "cursor"),
+        // A request frame has no null state: the probe holds the bytes it sent.
+        // A response frame does — `null` is "no reply carrying this id was seen".
+        requestFrame: optionalFrameText(file, entry, "requestFrame", false) ?? undefined,
+        responseFrame: optionalFrameText(file, entry, "responseFrame", true),
+        responseFraming: optionalString(file, entry, "responseFraming"),
+        responseFrameAbsence:
+          entry["responseFrameAbsence"] === null
+            ? undefined
+            : optionalString(file, entry, "responseFrameAbsence"),
       }),
     };
   });
@@ -388,6 +496,8 @@ export function parseRun(file: string, text: string): Run {
         versionCount: optionalNumber(file, entry, "versionCount"),
         bodyBytes: optionalNumber(file, entry, "bodyBytes"),
         handlingMs: optionalNumber(file, entry, "handlingMs"),
+        responseStatus: optionalNumber(file, entry, "responseStatus"),
+        responseBody: optionalBody(entry, "responseBody"),
       }),
     };
   });
@@ -925,6 +1035,34 @@ export function toolsListAnchor(file: string): string {
   return `${file}--tools-list`;
 }
 
+/** The anchor id of the `<pre>` holding one hit's recorded response body. */
+export function hookResponseAnchor(file: string, hitIndex: number): string {
+  return `${file}--hook-response-${hitIndex + 1}`;
+}
+
+/** How a reader is told which hit a recorded hook response belongs to. */
+export function hookResponseLabel(file: string, hitIndex: number): string {
+  return `the response to hit ${hitIndex + 1} of ${file}`;
+}
+
+/** The anchor id of the `<pre>` holding one request's outbound JSON-RPC frame. */
+export function requestFrameAnchor(file: string, requestIndex: number): string {
+  return `${file}--mcp-request-${requestIndex + 1}`;
+}
+
+export function requestFrameLabel(file: string, requestIndex: number): string {
+  return `the request frame of MCP request ${requestIndex + 1} of ${file}`;
+}
+
+/** The anchor id of the `<pre>` holding one request's inbound JSON-RPC frame. */
+export function responseFrameAnchor(file: string, requestIndex: number): string {
+  return `${file}--mcp-response-${requestIndex + 1}`;
+}
+
+export function responseFrameLabel(file: string, requestIndex: number): string {
+  return `the response frame of MCP request ${requestIndex + 1} of ${file}`;
+}
+
 /** The id of the `<pre>` holding one hit's shared `toolkits` object. */
 export function toolkitsStoreId(file: string, hitIndex: number): string {
   return `${file}--toolkits-${hitIndex + 1}`;
@@ -1061,7 +1199,10 @@ export interface PayloadPlacement {
  */
 export const BODY_KINDS = {
   "hook-payload": { one: "hook payload", many: "hook payloads" },
+  "hook-response": { one: "hook response", many: "hook responses" },
   "shared-toolkits": { one: "shared toolkits object", many: "shared toolkits objects" },
+  "mcp-request-frame": { one: "MCP request frame", many: "MCP request frames" },
+  "mcp-response-frame": { one: "MCP response frame", many: "MCP response frames" },
   "tools-list-result": { one: "tools/list result", many: "tools/list results" },
 } as const;
 
@@ -1076,15 +1217,34 @@ export interface BodyCount {
   repeats: number;
 }
 
+/**
+ * Where one MCP request's two frames live, or `null` for each the run file does
+ * not carry.
+ *
+ * `null` covers both "this run predates the capture" and "no reply was
+ * observed"; which of the two it was is a question about the run, not about the
+ * store, and {@link requestBodyNote} answers it in words.
+ */
+export interface McpFramePlacement {
+  request: PayloadPlacement | null;
+  response: PayloadPlacement | null;
+}
+
+/** Every body one run puts on the page, indexed the way the run section reads them. */
+export interface RunPlacements {
+  /** One per hook hit, in `run.hookHits` order. */
+  hookPayloads: PayloadPlacement[];
+  /** One per hook hit; `null` where the hit records no response of its own. */
+  hookResponses: (PayloadPlacement | null)[];
+  /** One per MCP request, in `run.requests` order. */
+  mcpFrames: McpFramePlacement[];
+  /** The run's `tools/list` result, or `null` where it has none to embed. */
+  toolsListResult: PayloadPlacement | null;
+}
+
 export interface PayloadPlan {
-  /** One entry per loaded run, each with one placement per hook hit. */
-  perRun: PayloadPlacement[][];
-  /**
-   * One entry per loaded run for its `toolsListResult`, or `null` where the run
-   * has no result to embed. It shares the hook payloads' store, so a result
-   * repeated across repetitions of the same gateway is embedded once too.
-   */
-  toolsListPerRun: (PayloadPlacement | null)[];
+  /** One entry per loaded run, holding every body that run puts on the page. */
+  perRun: RunPlacements[];
   /**
    * Every placement, tallied by kind — the single structure both the total and
    * the printed sentence are derived from. See {@link BODY_KINDS}.
@@ -1130,8 +1290,7 @@ function emptyBodies(): Record<BodyKind, BodyCount> {
  */
 export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
   const seen = new Map<string, { anchor: string; label: string; digest: string }>();
-  const perRun: PayloadPlacement[][] = [];
-  const toolsListPerRun: (PayloadPlacement | null)[] = [];
+  const perRun: RunPlacements[] = [];
   const bodies = emptyBodies();
   let charsSaved = 0;
 
@@ -1165,6 +1324,14 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     anchor: string,
     label: string,
     displayDigest?: string,
+    /**
+     * How this body's embedded copy is written. Defaults to {@link storedText},
+     * which indents a small body for the no-script reader. A **raw frame** uses
+     * identity instead: it is stored as it arrived, and indenting it would mean
+     * parsing and re-emitting it, which is the loss the capture exists to
+     * prevent — one level further out.
+     */
+    storedAs: (text: string) => string = storedText,
   ): PayloadPlacement => {
     const tally = bodies[kind];
     tally.occurrences += 1;
@@ -1175,7 +1342,7 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
       return { anchor, digest: displayDigest ?? digest, storedAt: anchor };
     }
     tally.repeats += 1;
-    charsSaved += escapeHtml(storedText(body)).length;
+    charsSaved += escapeHtml(storedAs(body)).length;
     return {
       anchor,
       digest: displayDigest ?? earlier.digest,
@@ -1241,22 +1408,76 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
     };
   };
 
-  for (const { file, run } of loaded) {
-    // Hook payloads first, then the run's `tools/list` result: the same order
-    // the run section renders them in, so "the first occurrence carries the
-    // body" means the first one a reader meets.
-    perRun.push(run.hookHits.map((hit, index) => placeHookPayload(hit.payload, file, index)));
+  /**
+   * A body the run file may simply not carry, placed only when it is there.
+   *
+   * The absent case gets no placement and no tally entry, because there is no
+   * body: a run written before #31 must not contribute a phantom to "this
+   * report embeds N bodies".
+   */
+  const placeOptional = (
+    kind: BodyKind,
+    body: unknown,
+    anchor: string,
+    label: string,
+  ): PayloadPlacement | null =>
+    body === undefined ? null : place(kind, payloadText(body), anchor, label);
 
-    toolsListPerRun.push(
-      Array.isArray(run.toolsListResult)
-        ? place(
-            "tools-list-result",
-            payloadText(run.toolsListResult),
-            toolsListStoreId(file),
-            toolsListLabel(file),
-          )
-        : null,
+  for (const { file, run } of loaded) {
+    // Hook payloads and their responses first, then the MCP frames, then the
+    // run's `tools/list` result: the order the run section renders them in, so
+    // "the first occurrence carries the body" means the first one a reader
+    // meets. Kinds never collide on bytes with each other by accident — the
+    // store is keyed on the JSON text, so two bodies share a copy only when
+    // they are byte for byte the same thing, whatever kind each is.
+    const hookPayloads = run.hookHits.map((hit, index) =>
+      placeHookPayload(hit.payload, file, index),
     );
+    const hookResponses = run.hookHits.map((hit, index) =>
+      placeOptional(
+        "hook-response",
+        hit.responseBody,
+        hookResponseAnchor(file, index),
+        hookResponseLabel(file, index),
+      ),
+    );
+    // A frame is already JSON *text*, so it is its own store key: running it
+    // through `payloadText` would JSON-encode the string and change both the
+    // digest and the bytes on the page.
+    const placeFrame = (
+      kind: BodyKind,
+      text: string | null | undefined,
+      anchor: string,
+      label: string,
+    ): PayloadPlacement | null =>
+      typeof text === "string" ? place(kind, text, anchor, label, undefined, rawText) : null;
+
+    const mcpFrames = run.requests.map((request, index): McpFramePlacement => ({
+      request: placeFrame(
+        "mcp-request-frame",
+        request.requestFrame,
+        requestFrameAnchor(file, index),
+        requestFrameLabel(file, index),
+      ),
+      // A `null` frame is the measurement "no reply was observed" and has no
+      // body to embed; the row says so in words rather than storing a `null`.
+      response: placeFrame(
+        "mcp-response-frame",
+        request.responseFrame,
+        responseFrameAnchor(file, index),
+        responseFrameLabel(file, index),
+      ),
+    }));
+    const toolsListResult = Array.isArray(run.toolsListResult)
+      ? place(
+          "tools-list-result",
+          payloadText(run.toolsListResult),
+          toolsListStoreId(file),
+          toolsListLabel(file),
+        )
+      : null;
+
+    perRun.push({ hookPayloads, hookResponses, mcpFrames, toolsListResult });
   }
 
   // Derived, never accumulated alongside: the total is the sum of exactly the
@@ -1264,7 +1485,6 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
   const counts = BODY_KIND_ORDER.map((kind) => bodies[kind]);
   return {
     perRun,
-    toolsListPerRun,
     bodies,
     occurrences: counts.reduce((sum, count) => sum + count.occurrences, 0),
     distinct: seen.size,
@@ -1331,6 +1551,19 @@ export function storedPayload(payload: unknown): string {
  * must not have to parse a body back into a value just to ask how long the
  * stored form would be.
  */
+/**
+ * A body stored exactly as it arrived.
+ *
+ * The identity function, named so the call site says *why* it is not
+ * {@link storedText}: a raw frame is the bytes off the wire, and pretty-printing
+ * it means `JSON.parse` followed by `JSON.stringify`, which would drop a
+ * duplicate key and normalise the spacing in the one copy a reader checks.
+ * Nothing is truncated either way.
+ */
+export function rawText(text: string): string {
+  return text;
+}
+
 export function storedText(compact: string): string {
   return Buffer.byteLength(compact, "utf8") > PRETTY_PAYLOAD_MAX_BYTES
     ? compact
@@ -1836,6 +2069,43 @@ function headersList(headers: Record<string, string> | undefined): string {
 }
 
 /**
+ * What this hook answered the hit with (#31 criterion 1, DESIGN.md decision 19).
+ *
+ * The direction the report could not show at all. A hook that records what it
+ * was asked and not what it answered cannot demonstrate that the deny it
+ * believes it issued was issued — #21's fail-open was provable only by a
+ * `curl` run by hand — so the status and the body sit here beside the payload
+ * they answer.
+ *
+ * `{}` is rendered as a body, loudly, and never as an absence. It is a real
+ * `AccessHookResult`: neither `only` nor `deny`, which the engine reads as *no
+ * change*. That value is correct when the request carried no Gmail and is the
+ * exact shape of the bug when it did, and a reader has to be able to tell the
+ * two apart by looking at the payload above it.
+ */
+function hookResponseDetail(hit: HookHit, placement: PayloadPlacement | null): string {
+  if (placement === null) {
+    return (
+      `<p class="empty">not recorded — this run file predates the hook recording its own ` +
+      `answer.</p>`
+    );
+  }
+  const status =
+    hit.responseStatus === undefined
+      ? `<p class="empty">HTTP status not recorded for this hit.</p>`
+      : `<p class="repeat-note">HTTP ${escapeHtml(String(hit.responseStatus))}</p>`;
+  const noOpinion = isRecord(hit.responseBody) && Object.keys(hit.responseBody).length === 0
+    ? `<p class="sub">This answer carries neither <code>only</code> nor <code>deny</code>, ` +
+      `which the engine reads as <strong>no change</strong> — every tool stays allowed. That ` +
+      `is the right answer to a request this policy has no opinion about, and it is also the ` +
+      `shape of the fail-open #21 fixed. The payload above says which of the two this was.</p>`
+    : "";
+  return [status, bodyBlock(hit.responseBody, placement, "response body"), noOpinion]
+    .filter((part) => part !== "")
+    .join("\n");
+}
+
+/**
  * The method that caused this hit (issue #25 criterion 4).
  *
  * `not attributed` is styled as an absence, not printed as a method, because it
@@ -1960,6 +2230,67 @@ function sharedToolkitsTextOf(payload: unknown): string {
   return payloadText((payload as Record<string, unknown>)[SHARED_KEY]);
 }
 
+/**
+ * One recorded body, rendered the way every body in this report is: an explorer
+ * mount, the one embedded `<pre>` that holds its bytes, and — when an earlier
+ * body was byte for byte the same — a note pointing at the copy instead of a
+ * second one.
+ *
+ * The same three pieces {@link payloadDetail} uses for a hook payload, in one
+ * function because #31 added three more kinds of body and a fourth hand-rolled
+ * copy of this shape is how the dedupe sentence went wrong twice before.
+ */
+function bodyBlock(body: unknown, placement: PayloadPlacement, heading: string): string {
+  return renderBody(storedPayload(body), payloadTextOf(body), placement, heading);
+}
+
+/**
+ * A **raw frame**, embedded as the bytes that crossed the wire.
+ *
+ * The `<pre>` holds the frame text verbatim: no indentation, because indenting
+ * it would mean parsing and re-emitting it, and a frame that has been through
+ * that round trip is missing a duplicate key and its original spacing — the
+ * exact loss the capture exists to prevent (#31 criterion 3). The explorer
+ * beside it *does* parse, so a duplicate key shows as its last value in the
+ * tree; the `<pre>` is the evidence and the tree is the convenience, which is
+ * the same division this report has always drawn.
+ */
+function rawFrameBlock(text: string, placement: PayloadPlacement, heading: string): string {
+  return renderBody(text, text, placement, heading);
+}
+
+/** The shared shape: a summary line, the explorer mount, and the one copy. */
+function renderBody(
+  stored: string,
+  measured: string,
+  placement: PayloadPlacement,
+  heading: string,
+): string {
+  const mount = `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"></div>`;
+  const summary = [
+    heading,
+    `${Buffer.byteLength(measured, "utf8")} B`,
+    `sha256 ${placement.digest}`,
+  ]
+    .concat(placement.sameAs === undefined ? [] : [`identical to ${placement.sameAs.label}`])
+    .map(escapeHtml)
+    .join(" \u00b7 ");
+
+  const embedded =
+    placement.sameAs === undefined
+      ? [
+          `<details class="raw"><summary>raw JSON</summary>`,
+          `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(stored)}</pre>`,
+          `</details>`,
+        ].join("\n")
+      : `<p class="repeat-note">Byte-identical to ` +
+        `<a href="#${escapeHtml(placement.sameAs.anchor)}">` +
+        `${escapeHtml(placement.sameAs.label)}</a>, which carries the one embedded copy. ` +
+        `Compared byte for byte; sha-256 is <code>${escapeHtml(placement.digest)}</code>.</p>`;
+
+  return [`<p class="repeat-note">${summary}</p>`, mount, embedded].join("\n");
+}
+
 /** One `<dt>`/`<dd>` pair, with `not recorded` for anything the run file lacks. */
 function detailRow(term: string, value: string | undefined): string {
   return `<dt>${escapeHtml(term)}</dt><dd>${
@@ -1968,16 +2299,22 @@ function detailRow(term: string, value: string | undefined): string {
 }
 
 /**
- * What the run JSON holds about one MCP request (issue #25 criterion 5).
+ * What the run JSON holds about one MCP request (issue #25 criterion 5, then
+ * #31).
  *
- * There is no body, and the row says so in those words. `src/client/request-log.ts`
- * pipes the response through instead of cloning it, so no MCP request or
- * response body was ever captured — rendering `{}` here would put an empty
- * object where a reader expects the payload, which is the plausible-but-wrong
- * rendering this report exists to avoid. A later slice adds capture; the row is
- * shaped so a body slots in beside this list when it does.
+ * #25 shaped this row so a body could slot in beside the metadata list when a
+ * slice captured one, and said `body not recorded` in those words until then —
+ * rendering `{}` would have put an empty object where a reader expects the
+ * payload. #31 filled that seam: the two MCP frames follow the list, from the
+ * same store every other body in this report uses. A run file that carries
+ * neither still reads exactly as it did.
  */
-function requestDetail(request: RunRequest, run: Run, file: string): string {
+function requestDetail(
+  request: RunRequest,
+  run: Run,
+  file: string,
+  frames: McpFramePlacement,
+): string {
   return [
     `<dl class="meta">`,
     detailRow("method", request.method),
@@ -1996,19 +2333,114 @@ function requestDetail(request: RunRequest, run: Run, file: string): string {
       request.responseObserved === undefined ? undefined : request.responseObserved ? "yes" : "no",
     ),
     detailRow("cursor followed", request.cursor),
+    detailRow("response framing", request.responseFraming),
     detailRow("hookHitsAfter (cumulative)", String(request.hookHitsAfter)),
     `</dl>`,
     requestBodyNote(request, run, file),
+    mcpFrameBlocks(request, frames),
   ].join("\n");
+}
+
+/**
+ * The two MCP directions for one request: what the probe sent, and what came
+ * back (#31, DESIGN.md decision 19).
+ *
+ * Each of the three states reads as itself. A frame the run file does not
+ * carry says the run predates the capture; a `responseFrame` of `null` says no
+ * reply was observed, which is the same condition `responseObserved: false`
+ * reports and is deliberately not an empty object; anything else is the frame,
+ * whole, through the same store every other body goes through.
+ */
+function mcpFrameBlocks(request: RunRequest, frames: McpFramePlacement): string {
+  const parts: string[] = [];
+
+  parts.push(`<h5>probe \u2192 gateway (MCP request frame)</h5>`);
+  if (frames.request === null) {
+    parts.push(
+      `<p class="empty">not recorded \u2014 this run file predates the MCP frame capture.</p>`,
+    );
+  } else {
+    parts.push(rawFrameBlock(request.requestFrame!, frames.request, "request frame"));
+  }
+
+  parts.push(`<h5>gateway \u2192 probe (MCP response frame)</h5>`);
+  if (frames.response !== null) {
+    parts.push(rawFrameBlock(request.responseFrame!, frames.response, "response frame"));
+  } else if (request.responseFrame === null) {
+    parts.push(responseFrameAbsenceNote(request));
+  } else {
+    parts.push(
+      `<p class="empty">not recorded \u2014 this run file predates the MCP frame capture.</p>`,
+    );
+  }
+
+  return parts.join("\n");
+}
+
+/**
+ * Why no reply frame was recorded — and the two answers that must never be
+ * printed as each other.
+ *
+ * "The gateway did not answer" is a measurement about the gateway. "We could
+ * not read what it sent" is a measurement about this instrument, and it is a
+ * *louder* one: it means bytes crossed the wire and the capture could not make
+ * a frame of them. Round 2's finding was a legal JSON body silently becoming
+ * the first answer when it was really neither, so the two now say themselves.
+ */
+function responseFrameAbsenceNote(request: RunRequest): string {
+  const framing =
+    request.responseFraming === undefined
+      ? ""
+      : ` The body was framed as <code>${escapeHtml(request.responseFraming)}</code>, from its` +
+        ` <code>Content-Type</code>.`;
+
+  if (request.responseFrameAbsence === "unreadable") {
+    return (
+      `<p class="empty"><strong>The reply could not be read.</strong> Bytes came back that ` +
+      `this capture could not parse as JSON under the framing it was given, so no frame was ` +
+      `recorded \u2014 which is <em>not</em> the same as the gateway failing to answer, and is ` +
+      `a defect in the instrument rather than a finding about the gateway.${framing}</p>`
+    );
+  }
+  return (
+    `<p class="empty">No reply carrying this request\u2019s JSON-RPC id was seen on the wire. ` +
+    `That is a measurement, not a missing one \u2014 the stream ended first, which is what ` +
+    `<code>response observed: no</code> above reports.${framing}</p>`
+  );
+}
+
+/**
+ * How the two MCP frames read in one phrase, or `null` when the run file
+ * carries neither and the row's older wording still applies.
+ *
+ * `responseFrame: null` is a state of its own and gets its own words: no reply
+ * carrying this request's id was seen. It is a measurement, and the one thing
+ * it must never be confused with is a frame that was recorded and happened to
+ * be empty.
+ */
+function frameState(request: RunRequest): string | null {
+  const hasRequest = request.requestFrame !== undefined;
+  const hasResponse = request.responseFrame !== undefined;
+  if (!hasRequest && !hasResponse) return null;
+  if (hasRequest && hasResponse && request.responseFrame !== null) {
+    return "request and response frames recorded";
+  }
+  const parts: string[] = [];
+  if (hasRequest) parts.push("request frame recorded");
+  if (request.responseFrame === null) parts.push("no response frame observed");
+  else if (hasResponse) parts.push("response frame recorded");
+  return parts.join(" \u00b7 ");
 }
 
 /**
  * The same fact as {@link requestBodyNote}, short enough for the collapsed row.
  *
  * A reader scanning summary lines must not be told `body not recorded` about a
- * request whose result the run file carries.
+ * request whose frames — or whose result — the run file carries.
  */
 function requestBodyState(request: RunRequest, run: Run): string {
+  const frames = frameState(request);
+  if (frames !== null) return frames;
   return request.method === "tools/list" && Array.isArray(run.toolsListResult)
     ? "response body recorded for the run"
     : "body not recorded";
@@ -2030,6 +2462,12 @@ function requestBodyState(request: RunRequest, run: Run): string {
  * result and says so, rather than implying it is that row's own page.
  */
 function requestBodyNote(request: RunRequest, run: Run, file: string): string {
+  // A run that carries frames says everything about them in the blocks below,
+  // which state each direction's own state. All this row owes such a reader is
+  // the pointer to the run's assembled `tools/list` result, which is a
+  // per-*run* body and not this row's frame.
+  if (frameState(request) !== null) return toolsListResultLink(request, run, file);
+
   const piped =
     `<code>src/client/request-log.ts</code> pipes the response through rather than cloning it`;
 
@@ -2050,17 +2488,39 @@ function requestBodyNote(request: RunRequest, run: Run, file: string): string {
   }
 
   const tools = run.toolsListResult.length;
-  const requests = run.toolsListRequests;
-  const paged =
-    requests !== undefined && requests > 1
-      ? ` It is the run’s assembled list, concatenated across ${requests} ` +
-        `<code>tools/list</code> requests in page order — not this row’s page alone.`
-      : "";
   return (
     `<p>The response body is not kept per request — ${piped} — but the result the gateway ` +
     `returned <strong>is</strong> recorded for this run: ` +
     `<a href="#${escapeHtml(toolsListAnchor(file))}">${tools} tool${tools === 1 ? "" : "s"}, ` +
-    `as it came off the wire</a>.${paged}</p>`
+    `as it came off the wire</a>.${pagedNote(run)}</p>`
+  );
+}
+
+/** ` It is the run’s assembled list…` — said wherever the result is pointed at. */
+function pagedNote(run: Run): string {
+  const requests = run.toolsListRequests;
+  return requests !== undefined && requests > 1
+    ? ` It is the run’s assembled list, concatenated across ${requests} ` +
+      `<code>tools/list</code> requests in page order — not this row’s page alone.`
+    : "";
+}
+
+/**
+ * The pointer from a `tools/list` row to the run's assembled result.
+ *
+ * Still worth saying next to a recorded response frame, and not a duplicate of
+ * it: the frame below is **this request's page**, and the result the section
+ * embeds is the whole list the client assembled across every page. On a
+ * single-page run the two agree; on a paged one they do not, and a reader who
+ * mistook one for the other would misread the evidence.
+ */
+function toolsListResultLink(request: RunRequest, run: Run, file: string): string {
+  if (request.method !== "tools/list" || !Array.isArray(run.toolsListResult)) return "";
+  const tools = run.toolsListResult.length;
+  return (
+    `<p>The run also records the <code>tools/list</code> result the gateway returned, ` +
+    `assembled: <a href="#${escapeHtml(toolsListAnchor(file))}">${tools} ` +
+    `tool${tools === 1 ? "" : "s"}, as it came off the wire</a>.${pagedNote(run)}</p>`
   );
 }
 
@@ -2094,7 +2554,7 @@ function runningCell(running: RunningTotal): string {
  * row: a request row has no hook handling time and a hit row has no client
  * round trip, so there is nothing for a reader to add together.
  */
-function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
+function wireTable(entry: LoadedRun, placements: RunPlacements): string {
   const { file, run } = entry;
   const events = wireEvents(run);
   const origin = events[0]?.at;
@@ -2119,7 +2579,7 @@ function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
         `<td colspan="10">`,
         `<details class="event"><summary>${requestBodyState(event.request, run)} · ` +
           `${escapeHtml(event.request.method)} request · what the run JSON holds</summary>`,
-        requestDetail(event.request, run, file),
+        requestDetail(event.request, run, file, placements.mcpFrames[event.index]!),
         `</details>`,
         `</td>`,
         `</tr>`,
@@ -2147,7 +2607,7 @@ function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
       bytes.sum += event.hit.bodyBytes;
       bytes.recorded += 1;
     }
-    const placement = placements[event.index]!;
+    const placement = placements.hookPayloads[event.index]!;
     const detail = [
       `<tr class="detail">`,
       `<td colspan="10">`,
@@ -2156,6 +2616,8 @@ function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
       payloadDetail(event.hit, placement),
       `<h5>captured request headers</h5>`,
       headersList(event.hit.headers),
+      `<h5>hook \u2192 gateway (the answer this hook sent)</h5>`,
+      hookResponseDetail(event.hit, placements.hookResponses[event.index] ?? null),
       `</details>`,
       `</td>`,
       `</tr>`,
@@ -2374,11 +2836,7 @@ function metaUnmeasured(): string {
   return '<span class="empty">not recorded</span>';
 }
 
-function runSection(
-  entry: LoadedRun,
-  placements: PayloadPlacement[],
-  toolsListPlacement: PayloadPlacement | null,
-): string {
+function runSection(entry: LoadedRun, placements: RunPlacements): string {
   const { file, run } = entry;
   const profile = profileHits(run.hookHits);
   const meta: [string, string][] = [
@@ -2449,12 +2907,17 @@ function runSection(
     `</dl>`,
     `<h4>wire timeline (${run.requests.length} requests, ${run.hookHits.length} hook hits)</h4>`,
     `<p class="sub">Every request the client sent and every hit the counter received, in one` +
-      ` sequence, oldest first. Each row expands: a hook hit shows its payload and its headers,` +
-      ` an MCP request shows what the run JSON holds for it. Expanding needs no network, and no` +
-      ` scripting — the explorer is an enhancement over a plain <code>&lt;pre&gt;</code> that is` +
-      ` already there.</p>`,
+      ` sequence, oldest first. Each row expands: a hook hit shows the payload it carried, its` +
+      ` headers and the answer this hook sent back; an MCP request shows both JSON-RPC frames,` +
+      ` as the bytes that crossed the wire rather than a re-serialisation of them. Expanding` +
+      ` needs no network, and no scripting — the explorer is an enhancement over a plain` +
+      ` <code>&lt;pre&gt;</code> that is already there.` +
+      ` A value under an <code>authorization</code>, <code>proxy-authorization</code>,` +
+      ` <code>cookie</code>, <code>set-cookie</code> or <code>x-api-key</code> key reads as` +
+      ` <code>&lt;redacted len=… sha256=…&gt;</code> wherever it appears: the key name is` +
+      ` evidence, the secret was replaced at capture and never reached this file.</p>`,
     timeline,
-    toolsListResultBlock(entry, toolsListPlacement),
+    toolsListResultBlock(entry, placements.toolsListResult),
     `</section>`,
   ].join("\n");
 }
@@ -2534,7 +2997,7 @@ ${payloadDedupeNote(plan)}
 ${toc}
 </ol></nav>
 
-${loaded.map((entry, index) => runSection(entry, plan.perRun[index]!, plan.toolsListPerRun[index] ?? null)).join("\n\n")}
+${loaded.map((entry, index) => runSection(entry, plan.perRun[index]!)).join("\n\n")}
 
 <footer>Generated by <code>bun run report</code>. Print to PDF from the browser.</footer>
 <script>

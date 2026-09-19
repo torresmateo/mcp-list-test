@@ -64,6 +64,29 @@ const TOOL_VERSION = "1.0.0";
  */
 const NON_SPEC_TOOL_FIELD = "fakeGatewayExtension";
 
+/**
+ * A field on the **result object itself** that the MCP spec does not name.
+ *
+ * It is here so the recorded frame is checkable one level up from
+ * {@link NON_SPEC_TOOL_FIELD}: a capture that carries `result` whole carries
+ * this, and a capture that rebuilt `result` from named fields would not.
+ *
+ * **Measured against the v2 client on 2026-09-19, so the two fields are not
+ * interchangeable evidence.** Given a reply whose `result` carries this key and
+ * whose tool entries carry {@link NON_SPEC_TOOL_FIELD}, `client.listTools()`
+ * hands the caller result keys `["tools", "fakeGatewayResultExtension"]` and
+ * tool keys `["name", "description", "inputSchema"]`. The client keeps what the
+ * spec does not name on the result object and **drops it inside each entry** —
+ * which is the loss issue #26 measured for `arcadeToolkit`, and it is the
+ * tool-level field, not this one, that tells a frame apart from the SDK's view
+ * of the same reply. What only a frame can carry either way is the JSON-RPC
+ * envelope: `jsonrpc` and `id` never reach the caller at all.
+ *
+ * As with the tool-level field, this is **not a claim that Arcade sends it** —
+ * the name is obviously this fake's.
+ */
+const NON_SPEC_RESULT_FIELD = "fakeGatewayResultExtension";
+
 export interface StartFakeGatewayOptions {
   /** Listen port. `0` (the default) binds an ephemeral port. */
   port?: number;
@@ -366,6 +389,7 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
         protocolVersion: options.protocolVersion ?? request.params.protocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: "fake-arcade-gateway", version: "0.1.0" },
+        [NON_SPEC_RESULT_FIELD]: "not named by the MCP spec",
       };
     });
 
@@ -402,6 +426,7 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
             [NON_SPEC_TOOL_FIELD]: "not named by the MCP spec",
           })),
         ...(end < tools.length ? { nextCursor: String(end) } : {}),
+        [NON_SPEC_RESULT_FIELD]: "not named by the MCP spec",
       };
     });
 

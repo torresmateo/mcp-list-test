@@ -221,9 +221,10 @@ describe("matching a listed Toolkit_Tool to a two-part hook payload", () => {
 describe("the run file records both sides of the comparison", () => {
   test("toolsListResult holds the gateway's entries whole, vendor fields included", async () => {
     // Criterion 1. The v2 client parses a `tools/list` result against the spec
-    // schema and drops every top-level field the spec does not name, so a
-    // result taken from `client.listTools()` would be a trimmed shape with
-    // nothing saying so. This asserts the field the SDK would have eaten.
+    // schema and drops every field of a tool entry that the spec does not name,
+    // so a result taken from `client.listTools()` would be a trimmed shape with
+    // nothing saying so. This asserts the field the SDK would have eaten; #31's
+    // `test/wire-capture.test.ts` measures that loss against the frame.
     const hook = hookServer();
     const fake = gateway(hook);
 

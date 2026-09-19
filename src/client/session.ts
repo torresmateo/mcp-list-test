@@ -96,10 +96,31 @@ export interface OpenSessionOptions {
    * over parsing the client's rejection when the two are both available.
    */
   observedRevision?: () => string | undefined;
+  /**
+   * How long one JSON-RPC request may wait for its reply before the client
+   * gives up on it.
+   *
+   * It exists because of what a gateway that *accepts* a request and never
+   * answers it does to this probe: the response stream ends, the wrapper
+   * settles its own bookkeeping, and the SDK goes on waiting for a reply that
+   * can never arrive — for `DEFAULT_REQUEST_TIMEOUT_MSEC`, 60 s, per request.
+   * The run still completes and still writes its file, but an operator watching
+   * a repetition sit for a minute cannot tell that from a hang, and five
+   * repetitions is five minutes of it.
+   *
+   * Omitted leaves the SDK's own default in place, which is what a live run
+   * gets unless the operator says otherwise — deliberately, and the reasoning
+   * is in `src/probe.ts` beside the constant: a deadline shorter than the
+   * effect being measured turns a high hook fan-out into a timeout error
+   * instead of a finding.
+   */
+  requestTimeoutMs?: number;
 }
 
 export interface ProbeSession {
   client: Client;
+  /** `{ timeout }` when the caller set one, `{}` otherwise. */
+  requestOptions: { timeout?: number };
   /** The revision the gateway actually negotiated. Equals the request, or this throws. */
   negotiatedRevision: string;
   /** `legacy` or `modern` — DESIGN.md decision 15. `null` if the client did not say. */
@@ -132,8 +153,11 @@ export async function openSession(options: OpenSessionOptions): Promise<ProbeSes
     { supportedProtocolVersions: [options.revision] },
   );
 
+  const timeout =
+    options.requestTimeoutMs === undefined ? {} : { timeout: options.requestTimeoutMs };
+
   try {
-    await client.connect(transport);
+    await client.connect(transport, timeout);
   } catch (error) {
     await transport.close().catch(() => {});
     const negotiated = options.observedRevision?.() ?? negotiatedRevisionFromRejection(error);
@@ -156,6 +180,8 @@ export async function openSession(options: OpenSessionOptions): Promise<ProbeSes
   return {
     client,
     negotiatedRevision: negotiated,
+    /** The same bound, for the calls this session makes after `connect`. */
+    requestOptions: timeout,
     era: client.getProtocolEra() ?? null,
     async close() {
       await client.close().catch(() => {});

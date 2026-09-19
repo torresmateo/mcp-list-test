@@ -2274,3 +2274,287 @@ describe("the body-count sentence reconciles", () => {
     }
   }, 60_000);
 });
+
+describe("the wire capture renders, and absence still reads as absence (#31)", () => {
+  /** A schema-1 run holding exactly the request rows and hits a case needs. */
+  function runWith(requests: unknown[], hookHits: unknown[]): Record<string, unknown> {
+    return {
+      schema: 1,
+      revisionRequested: "2025-11-25",
+      revisionNegotiated: "2025-11-25",
+      status: "ok",
+      userId: "probe-2025-11-25-1789768900000-1",
+      hookPublicUrl: "https://fixture-tunnel.ngrok.app",
+      requests,
+      hookHits,
+      toolsListed: 0,
+      gmailToolsListed: 0,
+      error: null,
+    };
+  }
+
+  /** Writes one run into its own directory and renders it with the real CLI. */
+  async function render(name: string, run: Record<string, unknown>) {
+    const dir = join(scratch, `wire-${name}`);
+    const file = "20260919T000000Z-2025-11-25-1.json";
+    await Bun.write(join(dir, file), JSON.stringify(run));
+    const { html } = await renderDir(dir, `wire-${name}.html`);
+    return { html, file };
+  }
+
+  const REQUEST_ROW = {
+    id: 1,
+    jsonRpcId: 1,
+    method: "tools/list",
+    sentAt: "2026-09-19T00:00:01.000Z",
+    finishedAt: "2026-09-19T00:00:01.100Z",
+    durationMs: 100,
+    status: 200,
+    responseObserved: true,
+    hookHitsAfter: 1,
+  };
+
+  const HIT_ROW = {
+    receivedAt: "2026-09-19T00:00:02.000Z",
+    payload: { user_id: "probe-1", toolkits: { Gmail: { tools: { SendEmail: [] } } } },
+    bodyBytes: 60,
+  };
+
+  test("a run file from before this slice renders, and says so in words", async () => {
+    // Criterion 6. The operator holds evidence written before the capture
+    // existed. It must still render, and every direction it does not carry has
+    // to read as absent — never as an empty body and never as a zero.
+    const { html, file } = await render("pre-31", runWith([REQUEST_ROW], [HIT_ROW]));
+    const { rows } = wireTimeline(html, file);
+
+    const request = rows.find((row) => row.side === "client")!;
+    expect(summaryLineOf(request.detail)).toContain("body not recorded");
+    expect(request.detail).toContain("probe → gateway (MCP request frame)");
+    expect(request.detail).toContain("gateway → probe (MCP response frame)");
+    expect(request.detail).toContain("predates the MCP frame capture");
+
+    const hit = rows.find((row) => row.side === "hook")!;
+    expect(hit.detail).toContain("hook → gateway (the answer this hook sent)");
+    expect(hit.detail).toContain("predates the hook recording its own answer");
+
+    // No absence is dressed up as a measurement anywhere in the document.
+    expect(html).not.toContain("HTTP 0");
+    expect(html).not.toContain(">{}<");
+    expect(html).not.toContain("<pre>{}</pre>");
+  }, 30_000);
+
+  test("a recorded empty hook answer is a body, and is called no change", async () => {
+    // `{}` is the fail-open shape: neither `only` nor `deny`. It must render as
+    // the value it is, beside the words for what the engine does with it, and
+    // must never collapse into the `not recorded` the test above asserts.
+    const { html, file } = await render(
+      "empty-answer",
+      runWith([REQUEST_ROW], [{ ...HIT_ROW, responseStatus: 200, responseBody: {} }]),
+    );
+    const hit = wireTimeline(html, file).rows.find((row) => row.side === "hook")!;
+
+    expect(hit.detail).toContain("HTTP 200");
+    expect(hit.detail).toContain("response body");
+    expect(hit.detail).toContain("no change");
+    expect(hit.detail).not.toContain("predates the hook recording its own answer");
+    // The body is on the page as bytes, in a `<pre>` of its own.
+    expect(hit.detail).toMatch(/<pre id="[^"]*--hook-response-1">\{\}<\/pre>/);
+  }, 30_000);
+
+  test("a request whose reply was never seen says that, not `{}`", async () => {
+    // `responseFrame: null` is the measurement "no reply carrying this id was
+    // seen", the same condition `response observed: no` reports. An empty
+    // object here would read as a gateway that answered with nothing.
+    const { html, file } = await render(
+      "no-reply",
+      runWith(
+        [
+          {
+            ...REQUEST_ROW,
+            responseObserved: false,
+            requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            responseFrame: null,
+          },
+        ],
+        [],
+      ),
+    );
+    const request = wireTimeline(html, file).rows.find((row) => row.side === "client")!;
+
+    expect(summaryLineOf(request.detail)).toContain("request frame recorded");
+    expect(summaryLineOf(request.detail)).toContain("no response frame observed");
+    expect(request.detail).toContain("No reply carrying this request’s JSON-RPC id was seen");
+    expect(request.detail).not.toContain("predates the MCP frame capture");
+    expect(request.detail).toMatch(/<pre id="[^"]*--mcp-request-1">/);
+    expect(request.detail).not.toMatch(/<pre id="[^"]*--mcp-response-1">/);
+    expect(html).not.toContain(">{}<");
+  }, 30_000);
+
+  test("the new bodies get unique anchors and every mount resolves to one", async () => {
+    // The structural guard the `tools/list` block needed a browser to find: a
+    // block and the `<pre>` inside it sharing an id makes `getElementById`
+    // return the block, and every payload silently fails to parse. Four more
+    // kinds of body means four more chances at it.
+    // Raw frame text, the way the probe writes it — including a duplicate key,
+    // which is the shape a `JSON.parse` round trip would silently collapse.
+    const frame = (id: number) =>
+      `{"jsonrpc":"2.0","id":${id},"result":{"tools":[{"name":"Slack_PostMessage",` +
+      `"arcadeToolkit":"Slack","dup":1,"dup":2}]}}`;
+    const run = runWith(
+      [
+        {
+          ...REQUEST_ROW,
+          requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+          responseFrame: frame(1),
+        },
+        {
+          ...REQUEST_ROW,
+          id: 2,
+          jsonRpcId: 2,
+          sentAt: "2026-09-19T00:00:03.000Z",
+          requestFrame: '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+          responseFrame: frame(2),
+        },
+      ],
+      [
+        { ...HIT_ROW, responseStatus: 200, responseBody: { deny: { Gmail: { tools: {} } } } },
+        {
+          ...HIT_ROW,
+          receivedAt: "2026-09-19T00:00:04.000Z",
+          responseStatus: 200,
+          responseBody: { deny: { Gmail: { tools: {} } } },
+        },
+      ],
+    );
+    run["toolsListResult"] = [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }];
+
+    const { html } = await render("anchors", run);
+
+    const ids = [...html.matchAll(/\sid="([^"]*)"/g)].map((match) => match[1]!);
+    const seen = new Set<string>();
+    expect(ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false)))).toEqual([]);
+
+    const stored = new Map(
+      [...html.matchAll(/<pre id="([^"]*)">([\s\S]*?)<\/pre>/g)].map((match) => [
+        match[1]!,
+        match[2]!,
+      ]),
+    );
+    const mounts = [...html.matchAll(/data-payload="([^"]*)"/g)].map((match) => match[1]!);
+    // One mount per body a row can expand: 2 hook payloads, 2 hook responses,
+    // 4 MCP frames, 1 tools/list result.
+    expect(mounts).toHaveLength(9);
+    for (const id of mounts) {
+      expect(stored.has(id), `no <pre id="${id}"> for a mount`).toBe(true);
+      const decoded = stored
+        .get(id)!
+        .replaceAll("&quot;", '"')
+        .replaceAll("&#39;", "'")
+        .replaceAll("&gt;", ">")
+        .replaceAll("&lt;", "<")
+        .replaceAll("&amp;", "&");
+      expect(() => JSON.parse(decoded), `${id} did not parse`).not.toThrow();
+    }
+    // The byte-identical repeats really did share rather than re-embed: nine
+    // mounts, fewer stores.
+    expect(stored.size).toBeLessThan(mounts.length);
+
+    // The frame is embedded as the bytes that arrived, not re-emitted through
+    // `JSON.parse`/`JSON.stringify` — the duplicate key is still both of it.
+    // A round trip in the renderer would undo the capture one level out.
+    expect(html).toContain("&quot;dup&quot;:1,&quot;dup&quot;:2");
+    // And every fragment link lands on something that exists.
+    for (const [, href] of html.matchAll(/href="#([^"]*)"/g)) {
+      expect(html, `dangling link #${href}`).toContain(`id="${href}"`);
+    }
+  }, 30_000);
+
+  test("`we could not read it` and `it did not answer` are different sentences", async () => {
+    // Round 2 finding 2's rule, in the renderer: a frame the capture could not
+    // read must not print as the gateway failing to answer. One is a defect in
+    // this instrument, the other is a measurement about the gateway, and a
+    // reader deciding what to chase needs to know which.
+    const { html, file } = await render(
+      "unreadable",
+      runWith(
+        [
+          {
+            ...REQUEST_ROW,
+            responseObserved: false,
+            requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+            responseFrame: null,
+            responseFraming: "unknown",
+            responseFrameAbsence: "unreadable",
+          },
+          {
+            ...REQUEST_ROW,
+            id: 2,
+            jsonRpcId: 2,
+            sentAt: "2026-09-19T00:00:03.000Z",
+            responseObserved: false,
+            requestFrame: '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+            responseFrame: null,
+            responseFraming: "sse",
+            responseFrameAbsence: "unanswered",
+          },
+        ],
+        [],
+      ),
+    );
+    const rows = wireTimeline(html, file).rows.filter((row) => row.side === "client");
+
+    expect(rows[0]!.detail).toContain("The reply could not be read");
+    expect(rows[0]!.detail).toContain("defect in the instrument");
+    expect(rows[0]!.detail).not.toContain("No reply carrying this request");
+    // The framing that produced it is on the row, because it changes what the
+    // absence means.
+    expect(rows[0]!.detail).toContain("<dt>response framing</dt><dd>unknown</dd>");
+
+    expect(rows[1]!.detail).toContain("No reply carrying this request");
+    expect(rows[1]!.detail).not.toContain("could not be read");
+    expect(rows[1]!.detail).toContain("<dt>response framing</dt><dd>sse</dd>");
+  }, 30_000);
+
+  test("a pre-#31 row still renders, with the framing simply not recorded", async () => {
+    // The new fields are additive and absent is still absent: a run file from
+    // before them must not gain a framing it never had.
+    const { html, file } = await render("no-framing", runWith([REQUEST_ROW], []));
+    const row = wireTimeline(html, file).rows.find((r) => r.side === "client")!;
+
+    expect(row.detail).toContain(
+      '<dt>response framing</dt><dd><span class="empty">not recorded</span></dd>',
+    );
+    expect(row.detail).not.toContain("could not be read");
+  }, 30_000);
+
+  test("a tools/list row with a frame still points at the run's assembled result", async () => {
+    // Criterion 7 leaves #25's row alone, and the two bodies it can show are
+    // different things: the frame is this request's page, the result is the
+    // whole list the client assembled. A reader who mistook one for the other
+    // would misread a paged run.
+    const run = runWith(
+      [
+        {
+          ...REQUEST_ROW,
+          requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+          responseFrame:
+            '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"Slack_PostMessage",' +
+            '"arcadeToolkit":"Slack"}]}}',
+        },
+      ],
+      [],
+    );
+    run["toolsListResult"] = [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }];
+    run["toolsListRequests"] = 1;
+
+    const { html, file } = await render("frame-and-result", run);
+    const request = wireTimeline(html, file).rows.find((row) => row.side === "client")!;
+
+    expect(summaryLineOf(request.detail)).toContain("request and response frames recorded");
+    expect(summaryLineOf(request.detail)).not.toContain("body not recorded");
+    expect(request.detail).toContain(`href="#${file}--tools-list"`);
+    // The timeline is still #25's table: same class, same columns.
+    expect(html).toContain('<table class="wire"');
+    expect(wireTimeline(html, file).column("caused by")).toBeGreaterThan(-1);
+  }, 30_000);
+});

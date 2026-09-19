@@ -8,7 +8,7 @@
  * up would report "one list call" where three requests went out, and a reader
  * would have no way to tell.
  *
- * Four things it records that a naive wrapper would not:
+ * Five things it records that a naive wrapper would not:
  *
  *  - **Completion, not just dispatch.** `fetch` resolves when the response
  *    *headers* arrive, which on a Streamable HTTP SSE response is before the
@@ -24,8 +24,8 @@
  *  - **The `tools/list` result, as the gateway sent it.** DESIGN.md decision 18
  *    wants the MCP side of the session recorded, not only a count of it, and
  *    "as the gateway returned it" has to mean the wire. The v2 client parses a
- *    result against the spec schema and **drops every top-level field the spec
- *    does not name**: a tool sent as
+ *    result against the spec schema and **drops every field of a tool entry
+ *    that the spec does not name**: a tool sent as
  *    `{ name, description, inputSchema, arcadeToolkit }` reaches the caller
  *    without `arcadeToolkit`, silently. Reading the entries here, off the same
  *    frames the reply is observed in, is the only way the recorded result is
@@ -36,6 +36,16 @@
  *    hook hits under a key nobody polls, and the probe would print a clean,
  *    wrong zero; recording what was sent is what tells "the hook never fired"
  *    apart from "we never identified ourselves".
+ *  - **Both MCP frames, whole.** DESIGN.md decision 19: the JSON-RPC request
+ *    the client sent and the JSON-RPC reply that came back, per request. The
+ *    reply frame cannot be rebuilt higher up, for two measured reasons. The
+ *    JSON-RPC envelope — `jsonrpc` and `id` — never reaches the caller at all,
+ *    so a "frame" assembled above the transport is not one. And the loss above
+ *    applies inside it: a reply whose tool entries carry a non-spec key reaches
+ *    the caller with those entries trimmed to `name`, `description`,
+ *    `inputSchema`. (The result *object's* own non-spec keys do survive the v2
+ *    parse — measured 2026-09-19 — so they are not what tells a frame apart
+ *    from the SDK's view; the per-entry loss and the envelope are.)
  *
  * The body is piped rather than cloned on purpose. A cloned branch that is
  * read only as far as the reply frame and then abandoned stalls the branch the
@@ -43,16 +53,92 @@
  * a failure that looks nothing like its cause. Piping leaves the transport in
  * charge of reading, exactly as it would be with no wrapper at all.
  *
+ * **The frame capture lives inside that same pass-through, and adds no second
+ * reader and no wait.** `observe` already had to decode every chunk to spot the
+ * reply, so recording the frame it just parsed costs one assignment. Nothing
+ * here clones the response, nothing buffers ahead of the consumer, and nothing
+ * awaits: `transform` enqueues each chunk *before* it looks at it, so the
+ * transport receives every byte at the moment it arrives whatever the capture
+ * does with it, and back-pressure stays the transport's. A chunked or streamed
+ * body therefore terminates exactly as it did before this capture existed —
+ * the stream ends when the server ends it, `flush` runs on that end, and a body
+ * that ends without a matching reply settles the request with
+ * `responseObserved: false` and a `responseFrame` of `null` rather than hanging.
+ *
  * Because the transport only reads after this function returns, the hook
  * snapshot for a request cannot be taken inside the call that made it. It is
  * taken at the start of the *next* outbound call — notifications included, so
  * `notifications/initialized` cannot slip its hits into `initialize`'s
  * snapshot — and by {@link RequestLog.flush} at the end of an operation.
  */
+import { redactJsonText, splitTopLevelJsonArray } from "../redact.ts";
 import { readArcadeUserId } from "./headers.ts";
 
 /** A JSON-RPC id as it appears on the wire. */
 export type JsonRpcId = string | number;
+
+/**
+ * An SSE line terminator. The spec allows CRLF, LF **or** a bare CR, and a
+ * `split("\n")` would leave a stray `\r` on the end of every line of a CRLF
+ * stream — enough to make `startsWith("data:")` still work and the payload
+ * quietly wrong.
+ */
+const EOL = /\r\n|\r|\n/;
+
+/**
+ * A blank line: one terminator immediately followed by another, in every
+ * combination the spec permits.
+ *
+ * The alternatives are longest-first so that a CRLF pair is consumed as one
+ * terminator rather than as two — `(?:\r\n|\r|\n){2}` would match a single
+ * `\r\n` and cut every CRLF stream in half at the first line break.
+ *
+ * A boundary can straddle a chunk, and the scan can then match a **shorter**
+ * boundary than the one that was coming — `\r\n\r` at the end of a buffer whose
+ * next chunk starts with `\n`. That is harmless and cannot corrupt a message:
+ * the only characters this matches are line terminators, an unescaped one
+ * cannot appear inside a `data:` line, so the leftover terminator merely opens
+ * the next frame with an empty line, which carries nothing.
+ *
+ * Only searched for from the start of the buffer, so no `g` flag — a sticky
+ * `lastIndex` across calls would skip frames.
+ */
+const FRAME_BOUNDARY = /\r\n\r\n|\r\n\r|\r\n\n|\n\r\n|\r\r\n|\n\n|\r\r|\n\r/;
+
+/**
+ * How a response body is cut into messages.
+ *
+ * **Decided by the media type, never guessed from the bytes.** A blank line
+ * means "end of frame" in `text/event-stream` and means *nothing at all* in
+ * `application/json`, where it is insignificant whitespace a pretty-printer is
+ * free to emit. Scanning for one without asking what the body is splits a
+ * legal JSON document in half and loses the message — a frame the capture
+ * cannot read must never fail to a quiet `null`.
+ *
+ *  - `sse` — cut at a blank line; `data:` lines carry the message.
+ *  - `whole` — the entire body is one message, whatever is in it.
+ *  - `unknown` — the media type is one we have no rule for. Treated as
+ *    `whole`, because a single undivided body is the shape that cannot lose
+ *    data: at worst the capture fails to parse it and says so. It is a
+ *    **named** state rather than a silent fallback so the row can report it.
+ */
+type Framing = "sse" | "whole" | "unknown";
+
+/**
+ * The framing a `Content-Type` calls for.
+ *
+ * Only the media type is read; parameters like `charset` are not part of the
+ * decision. An absent header is `unknown` rather than an assumption.
+ */
+export function framingFor(contentType: string | null): Framing {
+  if (contentType === null) return "unknown";
+  const media = contentType.split(";", 1)[0]!.trim().toLowerCase();
+  if (media === "text/event-stream") return "sse";
+  // `application/json`, and the `+json` structured suffix (RFC 6839) that a
+  // gateway is free to use for a JSON-RPC body.
+  if (media === "application/json" || media.endsWith("+json")) return "whole";
+  return "unknown";
+}
 
 /**
  * One entry of a `tools/list` result, exactly as it arrived on the wire.
@@ -80,6 +166,60 @@ export interface OutboundRequest {
   jsonRpcId: JsonRpcId;
   /** `initialize`, `tools/list`, … */
   method: string;
+  /**
+   * The JSON-RPC request frame as it went out: **the raw text**, with
+   * credential values redacted in place.
+   *
+   * Text, not a parsed object, and that is the whole point. A frame that has
+   * been through `JSON.parse` and back out again has already lost the thing
+   * this capture exists to show — a duplicate key collapses to its last
+   * occurrence, whitespace is normalised, and what you store is your
+   * serialiser's idea of the message rather than the message. The parse this
+   * wrapper does is for matching an `id` and a method and nothing else; it is
+   * deliberately not the thing that gets stored.
+   *
+   * Taken from the body the wrapper was handed, before it reached the network —
+   * there is no earlier point, and no later one either: the transport hands
+   * `fetch` a serialised body and keeps nothing.
+   *
+   * When one HTTP call carries a JSON-RPC *batch*, each request in it is one
+   * entry and each entry carries the source slice of its own message, so a row
+   * is never shown a frame that is not its own.
+   */
+  requestFrame: string;
+  /**
+   * The JSON-RPC reply frame for this request — the raw text as it arrived,
+   * credential values redacted in place — or `null` when none was recorded.
+   *
+   * `null` is a measurement, and {@link responseFrameAbsence} says which one.
+   * It is never an empty object: a `{}` here would read as a gateway that
+   * answered with nothing.
+   */
+  responseFrame: string | null;
+  /**
+   * The rule used to cut this response into messages, chosen from the
+   * `Content-Type` and never guessed from the bytes.
+   *
+   * Recorded because it changes what every other field on this row means: a
+   * body read as `whole` was never split at a blank line, and one read as
+   * `unknown` was read under a rule nobody wrote for that media type. A reader
+   * who cannot see which rule applied cannot tell a missing frame from a
+   * mis-framed one.
+   */
+  responseFraming: Framing;
+  /**
+   * Why {@link responseFrame} is `null`, or `null` itself when a frame was
+   * recorded. Three states, and conflating them is the bug this field exists
+   * to prevent:
+   *
+   *  - `"unanswered"` — the body ended with no message carrying this request's
+   *    id, and everything that did arrive parsed. The gateway did not answer.
+   *  - `"unreadable"` — bytes arrived that could not be read as JSON under the
+   *    chosen framing. **We could not read the answer**, which is a different
+   *    statement from "there was no answer" and must never render as one.
+   *  - `null` — a frame was recorded.
+   */
+  responseFrameAbsence: "unanswered" | "unreadable" | null;
   /** `params.cursor`, present only when this request followed a cursor. */
   cursor?: string;
   /** ISO-8601 instant the request left the client. */
@@ -144,6 +284,8 @@ interface ParsedRequest {
   id: JsonRpcId;
   method: string;
   cursor?: string;
+  /** The source text of this message, redacted. Never a re-serialisation of it. */
+  frame: string;
 }
 
 /** The JSON-RPC *requests* in a body; notifications and responses are not requests. */
@@ -156,8 +298,13 @@ function jsonRpcRequestsIn(body: unknown): ParsedRequest[] {
     return [];
   }
   const messages = Array.isArray(parsed) ? parsed : [parsed];
+  // The source text of each message, sliced rather than re-serialised. A batch
+  // splits into its elements; a single message is the whole body. The two
+  // arrays are built from the same value, so index `n` of one is index `n` of
+  // the other.
+  const sources = (Array.isArray(parsed) ? splitTopLevelJsonArray(body) : null) ?? [body];
   const requests: ParsedRequest[] = [];
-  for (const message of messages) {
+  for (const [position, message] of messages.entries()) {
     if (message === null || typeof message !== "object") continue;
     const record = message as Record<string, unknown>;
     const id = record["id"];
@@ -172,7 +319,16 @@ function jsonRpcRequestsIn(body: unknown): ParsedRequest[] {
       params !== null && typeof params === "object" && !Array.isArray(params)
         ? (params as Record<string, unknown>)["cursor"]
         : undefined;
-    requests.push({ id, method, ...(typeof cursor === "string" ? { cursor } : {}) });
+    requests.push({
+      id,
+      method,
+      ...(typeof cursor === "string" ? { cursor } : {}),
+      // Redacted here, on the way in, so no unredacted copy is ever held: this
+      // is the only value that travels on to the entry. A batch whose element
+      // slices could not be recovered falls back to the whole body, which is
+      // still the text that went out and is never another message's.
+      frame: redactJsonText(sources[position] ?? body),
+    });
   }
   return requests;
 }
@@ -239,65 +395,137 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
   /**
    * Pipes `body` through untouched while watching for a reply to one of
    * `wanted`, and reports when it arrives (or when the body ends without it).
+   *
+   * `wanted` maps each awaited JSON-RPC id to the entry it belongs to, so the
+   * reply frame is recorded on the row that asked for it rather than on
+   * whichever row happened to be last.
    */
   function observe(
     body: ReadableStream<Uint8Array>,
-    wanted: Set<JsonRpcId>,
-    onReply: (observed: boolean) => void,
+    wanted: Map<JsonRpcId, OutboundRequest>,
+    framing: Framing,
+    onReply: (observed: boolean, unreadable: boolean) => void,
   ): ReadableStream<Uint8Array> {
     const decoder = new TextDecoder();
     let buffered = "";
     let replied = false;
+    // Set when bytes arrived that could not be read as JSON under `framing`.
+    // Without it an HTML error page and an empty body both end as
+    // `responseFrame: null`, and "we could not read the answer" would be
+    // indistinguishable from "there was no answer" — the quiet null this
+    // capture exists to stop producing.
+    let unreadable = false;
 
+    /**
+     * One reconstructed message payload.
+     *
+     * `text` is what gets stored and `parsed` is what gets matched on, and the
+     * two are deliberately separate values: the parse tells us which request
+     * this answers, the text is the evidence. Storing the parse would fold the
+     * message through this file's serialiser and lose a duplicate key, the
+     * original spacing, and — the reason any of this exists — the difference
+     * between the wire and somebody's idea of it.
+     */
     const consume = (text: string): void => {
-      const trimmed = text.trim();
-      if (trimmed === "") return;
+      // Trimmed only to ask "is there anything here at all". Nothing trimmed is
+      // ever stored: `text` has already had its framing removed by the caller,
+      // so whatever whitespace is left belongs to the payload. A body of
+      // `{...}\n` is 61 bytes on the wire and has to be 61 bytes on the record
+      // — storing 60 of them is a re-serialisation by a shorter name.
+      if (text.trim() === "") return;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(trimmed);
+        // `JSON.parse` ignores whitespace around a document, so the raw text
+        // parses exactly as a trimmed copy would and there is no reason to
+        // make one.
+        parsed = JSON.parse(text);
       } catch {
+        unreadable = true;
         return;
       }
-      for (const message of Array.isArray(parsed) ? parsed : [parsed]) {
+      const messages = Array.isArray(parsed) ? parsed : [parsed];
+      // Source slices, so a batched reply gives each row its own message text
+      // rather than the batch it arrived in. An element's slice starts at the
+      // element — the brackets and commas around it are the *batch's* framing,
+      // not the message's — while a single message is the body as it stands.
+      const sources = (Array.isArray(parsed) ? splitTopLevelJsonArray(text) : null) ?? [text];
+      for (const [position, message] of messages.entries()) {
         const version = protocolVersionIn(message);
         if (version !== undefined) negotiated = version;
         const id = idOf(message);
-        if (id === undefined || !wanted.has(id)) continue;
+        if (id === undefined) continue;
+        const entry = wanted.get(id);
+        if (entry === undefined) continue;
         // Only replies to requests this session sent. A frame that belongs to
         // someone else's request is not this run's tool list.
         const tools = listedToolsIn(message);
         if (tools !== undefined) listedTools.push(...tools);
+        // The frame as it arrived, redacted on the way in so no unredacted copy
+        // is ever held (DESIGN.md decision 19, issue #31 criteria 3 and 5).
+        // Nothing above here has seen these bytes yet; the client's own schema
+        // parse — which keeps no envelope and trims each tool entry to the
+        // fields the spec names — happens later and to a different object. The
+        // first reply carrying an id wins, because a JSON-RPC id is answered
+        // once.
+        if (entry.responseFrame === null) {
+          entry.responseFrame = redactJsonText(sources[position] ?? text);
+          entry.responseFrameAbsence = null;
+        }
         if (!replied) {
           replied = true;
-          onReply(true);
+          onReply(true, false);
         }
       }
     };
 
+    /**
+     * The `data:` payload of one SSE frame, per the spec's own rule: drop the
+     * field name, drop **one** optional space after the colon, and join the
+     * lines with a newline. Not `trim()` and not a bare concatenation — both
+     * edit bytes that belong to the message, and the message is the evidence.
+     */
+    const dataPayload = (frame: string): string =>
+      frame
+        .split(EOL)
+        .filter(line => line.startsWith("data:"))
+        .map(line => {
+          const value = line.slice("data:".length);
+          return value.startsWith(" ") ? value.slice(1) : value;
+        })
+        .join("\n");
+
     return body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
+          // Enqueued before it is looked at, always. The consumer never waits on
+          // the capture, back-pressure stays the transport's, and nothing here
+          // awaits — which is what keeps a chunked body terminating exactly as
+          // it would with no wrapper at all.
           controller.enqueue(chunk);
           buffered += decoder.decode(chunk, { stream: true });
-          // SSE frames end at a blank line; `data:` lines carry the message. A
-          // plain JSON body has neither and is parsed when the body ends.
-          let boundary = buffered.indexOf("\n\n");
-          while (boundary !== -1) {
-            const frame = buffered.slice(0, boundary);
-            buffered = buffered.slice(boundary + 2);
-            consume(
-              frame
-                .split("\n")
-                .filter(line => line.startsWith("data:"))
-                .map(line => line.slice("data:".length).trim())
-                .join(""),
-            );
-            boundary = buffered.indexOf("\n\n");
+          // Only an SSE body is cut here. A blank line inside a JSON document
+          // is insignificant whitespace a pretty-printer is free to emit, and
+          // splitting on it would hand `consume` two halves of one message and
+          // lose both (issue #31, round 2 finding 2).
+          if (framing !== "sse") return;
+          for (;;) {
+            const boundary = FRAME_BOUNDARY.exec(buffered);
+            if (boundary === null) break;
+            const frame = buffered.slice(0, boundary.index);
+            buffered = buffered.slice(boundary.index + boundary[0].length);
+            consume(dataPayload(frame));
           }
         },
         flush() {
-          consume(buffered);
-          if (!replied) onReply(false);
+          // Whatever is left is the last message. Under `sse` that is a
+          // trailing frame the server ended without a blank line after it, and
+          // its `data:` lines are the only thing that carries one — a frame of
+          // pure `event:` or comment lines is valid SSE that simply says
+          // nothing, and feeding the framing text to `consume` would report it
+          // as an unreadable body. Under `whole` and `unknown` the buffer is
+          // the entire body, which was never cut.
+          consume(framing === "sse" ? dataPayload(buffered) : buffered);
+          if (!replied) onReply(false, unreadable);
         },
       }),
     );
@@ -323,11 +551,23 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
     const startedAt = performance.now();
     const response = await baseFetch(url, init);
 
+    // Decided once, from the media type, and recorded on every row it framed.
+    const framing = framingFor(response.headers.get("content-type"));
+
     const recorded: OutboundRequest[] = requests.map(request => {
       const entry: OutboundRequest = {
         index: entries.length,
         jsonRpcId: request.id,
         method: request.method,
+        requestFrame: request.frame,
+        // `null` until a reply carrying this id is seen, which is also what it
+        // stays when the stream ends without one.
+        responseFrame: null,
+        responseFraming: framing,
+        // Assume the worst that is still true: nothing answered. Narrowed to
+        // `unreadable` if bytes turn out to have arrived that we could not
+        // read, and cleared when a frame is recorded.
+        responseFrameAbsence: "unanswered",
         ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
         sentAt: sentAt.toISOString(),
         finishedAt: sentAt.toISOString(),
@@ -342,13 +582,18 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
       return entry;
     });
 
-    const settle = (observed: boolean): void => {
+    const settle = (observed: boolean, unreadable = false): void => {
       const durationMs = Math.round((performance.now() - startedAt) * 1000) / 1000;
       const finishedAt = new Date().toISOString();
       for (const entry of recorded) {
         entry.durationMs = durationMs;
         entry.finishedAt = finishedAt;
         entry.responseObserved = observed;
+        // Only for rows still without a frame: a batch where one id was
+        // answered and another was not must not relabel the answered one.
+        if (entry.responseFrame === null && unreadable) {
+          entry.responseFrameAbsence = "unreadable";
+        }
       }
     };
 
@@ -366,9 +611,9 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
       return response;
     }
 
-    const wanted = new Set(requests.map(request => request.id));
-    const observed = observe(response.body, wanted, seen => {
-      settle(seen);
+    const wanted = new Map(recorded.map(entry => [entry.jsonRpcId, entry] as const));
+    const observed = observe(response.body, wanted, framing, (seen, unreadable) => {
+      settle(seen, unreadable);
       resolveReplied();
     });
 

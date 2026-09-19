@@ -22,6 +22,15 @@
  * extending what the counter records per hit; passing it through means this
  * slice does not get to decide what is interesting.
  *
+ * `requests[].requestFrame` and `requests[].responseFrame` are the MCP wire
+ * itself (DESIGN.md decision 19). The timeline used to hold only metadata about
+ * a request — method, id, timing — so the report could say *when* a frame
+ * crossed and never *what* crossed, and printed `body not recorded` for every
+ * row. Both are the **raw frame text**, redacted at capture, read inside the
+ * request log's existing pass-through — so neither clones nor buffers the
+ * response the transport is reading, and neither is a re-serialisation of a
+ * parse of the message.
+ *
  * `toolsListResult` is the other half of that pair (DESIGN.md decision 18):
  * `hookHits` is what the gateway told the hook, `toolsListResult` is what the
  * same gateway told the client in the same session. The live run of 2026-09-19
@@ -53,6 +62,51 @@ export interface RunRequest {
   /** The JSON-RPC id exactly as it went on the wire, whatever its type. */
   jsonRpcId: string | number;
   method: string;
+  /**
+   * The JSON-RPC request frame the probe put on the wire — **the raw text**,
+   * with credential values redacted at capture (DESIGN.md decision 19).
+   *
+   * A string, not an object, and the difference is the criterion: a frame that
+   * has been through `JSON.parse` and back out is a re-serialisation, and a
+   * re-serialisation has already dropped a duplicate key and normalised the
+   * spacing. `src/client/request-log.ts` parses the bytes only to match an id
+   * and a method; what it stores is the source slice.
+   */
+  requestFrame: string;
+  /**
+   * The JSON-RPC reply frame the gateway sent back — the raw text as it
+   * arrived, redacted — or `null` when the response stream ended without a
+   * reply carrying this request's id.
+   *
+   * `null` is the measurement "no reply was observed", the same condition
+   * `responseObserved: false` reports, and it is deliberately not `{}` — an
+   * empty object would read as a gateway that answered with nothing.
+   *
+   * Off the wire rather than out of the client. A frame rebuilt from what the
+   * SDK handed over would not be this: the JSON-RPC envelope (`jsonrpc`, `id`)
+   * never reaches the caller, and inside the result each tool entry has been
+   * trimmed to the fields the spec names — the loss #26 measured for
+   * `arcadeToolkit`. See `src/client/request-log.ts`.
+   */
+  responseFrame: string | null;
+  /**
+   * The rule used to cut this response into messages — `sse`, `whole`, or
+   * `unknown` — chosen from the `Content-Type` and never guessed from the
+   * bytes. It changes what every other field on this row means, so it is
+   * recorded rather than re-derived.
+   */
+  responseFraming: string;
+  /**
+   * Why `responseFrame` is `null`: `"unanswered"` when the body ended with no
+   * message carrying this request's id, `"unreadable"` when bytes arrived that
+   * could not be read as JSON under that framing, and `null` when a frame was
+   * recorded.
+   *
+   * "We could not read the answer" and "there was no answer" are different
+   * findings and a reader must never have to guess which one a `null` frame
+   * means.
+   */
+  responseFrameAbsence: string | null;
   /** Present only when this request followed a pagination cursor. */
   cursor?: string;
   sentAt: string;
@@ -94,9 +148,9 @@ export interface Run {
    *
    * Read off the wire rather than from `client.listTools()`, because the two
    * are not the same list: the v2 client parses the result against the spec
-   * schema and drops every top-level field the spec does not name, so an Arcade
-   * tool carrying a vendor field would arrive here without it and nothing would
-   * say so. See `src/client/request-log.ts`.
+   * schema and drops every field of a tool entry that the spec does not name,
+   * so an Arcade tool carrying a vendor field would arrive here without it and
+   * nothing would say so. See `src/client/request-log.ts`.
    *
    * `null`, not `[]`, when no `tools/list` result was ever assembled — the run
    * died first, or never got that far. `[]` is reserved for the real
@@ -153,6 +207,11 @@ export interface RunRepetitionOptions {
   apiKey: string;
   hookPublicUrl: string;
   hits: HitsClient;
+  /**
+   * How long one JSON-RPC request may wait for its reply. Omitted leaves the
+   * SDK's own 60 s default. See {@link openSession}'s `requestTimeoutMs`.
+   */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -311,6 +370,10 @@ function toRunRequest(entry: OutboundRequest): RunRequest {
     id: typeof entry.jsonRpcId === "number" ? entry.jsonRpcId : entry.index,
     jsonRpcId: entry.jsonRpcId,
     method: entry.method,
+    requestFrame: entry.requestFrame,
+    responseFrame: entry.responseFrame,
+    responseFraming: entry.responseFraming,
+    responseFrameAbsence: entry.responseFrameAbsence,
     ...(entry.cursor === undefined ? {} : { cursor: entry.cursor }),
     sentAt: entry.sentAt,
     finishedAt: entry.finishedAt,
@@ -365,6 +428,9 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
       apiKey: options.apiKey,
       fetchImpl: log.fetch,
       observedRevision: () => log.negotiatedProtocolVersion,
+      ...(options.requestTimeoutMs === undefined
+        ? {}
+        : { requestTimeoutMs: options.requestTimeoutMs }),
     });
     revisionNegotiated = session.negotiatedRevision;
     protocolEra = session.era;
@@ -374,7 +440,7 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
     // future client does not send one.
     await log.flush();
 
-    const listed = await listTools(session.client);
+    const listed = await listTools(session.client, session.requestOptions);
     await log.flush();
     // `toolsListed` and `gmailToolsListed` keep their meaning and their source:
     // the tools the *client* ended up with, which is what every existing run
@@ -458,7 +524,10 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
  * no cursor, so the SDK walks every page itself. How many requests that became
  * is read back off the request log, never assumed.
  */
-async function listTools(client: Client): Promise<string[]> {
-  const result = await client.listTools();
+async function listTools(
+  client: Client,
+  requestOptions: { timeout?: number },
+): Promise<string[]> {
+  const result = await client.listTools(undefined, requestOptions);
   return result.tools.map(tool => tool.name);
 }

@@ -11,6 +11,7 @@
  * file from a directory with no network, so everything is inlined and nothing
  * is fetched. `test/report.test.ts` asserts that by scanning the output.
  */
+import { createHash } from "node:crypto";
 import { mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -380,6 +381,85 @@ export function hitsForMethod(run: Run, method: string): number | undefined {
   return total;
 }
 
+/** What a hit no request can account for is called, everywhere it is printed. */
+export const NOT_ATTRIBUTED = "not attributed";
+
+/**
+ * The method that caused each hook hit, in `run.hookHits` order.
+ *
+ * Derived, not recorded: `hookHitsAfter` is the cumulative count for the run's
+ * user id at the moment the request finished (DESIGN.md Contracts -> Run JSON),
+ * and `hookHits` is in arrival order, so the hits whose index falls between two
+ * consecutive snapshots are the ones that request caused. That is the whole
+ * attribution — it needs no new probe field and no run-JSON change, which
+ * matters because the run JSON is a contract the probe slice and the operator's
+ * committed evidence both already depend on.
+ *
+ * `null` is a real answer, not a fallback. A hit past the last snapshot arrived
+ * after the probe stopped looking and **no request can be shown to have caused
+ * it**; folding it into the first method, or into the nearest one, would invent
+ * an attribution the data does not support. It renders as
+ * {@link NOT_ATTRIBUTED}.
+ */
+export function attributeHits(run: Run): (string | null)[] {
+  const attributed: (string | null)[] = run.hookHits.map(() => null);
+  let previous = 0;
+  for (const request of run.requests) {
+    const after = request.hookHitsAfter;
+    for (let index = previous; index < after && index < attributed.length; index += 1) {
+      attributed[index] = request.method;
+    }
+    // Snapshots are cumulative and so never decrease; clamping rather than
+    // assigning keeps a malformed non-monotonic run from re-attributing hits
+    // that an earlier request already claimed.
+    if (after > previous) previous = after;
+  }
+  return attributed;
+}
+
+/** One method and the hits attributed to it in a single run. */
+export interface MethodSplitEntry {
+  method: string;
+  hits: number;
+}
+
+/**
+ * Hits per method for one run, in the order the methods were first issued,
+ * with any unattributable hits last.
+ *
+ * Counts the hits the run section actually renders, so a reader can check the
+ * split by counting rows in the hit table. A method that was issued and caused
+ * nothing keeps its entry with `0`: that zero is a measurement — the request
+ * went out and the hook did not fire — and dropping the row would read like the
+ * method was never issued.
+ */
+export function methodSplit(run: Run): MethodSplitEntry[] {
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  const note = (method: string): void => {
+    if (!counts.has(method)) {
+      counts.set(method, 0);
+      order.push(method);
+    }
+  };
+
+  for (const request of run.requests) note(request.method);
+
+  let unattributed = 0;
+  for (const method of attributeHits(run)) {
+    if (method === null) {
+      unattributed += 1;
+      continue;
+    }
+    note(method);
+    counts.set(method, counts.get(method)! + 1);
+  }
+
+  const entries = order.map((method) => ({ method, hits: counts.get(method)! }));
+  if (unattributed > 0) entries.push({ method: NOT_ATTRIBUTED, hits: unattributed });
+  return entries;
+}
+
 /**
  * A min/max over values that some of the records may not carry.
  *
@@ -638,6 +718,116 @@ export function summarize(loaded: LoadedRun[]): RevisionSummary[] {
 }
 
 // ---------------------------------------------------------------------------
+// Raw payloads: where each one is rendered, and which are repeats
+// ---------------------------------------------------------------------------
+
+/** The anchor id of one hit's raw-payload block. */
+export function payloadAnchor(file: string, hitIndex: number): string {
+  return `${file}--payload-${hitIndex + 1}`;
+}
+
+/** How a reader is told which hit a payload block belongs to. */
+export function payloadLabel(file: string, hitIndex: number): string {
+  return `hit ${hitIndex + 1} of ${file}`;
+}
+
+/** Where one hook payload is rendered, and whether it is a repeat of another. */
+export interface PayloadPlacement {
+  /** This occurrence's own anchor id, so a repeat can be linked to as well. */
+  anchor: string;
+  /** sha-256 over the payload bytes — the same string `bodyBytes` counts. */
+  digest: string;
+  /**
+   * Set only when this payload is **byte-identical** to an earlier one, which
+   * is where the body is rendered. `undefined` means this occurrence carries
+   * the full body.
+   */
+  sameAs?: { anchor: string; label: string };
+}
+
+export interface PayloadPlan {
+  /** One entry per loaded run, each with one placement per hook hit. */
+  perRun: PayloadPlacement[][];
+  /** Payload occurrences across the whole report. */
+  occurrences: number;
+  /** Distinct payload bodies — how many are rendered in full. */
+  distinct: number;
+  /** Occurrences that are repeats and therefore render no body. */
+  repeats: number;
+  /**
+   * Characters of escaped, pretty-printed JSON the repeats did not re-emit.
+   * The measurement behind "the report shrank", kept here so a test can pin it
+   * instead of trusting that a smaller file means the right thing happened.
+   */
+  charsSaved: number;
+}
+
+/**
+ * Decides, for every hook payload in the report, whether it renders in full or
+ * as a pointer to an earlier byte-identical one.
+ *
+ * **Identical is computed, never assumed.** The map is keyed by the payload's
+ * own JSON text, so two payloads collapse only when every byte matches — not
+ * when their `toolkitCount` and `bodyBytes` happen to agree, and not because a
+ * digest matched. The digest is printed for the reader to verify; the decision
+ * does not rest on it. A payload that differs anywhere, by one tool or by one
+ * character, is rendered in full: this project exists to measure a hook whose
+ * behaviour is invisible unless measured, and a report that quietly hid a
+ * difference between two hits would be the exact failure it is built to catch.
+ *
+ * Deduplication is document-wide, not per run, because the measured evidence
+ * has the catalogue payload byte-identical *across* runs — which is where
+ * almost all of the duplication was.
+ */
+export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
+  const seen = new Map<string, { anchor: string; label: string; digest: string }>();
+  const perRun: PayloadPlacement[][] = [];
+  let occurrences = 0;
+  let repeats = 0;
+  let charsSaved = 0;
+
+  for (const { file, run } of loaded) {
+    const placements = run.hookHits.map((hit, index): PayloadPlacement => {
+      occurrences += 1;
+      const body = payloadText(hit.payload);
+      const anchor = payloadAnchor(file, index);
+      const earlier = seen.get(body);
+      if (earlier === undefined) {
+        const digest = createHash("sha256").update(body).digest("hex");
+        seen.set(body, { anchor, label: payloadLabel(file, index), digest });
+        return { anchor, digest };
+      }
+      repeats += 1;
+      charsSaved += escapeHtml(prettyPayload(hit.payload)).length;
+      return {
+        anchor,
+        digest: earlier.digest,
+        sameAs: { anchor: earlier.anchor, label: earlier.label },
+      };
+    });
+    perRun.push(placements);
+  }
+
+  return { perRun, occurrences, distinct: seen.size, repeats, charsSaved };
+}
+
+/**
+ * The payload's bytes as a comparison key and as the digest's input.
+ *
+ * Compact, not pretty-printed: it is the same string the hook counter measured
+ * for `bodyBytes`, so a digest printed here can be reproduced from the run JSON
+ * with `jq -cj '.hookHits[N].payload' run.json | shasum -a 256`.
+ */
+function payloadText(payload: unknown): string {
+  return JSON.stringify(payload) ?? "null";
+}
+
+/** The payload as the report prints it. */
+function prettyPayload(payload: unknown): string {
+  return JSON.stringify(payload, null, 2) ?? "null";
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -739,6 +929,14 @@ section.run { border-top: 1px solid #e2e4ec; padding-top: .5rem; margin-top: 2re
 .callout-unknown { border-color: #c9ccd8; background: #f4f5f8; }
 table.hits td.headers { font-size: .72rem; line-height: 1.35; max-width: 26rem; }
 table.hits .hdr { word-break: break-all; }
+details.payload { border: 1px solid #e2e4ec; border-radius: 4px; background: #fbfbfd; margin: 0 0 .5rem; }
+details.payload > summary {
+  cursor: pointer; padding: .4rem .6rem; font-size: .76rem; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #2b2f3a;
+}
+details.payload > pre { margin: 0; border: 0; border-top: 1px solid #e2e4ec; border-radius: 0 0 4px 4px; }
+details.payload.repeat > summary { color: #5a5f70; }
+p.repeat-note { margin: 0; padding: .5rem .6rem; border-top: 1px solid #e2e4ec; font-size: .8rem; }
 nav ol { margin: .25rem 0 0; padding-left: 1.4rem; font-size: .85rem; }
 nav a { color: #1f4fd8; }
 footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
@@ -976,16 +1174,125 @@ function hitNumberCell(value: number | undefined, format: (n: number) => string 
 }
 
 /**
+ * The method that caused this hit (issue #25 criterion 1).
+ *
+ * `not attributed` is styled as an absence, not printed as a method, because it
+ * is the one answer the reader must not read as "some request did this".
+ */
+function causedByCell(method: string | null): string {
+  return method === null
+    ? `<td class="text empty">${NOT_ATTRIBUTED}</td>`
+    : `<td class="text">${escapeHtml(method)}</td>`;
+}
+
+/** `initialize 1 · tools/list 3`, for one run (issue #25 criterion 3). */
+export function formatMethodSplit(run: Run): string {
+  const entries = methodSplit(run);
+  if (entries.length === 0) return "no requests and no hook hits";
+  return entries.map((entry) => `${entry.method} ${entry.hits}`).join(" · ");
+}
+
+/**
+ * The one-line summary a reader decides on before expanding a payload
+ * (issue #25 criterion 4): which hit, which method caused it, when it arrived,
+ * how big it was, how much it carried, and its digest.
+ *
+ * Counts the run file does not carry read `not recorded` here for the same
+ * reason they do in every other cell: `0 tools` would be a measurement.
+ */
+function payloadSummaryLine(
+  hit: HookHit,
+  index: number,
+  method: string | null,
+  placement: PayloadPlacement,
+): string {
+  const plural = (count: number, noun: string): string =>
+    `${count} ${noun}${count === 1 ? "" : "s"}`;
+  const parts = [
+    `hit ${index + 1}`,
+    method ?? NOT_ATTRIBUTED,
+    hit.receivedAt,
+    hit.bodyBytes === undefined ? "size not recorded" : `${hit.bodyBytes} B`,
+    hit.toolkitCount === undefined
+      ? "toolkits not recorded"
+      : plural(hit.toolkitCount, "toolkit"),
+    hit.toolCount === undefined ? "tools not recorded" : plural(hit.toolCount, "tool"),
+    `sha256 ${placement.digest}`,
+  ];
+  if (placement.sameAs !== undefined) parts.push(`identical to ${placement.sameAs.label}`);
+  return parts.map(escapeHtml).join(" · ");
+}
+
+/**
+ * One raw payload, collapsed (issue #25 criteria 4 and 5).
+ *
+ * `<details>`/`<summary>` and nothing else: the engine team opens this file
+ * from a directory with no network, so expanding must cost no script and no
+ * request. A repeat renders the statement instead of the body — and names and
+ * links the hit that carries it, so "identical" is checkable rather than
+ * asserted at the reader.
+ */
+function payloadBlock(
+  hit: HookHit,
+  index: number,
+  method: string | null,
+  placement: PayloadPlacement,
+): string {
+  const summary = `<summary>${payloadSummaryLine(hit, index, method, placement)}</summary>`;
+  if (placement.sameAs === undefined) {
+    return [
+      `<details class="payload" id="${escapeHtml(placement.anchor)}">`,
+      summary,
+      `<pre>${escapeHtml(prettyPayload(hit.payload))}</pre>`,
+      `</details>`,
+    ].join("\n");
+  }
+  return [
+    `<details class="payload repeat" id="${escapeHtml(placement.anchor)}">`,
+    summary,
+    `<p class="repeat-note">Byte-identical to ` +
+      `<a href="#${escapeHtml(placement.sameAs.anchor)}">${escapeHtml(placement.sameAs.label)}</a>` +
+      `, which carries the body. Compared byte for byte, not by size or by tool count; ` +
+      `sha-256 of the payload is <code>${escapeHtml(placement.digest)}</code>.</p>`,
+    `</details>`,
+  ].join("\n");
+}
+
+/**
+ * What the reader is told about repeated payloads, stated whether or not there
+ * were any: "nothing was collapsed" is as much a result as a saving.
+ */
+export function payloadDedupeNote(plan: PayloadPlan): string {
+  if (plan.occurrences === 0) return `<p class="sub">No hook payloads in this report.</p>`;
+  if (plan.repeats === 0) {
+    return (
+      `<p class="sub">No two of the ${plan.occurrences} raw payloads in this report are ` +
+      `byte-identical, so every one is rendered in full.</p>`
+    );
+  }
+  return (
+    `<p class="sub">${plan.repeats} of the ${plan.occurrences} raw payloads are ` +
+    `<strong>byte-identical repeats</strong> of an earlier hit; ${plan.distinct} distinct ` +
+    `payloads are rendered in full and each repeat shows its digest and a link to the hit ` +
+    `that carries the body. The comparison is over the payload bytes, not over ` +
+    `<code>bodyBytes</code> or the toolkit and tool counts: a payload that differs anywhere ` +
+    `is rendered in full, so nothing a hit carried can be hidden by this.</p>`
+  );
+}
+
+/**
  * One row per hook hit: what it carried, how big it was, and what the hook
  * server spent answering it (issue #16 criterion 3). The raw payloads still
  * follow underneath — this table is the shape, not a replacement for the body.
  */
 function hitTable(run: Run): string {
+  const attributed = attributeHits(run);
   const rows = run.hookHits
     .map((hit, index) =>
       [
         "<tr>",
         num(index + 1),
+        causedByCell(attributed[index] ?? null),
         `<td class="text">${escapeHtml(hit.receivedAt)}</td>`,
         hitNumberCell(hit.toolkitCount),
         hitNumberCell(hit.toolCount),
@@ -1000,7 +1307,8 @@ function hitTable(run: Run): string {
 
   return [
     `<table class="hits">`,
-    `<thead><tr><th>hit</th><th class="text">received at</th><th>toolkits</th><th>tools</th>` +
+    `<thead><tr><th>hit</th><th class="text">caused by</th><th class="text">received at</th>` +
+      `<th>toolkits</th><th>tools</th>` +
       `<th>versions</th><th>bodyBytes</th><th>hook server<br>handling (ms)</th>` +
       `<th class="text">captured request headers</th></tr></thead>`,
     `<tbody>\n${rows}\n</tbody>`,
@@ -1040,9 +1348,10 @@ function metaUnmeasured(): string {
   return '<span class="empty">not recorded</span>';
 }
 
-function runSection(entry: LoadedRun): string {
+function runSection(entry: LoadedRun, placements: PayloadPlacement[]): string {
   const { file, run } = entry;
   const profile = profileHits(run.hookHits);
+  const attributed = attributeHits(run);
   const meta: [string, string][] = [
     ["revision requested", escapeHtml(run.revisionRequested)],
     ["revision negotiated", escapeHtml(formatRevisionNegotiated(run.revisionNegotiated))],
@@ -1086,6 +1395,10 @@ function runSection(entry: LoadedRun): string {
           ),
     ],
     ["tool set across hits", escapeHtml(samenessText(profile.sameness, profile.hits))],
+    // Issue #25 criterion 3: the split is here, in the run, so a reader sees
+    // "initialize 1 · tools/list 3" without counting rows or going back to the
+    // summary table — which aggregates across the whole revision anyway.
+    ["hook hits by method", escapeHtml(formatMethodSplit(run))],
     ["error", run.error === null ? '<span class="empty">none</span>' : escapeHtml(run.error)],
   ];
 
@@ -1093,10 +1406,8 @@ function runSection(entry: LoadedRun): string {
     run.hookHits.length === 0
       ? `<p class="empty">No hook hits recorded for this run.</p>`
       : run.hookHits
-          .map(
-            (hit, index) =>
-              `<h4>hit ${index + 1} — received at ${escapeHtml(hit.receivedAt)}</h4>\n` +
-              `<pre>${escapeHtml(JSON.stringify(hit.payload, null, 2))}</pre>`,
+          .map((hit, index) =>
+            payloadBlock(hit, index, attributed[index] ?? null, placements[index]!),
           )
           .join("\n");
 
@@ -1113,6 +1424,10 @@ function runSection(entry: LoadedRun): string {
       ? []
       : [`<h4>hook hits (${run.hookHits.length})</h4>`, hitTable(run)]),
     `<h4>raw hook payloads (${run.hookHits.length})</h4>`,
+    run.hookHits.length === 0
+      ? ""
+      : `<p class="sub">Collapsed by default — the summary line carries size, toolkits and ` +
+        `tools so you can decide before opening. Expanding needs no script and no network.</p>`,
     payloads,
     `</section>`,
   ].join("\n");
@@ -1128,6 +1443,7 @@ export interface RenderOptions {
 /** Renders the whole document. No external assets — see the file header. */
 export function renderHtml(loaded: LoadedRun[], options: RenderOptions): string {
   const summaries = summarize(loaded);
+  const plan = planPayloads(loaded);
   const generatedAt = options.generatedAt ?? new Date().toISOString();
 
   const toc = loaded
@@ -1187,11 +1503,12 @@ latency is after, and one blended figure would hide it.
 </p>
 
 <h2>Runs</h2>
+${payloadDedupeNote(plan)}
 <nav><ol>
 ${toc}
 </ol></nav>
 
-${loaded.map(runSection).join("\n\n")}
+${loaded.map((entry, index) => runSection(entry, plan.perRun[index]!)).join("\n\n")}
 
 <footer>Generated by <code>bun run report</code>. Print to PDF from the browser.</footer>
 </body>

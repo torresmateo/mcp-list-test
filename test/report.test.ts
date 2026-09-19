@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -360,7 +361,13 @@ describe("bun run report", () => {
 
   test("every hookHits[*].payload is rendered as pretty-printed JSON", async () => {
     const { html } = await renderFixtures("payloads.html");
-    let rendered = 0;
+    // Issue #25 criterion 5 rendered byte-identical repeats once, so "every
+    // payload is in the document" is now a statement about distinct bodies:
+    // each one appears in full exactly once, and every occurrence that is not
+    // the first names the hit that carries it. The count of `<pre>` blocks
+    // still pins it — it is just the distinct count now, not the hit count.
+    const bodies = new Set<string>();
+    let occurrences = 0;
 
     for (const file of await fixtureFiles()) {
       const run = await loadFixture(file);
@@ -368,20 +375,16 @@ describe("bun run report", () => {
       for (const hit of run.hookHits) {
         const pretty = JSON.stringify(hit.payload, null, 2);
         expect(pretty).toContain("\n  "); // pretty-printed, not one line
-        const escaped = pretty
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;")
-          .replaceAll('"', "&quot;")
-          .replaceAll("'", "&#39;");
-        expect(section, `${file} payload`).toContain(escaped);
+        expect(html, `${file} payload`).toContain(escaped(pretty));
         expect(section).toContain(hit.receivedAt);
-        rendered += 1;
+        bodies.add(JSON.stringify(hit.payload));
+        occurrences += 1;
       }
     }
 
-    expect(rendered).toBeGreaterThan(0);
-    expect(html.match(/<pre>/g)?.length ?? 0).toBe(rendered);
+    expect(occurrences).toBeGreaterThan(0);
+    expect(bodies.size).toBeLessThan(occurrences); // the fixtures do repeat
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(bodies.size);
   });
 
   test("an empty input directory exits non-zero with `no run files in <dir>`", async () => {
@@ -716,20 +719,27 @@ describe("per-hit detail", () => {
     const { html } = await renderDir(PROFILE_DIRS.varied, "profile-hits.html");
     const { file, run } = (await loadDir(PROFILE_DIRS.varied))[0]!;
     const rows = tableRows(sectionFor(html, file), "hits");
+    // Columns are found by their header, not counted, so adding one (issue #25
+    // added `caused by`) cannot silently shift what this test is reading.
+    const at = (label: string) => {
+      const index = rows[0]!.findIndex((cell) => cell.includes(label));
+      if (index < 0) throw new Error(`no hits column matching "${label}"`);
+      return index;
+    };
 
     expect(rows[0]!.join(" | ")).toContain("received at");
     expect(rows).toHaveLength(run.hookHits.length + 1);
 
     run.hookHits.forEach((hit, index) => {
       const cells = rows[index + 1]!;
-      expect(cells[1]).toBe(hit.receivedAt);
-      expect(cells[2]).toBe(String(hit.toolkitCount));
-      expect(cells[3]).toBe(String(hit.toolCount));
-      expect(cells[4]).toBe(String(hit.versionCount));
-      expect(cells[5]).toBe(String(hit.bodyBytes));
-      expect(cells[6]).toBe(ms(hit.handlingMs!));
+      expect(cells[at("received at")]).toBe(hit.receivedAt);
+      expect(cells[at("toolkits")]).toBe(String(hit.toolkitCount));
+      expect(cells[at("tools")]).toBe(String(hit.toolCount));
+      expect(cells[at("versions")]).toBe(String(hit.versionCount));
+      expect(cells[at("bodyBytes")]).toBe(String(hit.bodyBytes));
+      expect(cells[at("handling")]).toBe(ms(hit.handlingMs!));
       for (const [name, value] of Object.entries(hit.headers!)) {
-        expect(cells[7], `${name} on hit ${index + 1}`).toContain(
+        expect(cells[at("captured request headers")], `${name} on hit ${index + 1}`).toContain(
           `${name} : ${escaped(value)}`,
         );
       }
@@ -737,7 +747,7 @@ describe("per-hit detail", () => {
 
     // The sizes differ hit to hit, so the column is reading each hit rather
     // than repeating one number.
-    const sizes = rows.slice(1).map((cells) => cells[5]!);
+    const sizes = rows.slice(1).map((cells) => cells[at("bodyBytes")]!);
     expect(new Set(sizes).size).toBeGreaterThan(1);
   });
 
@@ -762,28 +772,24 @@ describe("per-hit detail", () => {
 
   test("the raw payload is still pretty-printed JSON under the table", async () => {
     const { html } = await renderDir(PROFILE_DIRS.paged, "profile-payloads.html");
-    let rendered = 0;
+    const bodies = new Set<string>();
+    let occurrences = 0;
 
-    for (const { file, run } of await loadDir(PROFILE_DIRS.paged)) {
-      const section = sectionFor(html, file);
+    for (const { run } of await loadDir(PROFILE_DIRS.paged)) {
       for (const hit of run.hookHits) {
         const pretty = JSON.stringify(hit.payload, null, 2);
         expect(pretty).toContain("\n  ");
-        expect(section).toContain(
-          pretty
-            .replaceAll("&", "&amp;")
-            .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;")
-            .replaceAll('"', "&quot;")
-            .replaceAll("'", "&#39;"),
-        );
-        rendered += 1;
+        expect(html).toContain(escaped(pretty));
+        bodies.add(JSON.stringify(hit.payload));
+        occurrences += 1;
       }
     }
 
-    expect(rendered).toBeGreaterThan(0);
-    // The hit table added no `<pre>` of its own: one per payload, still.
-    expect(html.match(/<pre>/g)?.length ?? 0).toBe(rendered);
+    expect(occurrences).toBeGreaterThan(0);
+    // The hit table still adds no `<pre>` of its own; since issue #25 the count
+    // is one per *distinct* payload, byte-identical repeats having become a
+    // digest and a link.
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(bodies.size);
   });
 
   test("the request timeline carries the client-observed round trip per request", async () => {
@@ -828,5 +834,291 @@ describe("the profile report is still self-contained", () => {
     ]);
     expect(exitCode).not.toBe(0);
     expect(stderr).toContain(`no run files in ${emptyDir}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #25: hits are attributed to a method, and payloads are navigable
+// ---------------------------------------------------------------------------
+
+/**
+ * Fixtures this slice added. Neither is a variant of the #16 set: `attribution`
+ * carries a run whose last hit falls past the final `hookHitsAfter` snapshot,
+ * and `dedupe/differs` carries two payloads that agree on every number the
+ * report prints and still differ.
+ */
+const ISSUE_25_DIRS = {
+  attribution: "test/fixtures/attribution",
+  differs: "test/fixtures/dedupe/differs",
+} as const;
+
+/**
+ * Which method caused each hit, worked out a second time here.
+ *
+ * `hookHitsAfter` is cumulative, so hit `i` belongs to the first request whose
+ * snapshot is greater than `i`, and to nothing at all when no request's is.
+ * Deriving it independently is the point — importing the renderer's own
+ * `attributeHits` would only assert that it equals itself.
+ */
+function expectedAttribution(run: {
+  requests: { method: string; hookHitsAfter: number }[];
+  hookHits: unknown[];
+}): (string | null)[] {
+  return run.hookHits.map((_hit, index) => {
+    const request = run.requests.find((candidate) => candidate.hookHitsAfter > index);
+    return request?.method ?? null;
+  });
+}
+
+/** The `caused by` cells of a run's hit table, in order. */
+function causedBy(html: string, file: string): string[] {
+  const rows = tableRows(sectionFor(html, file), "hits");
+  const column = rows[0]!.findIndex((header) => header.includes("caused by"));
+  expect(column).toBeGreaterThan(-1);
+  return rows.slice(1).map((cells) => cells[column]!);
+}
+
+/** The `hook hits by method` value from a run's meta list. */
+function methodSplitOf(html: string, file: string): string {
+  const match = /<dt>hook hits by method<\/dt><dd>([^<]*)<\/dd>/.exec(sectionFor(html, file));
+  if (match === null) throw new Error(`no method split in ${file}`);
+  return match[1]!;
+}
+
+/** Every `<details class="payload…">` block in a run section, as raw HTML. */
+function payloadBlocks(html: string, file: string): string[] {
+  return [
+    ...sectionFor(html, file).matchAll(/<details class="payload[^"]*"[\s\S]*?<\/details>/g),
+  ].map((match) => match[0]);
+}
+
+function summaryLineOf(block: string): string {
+  const match = /<summary>([\s\S]*?)<\/summary>/.exec(block);
+  if (match === null) throw new Error("no summary in payload block");
+  return stripTags(match[1]!);
+}
+
+describe("every hit says which method caused it", () => {
+  test("the hit table names the method, derived from the hookHitsAfter snapshots", async () => {
+    const { html } = await renderDir(ISSUE_25_DIRS.attribution, "attribution.html");
+
+    for (const { file, run } of await loadDir(ISSUE_25_DIRS.attribution)) {
+      const expected = expectedAttribution(run).map((method) => method ?? "not attributed");
+      expect(causedBy(html, file), file).toEqual(expected);
+    }
+
+    // …and the fixture is discriminating: it contains both methods, so a
+    // renderer that printed one constant would not pass.
+    const first = (await loadDir(ISSUE_25_DIRS.attribution))[0]!;
+    expect(new Set(causedBy(html, first.file)).size).toBeGreaterThan(1);
+  });
+
+  test("a hit no request accounts for reads `not attributed`, never the first method", async () => {
+    const loaded = await loadDir(ISSUE_25_DIRS.attribution);
+    const orphaned = loaded.find(
+      ({ run }) => run.hookHits.length > (run.requests.at(-1)?.hookHitsAfter ?? 0),
+    );
+    expect(orphaned, "a fixture with a hit past the last snapshot").toBeDefined();
+
+    const { html } = await renderDir(ISSUE_25_DIRS.attribution, "attribution-orphan.html");
+    const cells = causedBy(html, orphaned!.file);
+    const last = cells.at(-1)!;
+
+    expect(last).toBe("not attributed");
+    // The two readings this criterion exists to rule out: folding the hit into
+    // the first method, and silently giving it the nearest one.
+    expect(last).not.toBe("initialize");
+    expect(last).not.toBe("tools/list");
+    // The hits that *can* be attributed still are, so `not attributed` is this
+    // hit's answer and not a blanket fallback for the run.
+    expect(cells.slice(0, -1)).toEqual(
+      expectedAttribution(orphaned!.run).slice(0, -1).map((method) => method!),
+    );
+
+    // The payload block says it too, so a reader who scrolled past the table
+    // still cannot mistake the hit for an attributed one.
+    expect(summaryLineOf(payloadBlocks(html, orphaned!.file).at(-1)!)).toContain(
+      "not attributed",
+    );
+  });
+
+  test("the per-method split is stated inside each run, not only in the summary", async () => {
+    const { html } = await renderDir(ISSUE_25_DIRS.attribution, "attribution-split.html");
+    const loaded = await loadDir(ISSUE_25_DIRS.attribution);
+    const clean = loaded[0]!;
+    const orphaned = loaded[1]!;
+
+    expect(methodSplitOf(html, clean.file)).toBe("initialize 1 · tools/list 2");
+    expect(methodSplitOf(html, orphaned.file)).toBe(
+      "initialize 1 · tools/list 2 · not attributed 1",
+    );
+
+    // Counting the rows of that run's hit table gives the same numbers, which
+    // is the check a reader would do.
+    const cells = causedBy(html, clean.file);
+    expect(cells.filter((method) => method === "initialize")).toHaveLength(1);
+    expect(cells.filter((method) => method === "tools/list")).toHaveLength(2);
+  });
+
+  test("a method that was issued and caused no hits keeps its zero", async () => {
+    // The #16 fixture snapshots 0 after `initialize`: the request went out and
+    // the hook did not fire. Dropping the entry would read like the handshake
+    // never happened, which is a different result.
+    const { html } = await renderDir(PROFILE_DIRS.identical, "attribution-zero.html");
+    const { file, run } = (await loadDir(PROFILE_DIRS.identical))[0]!;
+
+    expect(run.requests.find((request) => request.method === "initialize")!.hookHitsAfter).toBe(0);
+    expect(methodSplitOf(html, file)).toBe("initialize 0 · tools/list 3");
+  });
+});
+
+describe("raw payloads are collapsed and navigable", () => {
+  test("every payload sits in a closed `<details>` whose summary carries size, toolkits and tools", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "collapsed.html");
+    const { file, run } = (await loadDir(PROFILE_DIRS.identical))[0]!;
+    const blocks = payloadBlocks(html, file);
+
+    expect(blocks).toHaveLength(run.hookHits.length);
+    blocks.forEach((block, index) => {
+      const hit = run.hookHits[index]!;
+      const line = summaryLineOf(block);
+      expect(line).toContain(`${hit.bodyBytes} B`);
+      expect(line).toContain(`${hit.toolkitCount} toolkits`);
+      expect(line).toContain(`${hit.toolCount} tools`);
+    });
+
+    // Collapsed by default: no `open` attribute anywhere in the document.
+    expect(html).not.toMatch(/<details[^>]*\bopen\b/i);
+    // Every `<pre>` is inside one, so nothing is left expanded by accident.
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(
+      (html.match(/<\/summary>\n<pre>/g) ?? []).length,
+    );
+  });
+
+  test("expanding needs no script and nothing off-file", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "collapsed-offline.html");
+
+    expect(html).toContain("<details");
+    expect(html).toContain("<summary>");
+    expect(html).not.toMatch(/<script/i);
+    expect(html).not.toMatch(/\bon[a-z]+\s*=/i); // no onclick/ontoggle handlers
+    expect(html).not.toMatch(/<link\b[^>]*\bhref\s*=/i);
+    expect(html).not.toMatch(/@import/i);
+    expect(html).not.toMatch(/url\s*\(/i);
+    for (const href of [...html.matchAll(/\bhref\s*=\s*"([^"]*)"/g)].map((m) => m[1]!)) {
+      expect(href).toStartWith("#");
+    }
+  });
+
+  test("a run file that measured none of it says `not recorded` in the summary line, not 0", async () => {
+    const { html } = await renderFixtures("collapsed-absent.html");
+    const file = (await fixtureFiles()).find((name) => name.endsWith("2025-11-25-1.json"))!;
+    const line = summaryLineOf(payloadBlocks(html, file)[0]!);
+
+    expect(line).toContain("size not recorded");
+    expect(line).toContain("toolkits not recorded");
+    expect(line).toContain("tools not recorded");
+    expect(line).not.toContain("0 B");
+    expect(line).not.toContain("0 toolkits");
+  });
+});
+
+describe("byte-identical payloads are rendered once", () => {
+  test("a repeat shows its digest and links the hit that carries the body", async () => {
+    const { html } = await renderDir(PROFILE_DIRS.identical, "dedupe-identical.html");
+    const { file, run } = (await loadDir(PROFILE_DIRS.identical))[0]!;
+    const blocks = payloadBlocks(html, file);
+
+    // The fixture's three hits carry one payload, so two of them are repeats.
+    expect(new Set(run.hookHits.map((hit) => JSON.stringify(hit.payload))).size).toBe(1);
+    expect(blocks[0]).toContain("<pre>");
+    for (const block of blocks.slice(1)) {
+      expect(block).not.toContain("<pre>");
+      expect(block).toContain("Byte-identical to");
+      expect(block).toContain(`href="#${file}--payload-1"`);
+      expect(summaryLineOf(block)).toContain(`identical to hit 1 of ${file}`);
+    }
+  });
+
+  test("two payloads that agree on every printed number and still differ are both rendered in full", async () => {
+    const { file, run } = (await loadDir(ISSUE_25_DIRS.differs))[0]!;
+    const [first, , third] = run.hookHits;
+
+    // The trap: same size, same toolkit count, same tool count. A renderer that
+    // collapsed on the summary numbers — or on "the hits look alike" — would
+    // hide a payload that differs by one tool, in a report whose whole subject
+    // is a hook whose behaviour is invisible unless measured.
+    expect(third!.bodyBytes).toBe(first!.bodyBytes);
+    expect(third!.toolkitCount).toBe(first!.toolkitCount);
+    expect(third!.toolCount).toBe(first!.toolCount);
+    expect(JSON.stringify(third!.payload)).not.toBe(JSON.stringify(first!.payload));
+
+    const { html } = await renderDir(ISSUE_25_DIRS.differs, "dedupe-differs.html");
+    const blocks = payloadBlocks(html, file);
+
+    expect(blocks[0]).toContain(escaped(JSON.stringify(first!.payload, null, 2)));
+    expect(blocks[1]).toContain("Byte-identical to"); // the real duplicate did collapse
+    expect(blocks[2]).not.toContain("Byte-identical to");
+    expect(blocks[2]).toContain(escaped(JSON.stringify(third!.payload, null, 2)));
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(2);
+
+    // The one tool that differs is on the page, which is the thing collapsing
+    // would have destroyed.
+    expect(html).toContain("SendMessage");
+    expect(html).toContain("PostMessage");
+  });
+
+  test("the digest is the sha-256 of the payload bytes, reproducible from the run file", async () => {
+    const { html } = await renderDir(ISSUE_25_DIRS.differs, "dedupe-digest.html");
+    const { run } = (await loadDir(ISSUE_25_DIRS.differs))[0]!;
+
+    for (const hit of run.hookHits) {
+      const digest = createHash("sha256").update(JSON.stringify(hit.payload)).digest("hex");
+      expect(html).toContain(`sha256 ${digest}`);
+    }
+    // Two distinct payloads, two distinct digests: the digest is of the body,
+    // not of the run or the hit index.
+    const digests = new Set(
+      run.hookHits.map((hit) =>
+        createHash("sha256").update(JSON.stringify(hit.payload)).digest("hex"),
+      ),
+    );
+    expect(digests.size).toBe(2);
+  });
+
+  test("the report states whether anything was collapsed, either way", async () => {
+    const { html: withRepeats } = await renderDir(PROFILE_DIRS.identical, "dedupe-note.html");
+    expect(withRepeats).toContain("byte-identical repeats");
+    expect(withRepeats).toContain("is rendered in full");
+
+    const { html: without } = await renderDir(PROFILE_DIRS.varied, "dedupe-note-none.html");
+    expect(without).toContain("No two of the 3 raw payloads");
+    expect(without).not.toContain("byte-identical repeats");
+  });
+});
+
+describe("headers stay per hit, whatever happened to the payloads", () => {
+  test("a collapsed payload does not collapse its hit's headers", async () => {
+    // Issue #16 renders every hit's headers so the credential descriptor is
+    // shown present on *every* hit; issue #25 collapses payload bodies only.
+    const { html } = await renderDir(ISSUE_25_DIRS.differs, "dedupe-headers.html");
+    const { file, run } = (await loadDir(ISSUE_25_DIRS.differs))[0]!;
+    const rows = tableRows(sectionFor(html, file), "hits");
+    const column = rows[0]!.findIndex((header) => header.includes("captured request headers"));
+
+    expect(rows).toHaveLength(run.hookHits.length + 1);
+    run.hookHits.forEach((hit, index) => {
+      for (const [name, value] of Object.entries(hit.headers!)) {
+        expect(rows[index + 1]![column], `${name} on hit ${index + 1}`).toContain(
+          `${name} : ${escaped(value)}`,
+        );
+      }
+    });
+
+    // Two of the three payloads collapsed into one; all three descriptors are
+    // still printed in full, never folded into a "same as above".
+    expect(html.match(/<pre>/g)?.length ?? 0).toBe(2);
+    expect(html.split("Bearer &lt;redacted").length - 1).toBe(run.hookHits.length);
+    expect(html).not.toContain("same as above");
   });
 });

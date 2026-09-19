@@ -9,10 +9,13 @@
  *  - **Ephemeral ports.** `$PORT_WEB` belongs to the operator's hook server and
  *    to the other worktrees. Both servers here bind port 0 and the probe is
  *    told where they landed with `--hook-url`.
- *  - **Nothing is inherited from the environment.** `bun test` does not load
- *    `.env.local`, but the child process it spawns through `bun run` does, and
- *    an explicitly-set variable beats it even when empty. Every variable the
- *    probe reads is therefore passed explicitly on every spawn.
+ *  - **Nothing is inherited from the environment.** Neither `bun test` nor the
+ *    child it spawns reads `.env.local` — both run under `NODE_ENV=test`, and
+ *    bun skips the file under it. What does reach the child is whatever the
+ *    operator exported into the shell, which the quickstart in
+ *    `.orca/project.md` tells them to do. Every variable the probe reads is
+ *    therefore pinned on every spawn, by `PINNED_PROBE_ENV`; see
+ *    `test/support/probe-env.ts` for the measurement behind that (issue #29).
  *  - **A zero is never the whole assertion.** "The hook was not called" and
  *    "the probe could not ask" both leave a count at 0, so every count here is
  *    paired with something that tells those apart: the gateway's own record of
@@ -25,6 +28,7 @@ import { join } from "node:path";
 import { ARCADE_USER_ID_HEADER } from "../src/client/headers.ts";
 import { type FakeGateway, startFakeGateway } from "../src/fake-gateway/server.ts";
 import { type HookServer, startHookServer } from "../src/hook-server/server.ts";
+import { PINNED_PROBE_ENV } from "./support/probe-env.ts";
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname;
 const HOOK_TOKEN = "hook-token-for-probe-tests";
@@ -124,14 +128,18 @@ async function runProbe(
     cwd: REPO_ROOT,
     env: {
       ...process.env,
+      // Every variable the probe reads, blanked, before anything case-specific
+      // goes over it. `ARCADE_USER_ID_PREFIX` blank is what lets the
+      // default-prefix assertions below mean something — an explicit empty
+      // value beats an inherited one, and `probe` is then the documented
+      // default rather than whatever the operator's shell held. `PORT_WEB` is
+      // in there for the same reason, against the day a case here drops
+      // `--hook-url`.
+      ...PINNED_PROBE_ENV,
       ARCADE_API_KEY: "probe-test-key",
       ARCADE_MCP_URL: options.gatewayUrl ?? "http://127.0.0.1:1/mcp",
       HOOK_BEARER_TOKEN: HOOK_TOKEN,
       HOOK_PUBLIC_URL: "https://probe-test-tunnel.example",
-      // Explicitly blank so the default-prefix assertions cannot be satisfied
-      // by an `ARCADE_USER_ID_PREFIX` sitting in somebody's `.env.local` — the
-      // child *does* load it, and an explicit empty value is what beats it.
-      ARCADE_USER_ID_PREFIX: "",
       ...options.env,
     },
     stdout: "pipe",

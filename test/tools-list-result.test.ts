@@ -14,9 +14,12 @@
  *
  * Nothing here mocks the unit under test. The gateway and the counter are the
  * real servers on ephemeral ports; `$PORT_WEB` belongs to the operator, and
- * every variable the probe reads is passed explicitly on every spawn — `bun
- * test` does not load `.env.local` but the child it spawns through `bun run`
- * does, and an explicitly-set value beats it even when empty.
+ * every variable the probe reads is pinned on every spawn by
+ * `PINNED_PROBE_ENV`. Neither `bun test` nor the child it spawns reads
+ * `.env.local` — both run under `NODE_ENV=test` and bun skips the file under
+ * it — so the thing that actually reaches the child is whatever the operator
+ * exported into their shell, and an explicitly-set value beats that even when
+ * it is empty. See `test/support/probe-env.ts` (issue #29).
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -26,6 +29,7 @@ import { type FakeGateway, startFakeGateway } from "../src/fake-gateway/server.t
 import { type HookServer, startHookServer } from "../src/hook-server/server.ts";
 import { deriveToolsNotOfferedToHook } from "../src/probe/run.ts";
 import type { HookHit } from "../src/probe/hits.ts";
+import { PINNED_PROBE_ENV } from "./support/probe-env.ts";
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname;
 const HOOK_TOKEN = "hook-token-for-tools-list-tests";
@@ -108,15 +112,17 @@ async function runProbe(options: {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
+        // Every variable the probe reads, blanked, before anything
+        // case-specific goes over it. A malformed `ARCADE_USER_ID_PREFIX` in
+        // the operator's shell would otherwise exit the probe non-zero and
+        // fail this suite for a reason that has nothing to do with what it
+        // measures; `PORT_WEB` is pinned alongside it against the day a case
+        // here drops `--hook-url`.
+        ...PINNED_PROBE_ENV,
         ARCADE_API_KEY: "tools-list-test-key",
         ARCADE_MCP_URL: options.gatewayUrl,
         HOOK_BEARER_TOKEN: HOOK_TOKEN,
         HOOK_PUBLIC_URL: "https://tools-list-test-tunnel.example",
-        // Explicitly blank, so an `ARCADE_USER_ID_PREFIX` sitting in somebody's
-        // `.env.local` cannot reach these runs. A malformed one there would
-        // exit the probe non-zero and fail this suite for a reason that has
-        // nothing to do with what it measures.
-        ARCADE_USER_ID_PREFIX: "",
         ...options.env,
       },
       stdout: "pipe",

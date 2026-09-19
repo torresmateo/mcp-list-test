@@ -23,6 +23,12 @@
  * cost* of the invocation — headers, toolkit/tool/version counts, body size and
  * the server's own handling time — because a bare count does not tell the
  * engine team what an access hook costs them.
+ *
+ * Decision 19 adds the direction that was missing entirely: **what this hook
+ * answered.** `responseStatus` and `responseBody` sit on the hit beside the
+ * request they answer, so the evidence file itself shows the deny that was
+ * actually sent. Decision 7 is untouched by it — a 401 is not a hit, records
+ * nothing, and therefore has no response to record either.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
@@ -80,6 +86,29 @@ export interface HookHit {
   handlingMs: number;
   /** The body exactly as the gateway sent it, unfiltered. */
   payload: Record<string, unknown>;
+  /**
+   * The HTTP status this hook answered with — DESIGN.md decision 19.
+   *
+   * Always 200 on a recorded hit, and recorded anyway rather than assumed: a
+   * hit exists only on the path that answers 200, so a constant in the file
+   * would be a restatement of the code and a *recorded* value is a measurement
+   * a reader can check. A 401 is not a hit and never reaches here (decision 7).
+   */
+  responseStatus: number;
+  /**
+   * The body this hook sent back, as the `AccessHookResult` it serialised.
+   *
+   * The same value, not a reconstruction of it: {@link postAccess} builds the
+   * decision once, and the bytes on the wire are `JSON.stringify` of exactly
+   * this object, so `JSON.stringify(hit.responseBody)` reproduces the response
+   * byte for byte.
+   *
+   * This is the direction that was missing. A hook that records what it was
+   * asked and not what it answered cannot show that the deny it believes it
+   * issued was issued — which is the fail-open #21 fixed, and which until now
+   * was only ever provable by a `curl` run by hand.
+   */
+  responseBody: Record<string, unknown>;
 }
 
 export interface StartHookServerOptions {
@@ -374,7 +403,12 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
       return json({ error: "missing user_id" }, 400);
     }
 
-    const response = json(accessDecision(body));
+    // Built once and used twice, on purpose: the response carries
+    // `JSON.stringify(decision)` and the hit carries `decision`, so the
+    // recorded body is the sent body rather than a second construction of it
+    // that could drift.
+    const decision = accessDecision(body);
+    const response = json(decision);
     // Everything the answer needed is done; what remains is bookkeeping, and
     // the JSONL append cannot be inside the number it writes.
     record(userId, {
@@ -385,6 +419,8 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
       bodyBytes,
       handlingMs: millisSince(received.at),
       payload: body,
+      responseStatus: response.status,
+      responseBody: decision,
     });
     return response;
   }

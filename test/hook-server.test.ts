@@ -24,6 +24,7 @@ const TOKEN = "s3cret-hook-token";
  * `DESIGN.md` Contracts -> Hook counter HTTP API. Toolkit values stay loose so
  * a test can reach into the nested tool metadata it posted.
  */
+
 interface Hit {
   receivedAt: string;
   headers: Record<string, string>;
@@ -33,6 +34,8 @@ interface Hit {
   bodyBytes: number;
   handlingMs: number;
   payload: unknown;
+  responseStatus: number;
+  responseBody: Loose;
 }
 interface HitsResponse {
   count: number;
@@ -722,6 +725,9 @@ describe("the profile in the JSONL log (criterion 3)", () => {
       "headers",
       "payload",
       "receivedAt",
+      // Decision 19's pair: what this hook answered, beside what it was asked.
+      "responseBody",
+      "responseStatus",
       "toolCount",
       "toolkitCount",
       "versionCount",

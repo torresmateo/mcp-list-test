@@ -190,16 +190,24 @@ That matters in three places a count alone would mislead you:
   nobody drains stalls the branch the transport is reading and the session goes
   silent on the *next* request. Each chunk is handed on before it is looked at,
   so a chunked or streamed body terminates exactly as it would with no wrapper
-  at all.
+  at all. Frames are found at a blank line in **any** of the terminator
+  combinations SSE permits — `\n\n` and `\r\n\r\n` among them — because a scan
+  that knew only one of them would report a run where the gateway never
+  answered, which is indistinguishable from the measurement.
 - **Latency is measured to the reply, not to the response headers.** A hook
   that filters a tool list has to answer before the list can come back, so its
   round trip is on the critical path; `durationMs` per request is where the
   cost of that shows up against the hook server's own handling time.
-- **Both MCP frames are kept, not just their metadata.** `requestFrame` is the
-  JSON-RPC request the probe put on the wire and `responseFrame` is the reply
-  that came back, each whole, on the row it belongs to. The reply is read off
-  the wire rather than rebuilt from what the client handed back, because the two
-  are not the same message: the JSON-RPC envelope never reaches the caller, and
+- **Both MCP frames are kept as text, not as parsed objects.** `requestFrame` is
+  the JSON-RPC request the probe put on the wire and `responseFrame` is the reply
+  that came back — each the **raw frame**, on the row it belongs to. Text,
+  because a message that has been through `JSON.parse` and back out is a
+  re-serialisation: a duplicate key collapses to its last occurrence and the
+  spacing is normalised, so what you stored is your serialiser's idea of the
+  message. The parse the probe does is for matching an id and a method, and it
+  is deliberately not the thing that gets stored. The reply is read off the wire
+  rather than rebuilt from what the client handed back, because the two are not
+  the same message either: the JSON-RPC envelope never reaches the caller, and
   each tool entry arrives trimmed to the fields the spec names. `responseFrame`
   is **`null`, never `{}`**, when the stream ended without a reply carrying that
   request's id — the same condition `responseObserved: false` reports.
@@ -326,7 +334,7 @@ decision 17). `/hits` and each JSONL line hold the same record:
 | `handlingMs`   | The server's *own* handling time: received to response ready. Not client-observed latency — the report shows the two separately. |
 | `payload`      | The body exactly as the gateway sent it, unfiltered — Gmail included. |
 | `responseStatus` | The HTTP status this hook answered with. Recorded, not assumed: a hit only exists on the path that answers 200, and a recorded value is something a reader can check. |
-| `responseBody` | The `AccessHookResult` this hook sent back. The same object it serialised, so `JSON.stringify(responseBody)` reproduces the response byte for byte. |
+| `responseBody` | The `AccessHookResult` this hook sent back, with credential values replaced at capture. The same object it serialised, so `JSON.stringify(responseBody)` reproduces the response byte for byte except where a descriptor replaced a secret. |
 
 The counts describe what arrived, not what went back: a Gmail toolkit the
 policy names in its `deny` is still counted in the profile.
@@ -366,10 +374,34 @@ time* — while the value itself never lands on disk. Nothing real is lost, sinc
 the server has already verified the bearer: a recorded hit is by definition one
 that authenticated.
 
-The list matches header **names**, case-insensitively, and nothing else. No
-value is pattern-matched, and `traceparent`, `user-agent`, `x-arcade-user-id`
-and anything else a gateway sends stay exactly as they arrived — discovering
-them is the point of the instrument.
+The list matches **names**, case-insensitively, and nothing else. No value is
+pattern-matched, and `traceparent`, `user-agent`, `x-arcade-user-id` and
+anything else a gateway sends stay exactly as they arrived — discovering them is
+the point of the instrument.
+
+The same rule, from the same code in `src/redact.ts`, reaches into the bodies
+this harness puts on a record: the hook's own `responseBody` and both MCP
+frames. It walks them to any depth and replaces the value under a
+credential-named key while leaving the key — that an `authorization` field was
+there is evidence; what it held is not.
+
+### What is not redacted, and why that is a ruling
+
+A hook hit's `payload` and a run's `toolsListResult` are **not** put through it.
+They are the gateway's own description of its catalogue, where a key named
+`authorization` in tool metadata names what a tool *requires* rather than a
+secret it carries — and a key-based rule cannot tell those apart, so it would
+delete the measurement to protect something that was never a credential.
+`DESIGN.md` decision 17's "exactly as the gateway sent it, unfiltered" is
+deliberate.
+
+The protection there is **value-based** instead, and it already exists:
+`RUNBOOK.md` step 10 greps the operator's actual key, gateway URL, bearer token
+and tunnel host across the whole evidence directory before anything is
+committed, and step 10.4 plants a secret to prove the grep can find one — a
+`clean` verdict from a grep that read nothing looks exactly like proof. Key-based
+redaction for the values we record, value-based sweeping for everything before
+it is published.
 
 Other code starts the counter directly instead of shelling out:
 
@@ -459,8 +491,8 @@ are all on the page:
 
 | Row | Direction | What it expands to |
 | --- | --------- | ------------------ |
-| MCP request | probe → gateway | The JSON-RPC request frame, whole |
-| MCP request | gateway → probe | The JSON-RPC reply frame, whole |
+| MCP request | probe → gateway | The JSON-RPC request frame, as the bytes that went out |
+| MCP request | gateway → probe | The JSON-RPC reply frame, as the bytes that came back |
 | hook hit | gateway → hook | The payload and every captured request header |
 | hook hit | hook → gateway | The status and the body this hook answered with |
 
@@ -469,6 +501,13 @@ JSON-RPC id, status, round trip, the user-id header observed — and a
 `tools/list` row links the run's assembled result, which is a different body
 from its own frame: the frame is **this request's page**, the result is the
 whole list the client assembled across every page.
+
+A frame is embedded as the bytes that crossed the wire — no indentation, because
+indenting it would mean parsing and re-emitting it, and the round trip is the
+loss. The explorer beside it does parse, so a duplicate key shows as its last
+value in the tree; the `<pre>` is the evidence and the tree is the convenience.
+A value under a credential-named key reads as `<redacted len=… sha256=…>`
+wherever it appears, having been replaced at capture.
 
 A direction a run file does not carry says so in words. A run written before
 this capture existed renders exactly as it did, with `body not recorded` on its

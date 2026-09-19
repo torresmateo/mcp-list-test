@@ -37,6 +37,14 @@ const SPAWN_TIMEOUT_MS = 40_000;
 /** The run JSON as it comes back off disk. `any` keeps the assertions readable. */
 type Loose = Record<string, any>;
 
+/** A recorded frame is raw text; tests that read inside one parse it here. */
+function parseFrame(frame: unknown): Loose {
+  expect(typeof frame, "a recorded frame must be the raw text, not a parsed object").toBe(
+    "string",
+  );
+  return JSON.parse(frame as string) as Loose;
+}
+
 const cleanups: (() => void | Promise<void>)[] = [];
 
 afterEach(async () => {
@@ -252,21 +260,24 @@ describe("the run file holds both MCP frames, whole", () => {
     const list = (run.requests as Loose[]).find((request) => request.method === "tools/list")!;
     const init = (run.requests as Loose[]).find((request) => request.method === "initialize")!;
 
-    expect(list.responseFrame.result.fakeGatewayResultExtension).toBe("not named by the MCP spec");
-    expect(init.responseFrame.result.fakeGatewayResultExtension).toBe("not named by the MCP spec");
-    // The field the SDK's parse actually eats — see the next test — reaching
-    // disk inside the frame.
-    expect(list.responseFrame.result.tools[0].fakeGatewayExtension).toBe(
+    const listResponse = parseFrame(list.responseFrame);
+    expect(listResponse.result.fakeGatewayResultExtension).toBe("not named by the MCP spec");
+    expect(parseFrame(init.responseFrame).result.fakeGatewayResultExtension).toBe(
       "not named by the MCP spec",
     );
+    // The field the SDK's parse actually eats — see the next test — reaching
+    // disk inside the frame.
+    expect(listResponse.result.tools[0].fakeGatewayExtension).toBe("not named by the MCP spec");
     // The frame is the whole JSON-RPC message, envelope included — not the
     // `result` lifted out of it.
-    expect(list.responseFrame.jsonrpc).toBe("2.0");
-    expect(list.responseFrame.id).toBe(list.jsonRpcId);
-    // …and the request direction, likewise whole.
-    expect(list.requestFrame).toEqual({ method: "tools/list", jsonrpc: "2.0", id: list.jsonRpcId });
-    expect(init.requestFrame.params.protocolVersion).toBe(REVISION);
-    expect(init.requestFrame.params.clientInfo.name).toBe("mcp-list-test-probe");
+    expect(listResponse.jsonrpc).toBe("2.0");
+    expect(listResponse.id).toBe(list.jsonRpcId);
+    // …and the request direction, likewise whole, and as text rather than a
+    // re-serialisation: the probe sends a compact body and the file holds it.
+    expect(list.requestFrame).toBe(`{"method":"tools/list","jsonrpc":"2.0","id":${list.jsonRpcId}}`);
+    const initRequest = parseFrame(init.requestFrame);
+    expect(initRequest.params.protocolVersion).toBe(REVISION);
+    expect(initRequest.params.clientInfo.name).toBe("mcp-list-test-probe");
     // Additive to schema 1 (criterion 6).
     expect(run.schema).toBe(1);
   }, SPAWN_TIMEOUT_MS);
@@ -296,8 +307,8 @@ describe("the run file holds both MCP frames, whole", () => {
     await log.flush();
     await session.close();
 
-    const frame = log.entries.find((entry) => entry.method === "tools/list")!
-      .responseFrame as Loose;
+    const raw = log.entries.find((entry) => entry.method === "tools/list")!.responseFrame;
+    const frame = parseFrame(raw);
 
     // Lost on the way to the caller, and present in the frame: the per-entry
     // vendor field — #26's `arcadeToolkit`, under this fake's own name.
@@ -335,12 +346,12 @@ describe("the run file holds both MCP frames, whole", () => {
     // Each frame is that request's own page: the names in the frames, in order,
     // are the assembled result — not three copies of it.
     const fromFrames = lists.flatMap((request) =>
-      (request.responseFrame.result.tools as Loose[]).map((tool) => tool.name),
+      (parseFrame(request.responseFrame).result.tools as Loose[]).map((tool) => tool.name),
     );
     expect(fromFrames).toEqual((run.toolsListResult as Loose[]).map((tool) => tool.name));
     // The cursor the client followed is in the frame it was sent in, which is
     // the only place it ever existed.
-    expect(lists[1]!.requestFrame.params.cursor).toBe(lists[1]!.cursor);
+    expect(parseFrame(lists[1]!.requestFrame).params.cursor).toBe(lists[1]!.cursor);
   }, SPAWN_TIMEOUT_MS);
 
   test("a run that never got a reply writes null, not an empty object", async () => {
@@ -358,11 +369,11 @@ describe("the run file holds both MCP frames, whole", () => {
     // though the run failed — that is the point of recording it.
     const init = (run.requests as Loose[])[0]!;
     expect(init.method).toBe("initialize");
-    expect(init.requestFrame.params.protocolVersion).toBe(REVISION);
+    expect(parseFrame(init.requestFrame).params.protocolVersion).toBe(REVISION);
     expect(Object.hasOwn(init, "responseFrame")).toBe(true);
     for (const request of run.requests as Loose[]) {
-      expect(request.responseFrame === null || typeof request.responseFrame === "object").toBe(true);
-      expect(request.responseFrame).not.toEqual({});
+      expect(request.responseFrame === null || typeof request.responseFrame === "string").toBe(true);
+      expect(request.responseFrame).not.toBe("{}");
     }
   }, SPAWN_TIMEOUT_MS);
 });
@@ -406,27 +417,78 @@ describe("capture happens inside the pass-through and always terminates", () => 
     return { log, delivered };
   }
 
+  /** A frame whose bytes no round trip survives: a duplicate key and spacing. */
+  const LOSSY_FRAME =
+    '{"jsonrpc":"2.0", "id":7, "dup":1,"dup":2, "result":{"tools":' +
+    '[{"name":"Slack_PostMessage","arcadeToolkit":"Slack"}],"vendorTop":"kept"}}';
+
   test("a frame split across chunks is captured whole, and every byte still reaches the consumer", async () => {
-    const frame =
-      `data: ${JSON.stringify({
-        jsonrpc: "2.0",
-        id: 7,
-        result: { tools: [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }], vendorTop: "kept" },
-      })}\n\n`;
     // One byte at a time: every boundary inside the frame is exercised, which
     // is what a real chunked transfer is free to do.
-    const chunks = ["event: message\n", ...frame.split("")];
+    const chunks = ["event: message\n", ...`data: ${LOSSY_FRAME}\n\n`.split("")];
 
     const { log, delivered } = await send(streaming(chunks));
 
     expect(delivered).toBe(chunks.join(""));
     const entry = log.entries[0]!;
     expect(entry.responseObserved).toBe(true);
-    expect(entry.responseFrame).toEqual({
-      jsonrpc: "2.0",
-      id: 7,
-      result: { tools: [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }], vendorTop: "kept" },
-    });
+    // The frame as it arrived, byte for byte — not a re-serialisation of a
+    // parse of it. `JSON.parse` keeps only the last `dup`, so a round trip
+    // anywhere on this path shows up here as a missing `"dup":1` and as
+    // normalised spacing.
+    expect(entry.responseFrame).toBe(LOSSY_FRAME);
+    expect(JSON.parse(entry.responseFrame as string).dup).toBe(2);
+  });
+
+  test("a duplicate key survives the request direction too", async () => {
+    const body = '{"jsonrpc":"2.0", "id":7,"dup":1,"dup":2, "method":"tools/list"}';
+    const log = createRequestLog({ fetchImpl: streaming([]) });
+    await (await log.fetch("http://gateway.invalid/mcp", { method: "POST", body })).text();
+    await log.flush();
+
+    expect(log.entries[0]!.requestFrame).toBe(body);
+  });
+
+  test("a CRLF-delimited frame is seen, not silently missed", async () => {
+    // SSE permits CRLF. A scan that looked only for `\n\n` reported
+    // `responseObserved: false` and no frame at all — not a crash, a run that
+    // quietly says the gateway never answered, which is this project's
+    // characteristic failure.
+    const { log } = await send(
+      streaming([`event: message\r\n`, `data: ${LOSSY_FRAME}\r\n\r\n`]),
+    );
+
+    const entry = log.entries[0]!;
+    expect(entry.responseObserved).toBe(true);
+    expect(entry.responseFrame).toBe(LOSSY_FRAME);
+  });
+
+  test("a CRLF frame split one byte at a time is seen too", async () => {
+    // The boundary itself straddles chunks, so the scan has to wait for it
+    // rather than match half of it and drop the rest of the message.
+    const chunks = `event: message\r\ndata: ${LOSSY_FRAME}\r\n\r\n`.split("");
+
+    const { log, delivered } = await send(streaming(chunks));
+
+    expect(delivered).toBe(chunks.join(""));
+    expect(log.entries[0]!.responseFrame).toBe(LOSSY_FRAME);
+  });
+
+  test("a plain JSON body, with no SSE framing at all, is still captured", async () => {
+    const { log } = await send(streaming([LOSSY_FRAME]));
+
+    expect(log.entries[0]!.responseObserved).toBe(true);
+    expect(log.entries[0]!.responseFrame).toBe(LOSSY_FRAME);
+  });
+
+  test("a last frame the server ended without a blank line is still captured", async () => {
+    // `flush` has to finish the job `transform` could not: there is no boundary
+    // to find, so the buffer is the frame. Dropping it would be another quiet
+    // "the gateway never answered".
+    const { log } = await send(streaming([`event: message\n`, `data: ${LOSSY_FRAME}`]));
+
+    expect(log.entries[0]!.responseObserved).toBe(true);
+    expect(log.entries[0]!.responseFrame).toBe(LOSSY_FRAME);
   });
 
   test("a stream that ends without a reply terminates, and says so", async () => {
@@ -437,6 +499,7 @@ describe("capture happens inside the pass-through and always terminates", () => 
     );
 
     expect(delivered).toContain("notifications/x");
+
     const entry = log.entries[0]!;
     expect(entry.responseObserved).toBe(false);
     expect(entry.responseFrame).toBeNull();
@@ -475,7 +538,7 @@ describe("capture happens inside the pass-through and always terminates", () => 
     expect(received).toContain("trailing-noise");
     expect(received).toContain("keep-alive");
     expect(completed).toEqual([7]);
-    expect(log.entries[0]!.responseFrame).toEqual({ jsonrpc: "2.0", id: 7, result: { ok: true } });
+    expect(log.entries[0]!.responseFrame).toBe('{"jsonrpc":"2.0","id":7,"result":{"ok":true}}');
   });
 
   test("a batch gives each request its own frames, never another request's", async () => {
@@ -498,10 +561,13 @@ describe("capture happens inside the pass-through and always terminates", () => 
     await log.flush();
 
     const [first, second] = log.entries;
-    expect(first!.requestFrame).toEqual({ jsonrpc: "2.0", id: 1, method: "tools/list" });
-    expect(second!.requestFrame).toEqual({ jsonrpc: "2.0", id: 2, method: "resources/list" });
-    expect(first!.responseFrame).toEqual({ jsonrpc: "2.0", id: 1, result: { first: true } });
-    expect(second!.responseFrame).toEqual({ jsonrpc: "2.0", id: 2, result: { second: true } });
+    // Each row gets the source slice of its own message, not the batch it
+    // travelled in — and the slices are text, so nothing was re-serialised to
+    // take them apart.
+    expect(first!.requestFrame).toBe('{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
+    expect(second!.requestFrame).toBe('{"jsonrpc":"2.0","id":2,"method":"resources/list"}');
+    expect(first!.responseFrame).toBe('{"jsonrpc":"2.0","id":1,"result":{"first":true}}');
+    expect(second!.responseFrame).toBe('{"jsonrpc":"2.0","id":2,"result":{"second":true}}');
   });
 });
 
@@ -509,7 +575,198 @@ describe("capture happens inside the pass-through and always terminates", () => 
 // Criterion 5 — nothing newly recorded is a credential
 // ---------------------------------------------------------------------------
 
+/**
+ * The sentinels round 1's reviewer planted, kept verbatim so the reproduction
+ * and the fix are talking about the same strings.
+ */
+const SENTINELS = [
+  "REQ-SECRET",
+  "PROXY-SECRET",
+  "COOKIE-SECRET",
+  "SET-COOKIE-SECRET",
+  "API-SECRET",
+  "MCP-SECRET",
+  "HOOK-SECRET",
+] as const;
+
+/** Every sentinel that appears anywhere in `text`. Empty is the passing answer. */
+function leaks(text: string): string[] {
+  return SENTINELS.filter((sentinel) => text.includes(sentinel));
+}
+
+/** The descriptor a redacted value becomes, whatever it held. */
+const DESCRIPTOR = /<redacted len=\d+ sha256=[0-9a-f]{8}>/;
+
 describe("no credential reaches disk through anything recorded", () => {
+  /**
+   * A credential under every name we redact, at the top level, in a header bag
+   * one level down, and nested several levels deep. A body that only ever
+   * carried a secret at the top would not have caught round 1's defect.
+   */
+  function seeded(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      authorization: "Bearer REQ-SECRET",
+      "x-api-key": "API-SECRET",
+      headers: {
+        "proxy-authorization": "Basic PROXY-SECRET",
+        cookie: "session=COOKIE-SECRET",
+        "set-cookie": "session=SET-COOKIE-SECRET; HttpOnly",
+      },
+      deep: [{ level2: { level3: { Authorization: "Bearer MCP-SECRET" } } }],
+      ...extra,
+    };
+  }
+
+  test("the sweep finds a planted secret — the control for every assertion below", () => {
+    // A sweep that cannot find a planted secret is not evidence. This is the
+    // same `leaks` the assertions below rely on, run against text nothing has
+    // redacted, and it has to come back with all seven.
+    const planted = JSON.stringify({ ...seeded(), note: "HOOK-SECRET" });
+    expect(leaks(planted).sort()).toEqual([...SENTINELS].sort());
+    expect(planted).not.toMatch(DESCRIPTOR);
+  });
+
+  test("both MCP frames are redacted at capture, at every depth", async () => {
+    // Round 1's finding 1, reproduced and then fixed: a direct
+    // `createRequestLog` drive stored frames holding every sentinel.
+    const requestBody = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/list",
+      params: seeded(),
+    });
+    const responseText = JSON.stringify({ jsonrpc: "2.0", id: 3, result: seeded() });
+
+    // The control, on this run's own bytes: what went in really did carry them.
+    expect(leaks(requestBody).length).toBeGreaterThan(0);
+    expect(leaks(responseText).length).toBeGreaterThan(0);
+
+    const log = createRequestLog({
+      fetchImpl: (async () =>
+        new Response(`data: ${responseText}\n\n`, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        })) as unknown as typeof fetch,
+    });
+    const response = await log.fetch("http://gateway.invalid/mcp", {
+      method: "POST",
+      body: requestBody,
+      headers: { authorization: "Bearer REQ-SECRET", "x-api-key": "API-SECRET" },
+    });
+    await response.text();
+    await log.flush();
+
+    const entry = log.entries[0]!;
+    const stored = JSON.stringify(entry);
+    expect(leaks(stored)).toEqual([]);
+
+    // Not an empty capture: the frames are there, the key names are there, and
+    // what replaced the values is the descriptor rather than nothing at all.
+    expect(entry.requestFrame).toContain('"authorization"');
+    expect(entry.requestFrame).toContain('"set-cookie"');
+    expect(entry.requestFrame).toContain('"Authorization"');
+    expect(entry.requestFrame).toMatch(DESCRIPTOR);
+    expect(entry.responseFrame).toMatch(DESCRIPTOR);
+    // The scheme survives where there is one; a cookie has none and goes whole.
+    expect(entry.requestFrame).toMatch(/"authorization":"Bearer <redacted /);
+    expect(entry.requestFrame).toMatch(/"cookie":"<redacted /);
+    // And the non-credential parts of the frame are untouched.
+    expect(entry.requestFrame).toContain('"method":"tools/list"');
+  });
+
+  test("the hook's recorded answer is redacted, even though the answer it sent is not", async () => {
+    // Round 1's second reproduction: the decision echoes `ToolkitInfo` **as
+    // received**, so a credential in tool metadata travelled straight back out
+    // into `responseBody` and onto disk. The gateway still has to receive the
+    // real value or it cannot act on the deny, so the redaction is on the
+    // record, not on the wire.
+    const dir = scratchDir("wire-redact-hook-");
+    const logPath = join(dir, "hook-log.jsonl");
+    const server = startHookServer({ port: 0, token: HOOK_TOKEN, logPath });
+    cleanups.push(() => server.close());
+
+    const payload = {
+      user_id: "u-redact",
+      toolkits: {
+        Gmail: { tools: { SendEmail: [{ version: "1.0.0", metadata: seeded() }] } },
+      },
+    };
+    const sent = await fetch(`${server.url}/access`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${HOOK_TOKEN}`,
+        "content-type": "application/json",
+        cookie: "session=COOKIE-SECRET",
+      },
+      body: JSON.stringify(payload),
+    });
+    const answer = await sent.text();
+
+    // The control: the answer that went to the gateway is the real one.
+    expect(leaks(answer).length).toBeGreaterThan(0);
+
+    const hits = (await (await fetch(`${server.url}/hits?user_id=u-redact`)).json()) as {
+      hits: Loose[];
+    };
+    const recorded = hits.hits[0]!;
+    expect(leaks(JSON.stringify(recorded.responseBody))).toEqual([]);
+    expect(leaks(JSON.stringify(recorded.headers))).toEqual([]);
+    expect(JSON.stringify(recorded.responseBody)).toMatch(DESCRIPTOR);
+    // The deny itself is intact — redaction replaced values, not the decision.
+    expect(Object.keys(recorded.responseBody.deny)).toEqual(["Gmail"]);
+    // The JSONL copy is the same record, so the crash-surviving file is clean too.
+    expect(leaks(JSON.stringify(JSON.parse(readFileSync(logPath, "utf8").trim()).responseBody)))
+      .toEqual([]);
+
+    // Redaction copied rather than reached back into the payload it echoes.
+    expect(payload.toolkits.Gmail.tools.SendEmail[0]!.metadata.authorization).toBe(
+      "Bearer REQ-SECRET",
+    );
+  });
+
+  test("the boundary is where it was decided, not where it drifted to", async () => {
+    // The three surfaces this slice added are redacted by key name. The hook
+    // hit's `payload` is not, and that is a ruling rather than a gap: it is the
+    // gateway's description of its catalogue, where an `authorization` key
+    // names what a tool *requires* rather than a secret it carries, and a
+    // key-based rule cannot tell those apart (DESIGN.md decision 17). The
+    // protection there is value-based — `RUNBOOK.md` step 10 greps the
+    // operator's real key, URL, bearer and tunnel host across the whole
+    // evidence directory before anything is committed, with its own positive
+    // control at step 10.4.
+    //
+    // Pinned as a test so the next reader finds a decision instead of
+    // rediscovering it as a leak.
+    const dir = scratchDir("wire-boundary-");
+    const server = startHookServer({ port: 0, token: HOOK_TOKEN, logPath: join(dir, "l.jsonl") });
+    cleanups.push(() => server.close());
+
+    await (
+      await fetch(`${server.url}/access`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${HOOK_TOKEN}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          user_id: "u-boundary",
+          toolkits: { Gmail: { tools: { SendEmail: [{ version: "1.0.0", metadata: seeded() }] } } },
+        }),
+      })
+    ).text();
+
+    const hit = (
+      (await (await fetch(`${server.url}/hits?user_id=u-boundary`)).json()) as { hits: Loose[] }
+    ).hits[0]!;
+
+    // Redacted: the answer we sent, and the headers that arrived.
+    expect(leaks(JSON.stringify(recordedAnswer(hit)))).toEqual([]);
+    // Not redacted, on purpose: the gateway's own catalogue description.
+    expect(leaks(JSON.stringify(hit.payload)).length).toBeGreaterThan(0);
+  });
+
+  /** The parts of a hit this slice is responsible for redacting. */
+  function recordedAnswer(hit: Loose): Loose {
+    return { responseStatus: hit.responseStatus, responseBody: hit.responseBody, headers: hit.headers };
+  }
+
   test("neither the gateway key nor the hook bearer appears in what was written", async () => {
     const hook = hookServer();
     const fake = gateway(hook);

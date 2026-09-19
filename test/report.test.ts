@@ -2372,7 +2372,7 @@ describe("the wire capture renders, and absence still reads as absence (#31)", (
           {
             ...REQUEST_ROW,
             responseObserved: false,
-            requestFrame: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+            requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
             responseFrame: null,
           },
         ],
@@ -2395,21 +2395,25 @@ describe("the wire capture renders, and absence still reads as absence (#31)", (
     // block and the `<pre>` inside it sharing an id makes `getElementById`
     // return the block, and every payload silently fails to parse. Four more
     // kinds of body means four more chances at it.
-    const frame = {
-      jsonrpc: "2.0",
-      id: 1,
-      result: { tools: [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }] },
-    };
+    // Raw frame text, the way the probe writes it — including a duplicate key,
+    // which is the shape a `JSON.parse` round trip would silently collapse.
+    const frame = (id: number) =>
+      `{"jsonrpc":"2.0","id":${id},"result":{"tools":[{"name":"Slack_PostMessage",` +
+      `"arcadeToolkit":"Slack","dup":1,"dup":2}]}}`;
     const run = runWith(
       [
-        { ...REQUEST_ROW, requestFrame: { jsonrpc: "2.0", id: 1, method: "tools/list" }, responseFrame: frame },
+        {
+          ...REQUEST_ROW,
+          requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+          responseFrame: frame(1),
+        },
         {
           ...REQUEST_ROW,
           id: 2,
           jsonRpcId: 2,
           sentAt: "2026-09-19T00:00:03.000Z",
-          requestFrame: { jsonrpc: "2.0", id: 2, method: "tools/list" },
-          responseFrame: { ...frame, id: 2 },
+          requestFrame: '{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+          responseFrame: frame(2),
         },
       ],
       [
@@ -2454,6 +2458,11 @@ describe("the wire capture renders, and absence still reads as absence (#31)", (
     // The byte-identical repeats really did share rather than re-embed: nine
     // mounts, fewer stores.
     expect(stored.size).toBeLessThan(mounts.length);
+
+    // The frame is embedded as the bytes that arrived, not re-emitted through
+    // `JSON.parse`/`JSON.stringify` — the duplicate key is still both of it.
+    // A round trip in the renderer would undo the capture one level out.
+    expect(html).toContain("&quot;dup&quot;:1,&quot;dup&quot;:2");
     // And every fragment link lands on something that exists.
     for (const [, href] of html.matchAll(/href="#([^"]*)"/g)) {
       expect(html, `dangling link #${href}`).toContain(`id="${href}"`);
@@ -2469,12 +2478,10 @@ describe("the wire capture renders, and absence still reads as absence (#31)", (
       [
         {
           ...REQUEST_ROW,
-          requestFrame: { jsonrpc: "2.0", id: 1, method: "tools/list" },
-          responseFrame: {
-            jsonrpc: "2.0",
-            id: 1,
-            result: { tools: [{ name: "Slack_PostMessage", arcadeToolkit: "Slack" }] },
-          },
+          requestFrame: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+          responseFrame:
+            '{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"Slack_PostMessage",' +
+            '"arcadeToolkit":"Slack"}]}}',
         },
       ],
       [],

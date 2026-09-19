@@ -22,6 +22,13 @@
  * extending what the counter records per hit; passing it through means this
  * slice does not get to decide what is interesting.
  *
+ * `requests[].requestFrame` and `requests[].responseFrame` are the MCP wire
+ * itself (DESIGN.md decision 19). The timeline used to hold only metadata about
+ * a request — method, id, timing — so the report could say *when* a frame
+ * crossed and never *what* crossed, and printed `body not recorded` for every
+ * row. Both are read inside the request log's existing pass-through, so neither
+ * clones nor buffers the response the transport is reading.
+ *
  * `toolsListResult` is the other half of that pair (DESIGN.md decision 18):
  * `hookHits` is what the gateway told the hook, `toolsListResult` is what the
  * same gateway told the client in the same session. The live run of 2026-09-19
@@ -53,6 +60,27 @@ export interface RunRequest {
   /** The JSON-RPC id exactly as it went on the wire, whatever its type. */
   jsonRpcId: string | number;
   method: string;
+  /**
+   * The JSON-RPC request frame the probe put on the wire, whole (DESIGN.md
+   * decision 19). Recorded, never rebuilt: `src/client/request-log.ts` parses
+   * the bytes the transport handed `fetch`, so every key travels.
+   */
+  requestFrame: unknown;
+  /**
+   * The JSON-RPC reply frame the gateway sent back, whole, or `null` when the
+   * response stream ended without a reply carrying this request's id.
+   *
+   * `null` is the measurement "no reply was observed", the same condition
+   * `responseObserved: false` reports, and it is deliberately not `{}` — an
+   * empty object would read as a gateway that answered with nothing.
+   *
+   * Off the wire rather than out of the client. A frame rebuilt from what the
+   * SDK handed over would not be this: the JSON-RPC envelope (`jsonrpc`, `id`)
+   * never reaches the caller, and inside the result each tool entry has been
+   * trimmed to the fields the spec names — the loss #26 measured for
+   * `arcadeToolkit`. See `src/client/request-log.ts`.
+   */
+  responseFrame: unknown;
   /** Present only when this request followed a pagination cursor. */
   cursor?: string;
   sentAt: string;
@@ -94,9 +122,9 @@ export interface Run {
    *
    * Read off the wire rather than from `client.listTools()`, because the two
    * are not the same list: the v2 client parses the result against the spec
-   * schema and drops every top-level field the spec does not name, so an Arcade
-   * tool carrying a vendor field would arrive here without it and nothing would
-   * say so. See `src/client/request-log.ts`.
+   * schema and drops every field of a tool entry that the spec does not name,
+   * so an Arcade tool carrying a vendor field would arrive here without it and
+   * nothing would say so. See `src/client/request-log.ts`.
    *
    * `null`, not `[]`, when no `tools/list` result was ever assembled — the run
    * died first, or never got that far. `[]` is reserved for the real
@@ -311,6 +339,8 @@ function toRunRequest(entry: OutboundRequest): RunRequest {
     id: typeof entry.jsonRpcId === "number" ? entry.jsonRpcId : entry.index,
     jsonRpcId: entry.jsonRpcId,
     method: entry.method,
+    requestFrame: entry.requestFrame,
+    responseFrame: entry.responseFrame,
     ...(entry.cursor === undefined ? {} : { cursor: entry.cursor }),
     sentAt: entry.sentAt,
     finishedAt: entry.finishedAt,

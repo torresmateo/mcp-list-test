@@ -8,7 +8,7 @@
  * up would report "one list call" where three requests went out, and a reader
  * would have no way to tell.
  *
- * Four things it records that a naive wrapper would not:
+ * Five things it records that a naive wrapper would not:
  *
  *  - **Completion, not just dispatch.** `fetch` resolves when the response
  *    *headers* arrive, which on a Streamable HTTP SSE response is before the
@@ -24,8 +24,8 @@
  *  - **The `tools/list` result, as the gateway sent it.** DESIGN.md decision 18
  *    wants the MCP side of the session recorded, not only a count of it, and
  *    "as the gateway returned it" has to mean the wire. The v2 client parses a
- *    result against the spec schema and **drops every top-level field the spec
- *    does not name**: a tool sent as
+ *    result against the spec schema and **drops every field of a tool entry
+ *    that the spec does not name**: a tool sent as
  *    `{ name, description, inputSchema, arcadeToolkit }` reaches the caller
  *    without `arcadeToolkit`, silently. Reading the entries here, off the same
  *    frames the reply is observed in, is the only way the recorded result is
@@ -36,12 +36,34 @@
  *    hook hits under a key nobody polls, and the probe would print a clean,
  *    wrong zero; recording what was sent is what tells "the hook never fired"
  *    apart from "we never identified ourselves".
+ *  - **Both MCP frames, whole.** DESIGN.md decision 19: the JSON-RPC request
+ *    the client sent and the JSON-RPC reply that came back, per request. The
+ *    reply frame cannot be rebuilt higher up, for two measured reasons. The
+ *    JSON-RPC envelope — `jsonrpc` and `id` — never reaches the caller at all,
+ *    so a "frame" assembled above the transport is not one. And the loss above
+ *    applies inside it: a reply whose tool entries carry a non-spec key reaches
+ *    the caller with those entries trimmed to `name`, `description`,
+ *    `inputSchema`. (The result *object's* own non-spec keys do survive the v2
+ *    parse — measured 2026-09-19 — so they are not what tells a frame apart
+ *    from the SDK's view; the per-entry loss and the envelope are.)
  *
  * The body is piped rather than cloned on purpose. A cloned branch that is
  * read only as far as the reply frame and then abandoned stalls the branch the
  * transport is reading, and the session goes silent on the *next* request —
  * a failure that looks nothing like its cause. Piping leaves the transport in
  * charge of reading, exactly as it would be with no wrapper at all.
+ *
+ * **The frame capture lives inside that same pass-through, and adds no second
+ * reader and no wait.** `observe` already had to decode every chunk to spot the
+ * reply, so recording the frame it just parsed costs one assignment. Nothing
+ * here clones the response, nothing buffers ahead of the consumer, and nothing
+ * awaits: `transform` enqueues each chunk *before* it looks at it, so the
+ * transport receives every byte at the moment it arrives whatever the capture
+ * does with it, and back-pressure stays the transport's. A chunked or streamed
+ * body therefore terminates exactly as it did before this capture existed —
+ * the stream ends when the server ends it, `flush` runs on that end, and a body
+ * that ends without a matching reply settles the request with
+ * `responseObserved: false` and a `responseFrame` of `null` rather than hanging.
  *
  * Because the transport only reads after this function returns, the hook
  * snapshot for a request cannot be taken inside the call that made it. It is
@@ -80,6 +102,29 @@ export interface OutboundRequest {
   jsonRpcId: JsonRpcId;
   /** `initialize`, `tools/list`, … */
   method: string;
+  /**
+   * The JSON-RPC request frame as it went out, whole.
+   *
+   * Taken from the body this wrapper was handed, before it reached the network
+   * — there is no earlier point, and no later one either: the transport hands
+   * `fetch` a serialised body and keeps nothing. `JSON.parse` of those bytes,
+   * not a projection of them, so every key the client put on the wire is here
+   * whether or not anything reads it.
+   *
+   * When one HTTP call carries a JSON-RPC *batch*, each request in it is one
+   * entry and each entry carries its own message out of that batch, so a row
+   * is never shown a frame that is not its own.
+   */
+  requestFrame: unknown;
+  /**
+   * The JSON-RPC reply frame for this request, read off the wire inside the
+   * pass-through, or `null` when the stream ended without one.
+   *
+   * `null` is a measurement — "no reply to this id was seen" — and is the same
+   * condition `responseObserved: false` reports. It is never an empty object:
+   * a `{}` here would read as a gateway that answered with nothing.
+   */
+  responseFrame: unknown;
   /** `params.cursor`, present only when this request followed a cursor. */
   cursor?: string;
   /** ISO-8601 instant the request left the client. */
@@ -144,6 +189,8 @@ interface ParsedRequest {
   id: JsonRpcId;
   method: string;
   cursor?: string;
+  /** The message itself, as parsed from the bytes that went out. */
+  frame: unknown;
 }
 
 /** The JSON-RPC *requests* in a body; notifications and responses are not requests. */
@@ -172,7 +219,12 @@ function jsonRpcRequestsIn(body: unknown): ParsedRequest[] {
       params !== null && typeof params === "object" && !Array.isArray(params)
         ? (params as Record<string, unknown>)["cursor"]
         : undefined;
-    requests.push({ id, method, ...(typeof cursor === "string" ? { cursor } : {}) });
+    requests.push({
+      id,
+      method,
+      ...(typeof cursor === "string" ? { cursor } : {}),
+      frame: message,
+    });
   }
   return requests;
 }
@@ -239,10 +291,14 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
   /**
    * Pipes `body` through untouched while watching for a reply to one of
    * `wanted`, and reports when it arrives (or when the body ends without it).
+   *
+   * `wanted` maps each awaited JSON-RPC id to the entry it belongs to, so the
+   * reply frame is recorded on the row that asked for it rather than on
+   * whichever row happened to be last.
    */
   function observe(
     body: ReadableStream<Uint8Array>,
-    wanted: Set<JsonRpcId>,
+    wanted: Map<JsonRpcId, OutboundRequest>,
     onReply: (observed: boolean) => void,
   ): ReadableStream<Uint8Array> {
     const decoder = new TextDecoder();
@@ -262,11 +318,21 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         const version = protocolVersionIn(message);
         if (version !== undefined) negotiated = version;
         const id = idOf(message);
-        if (id === undefined || !wanted.has(id)) continue;
+        if (id === undefined) continue;
+        const entry = wanted.get(id);
+        if (entry === undefined) continue;
         // Only replies to requests this session sent. A frame that belongs to
         // someone else's request is not this run's tool list.
         const tools = listedToolsIn(message);
         if (tools !== undefined) listedTools.push(...tools);
+        // The frame this observer just parsed, kept whole (DESIGN.md decision
+        // 19). It is the message as it arrived, not what the SDK will make of
+        // it: nothing above here has seen these bytes yet, and the client's own
+        // schema parse — which keeps no envelope and trims each tool entry to
+        // the fields the spec names — happens later and to a different object.
+        // The first reply carrying an id wins, because a JSON-RPC id is
+        // answered once.
+        if (entry.responseFrame === null) entry.responseFrame = message;
         if (!replied) {
           replied = true;
           onReply(true);
@@ -328,6 +394,10 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         index: entries.length,
         jsonRpcId: request.id,
         method: request.method,
+        requestFrame: request.frame,
+        // `null` until a reply carrying this id is seen, which is also what it
+        // stays when the stream ends without one.
+        responseFrame: null,
         ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
         sentAt: sentAt.toISOString(),
         finishedAt: sentAt.toISOString(),
@@ -366,7 +436,7 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
       return response;
     }
 
-    const wanted = new Set(requests.map(request => request.id));
+    const wanted = new Map(recorded.map(entry => [entry.jsonRpcId, entry] as const));
     const observed = observe(response.body, wanted, seen => {
       settle(seen);
       resolveReplied();

@@ -338,8 +338,11 @@ describe("attribution", () => {
       expect(request.userIdHeader).toBe(run.userId);
       expect(request.authorizationScheme).toBe("Bearer");
     }
-    // The header name is the one constant the probe and the gateway share.
-    expect(ARCADE_USER_ID_HEADER).toBe("Arcade-User-ID");
+    // The header name is the one constant the probe and the gateway share, and
+    // it is spelled the way the Arcade Dashboard spells it (DESIGN.md open
+    // question 7). `Arcade-User-ID` also worked against the live gateway; this
+    // pins the Dashboard's spelling, not a fix.
+    expect(ARCADE_USER_ID_HEADER).toBe("Arcade-User-Id");
   }, SPAWN_TIMEOUT_MS);
 
   test("the run file carries every field the counter records per hit", async () => {

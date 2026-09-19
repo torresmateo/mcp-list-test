@@ -156,6 +156,9 @@ what was offered, and an empty array would read as "nothing bypassed the hook".
   every toolkit whose name matches `/^gmail$/i`, and `{}` when the request
   carried none. It does **not** echo the request body.
   Reply immediately, no artificial delay.
+- Every hit also records **the response this hook sent back**: its status and
+  body (decision 19). A hook that records only what it was asked, and not what
+  it answered, cannot show that the deny it believes it issued was issued.
 - `GET /hits?user_id=<id>` → `{ "count": n, "hits": [ { "receivedAt", "payload" } ] }`.
 - `GET /healthz` → 200.
 - Every accepted hit is also appended as one JSON line to
@@ -265,6 +268,15 @@ browser's print dialog.
     we measure what real clients experience. Migrating is its own slice, done
     before the probe is written, because the probe is the file the migration
     would otherwise force a rewrite of.
+19. **Record both directions on both wires.** The probe holds every MCP request
+    and response frame and the hook holds its own answer; both were being
+    reduced to metadata. The operator asked to inspect what actually crossed the
+    wire and the report could only print `body not recorded`, because the data
+    was never kept. Four directions, all recorded: probe->gateway request,
+    gateway->probe response, gateway->hook request (already kept), and
+    **hook->gateway response**, which is the one that shows the deny we believe
+    we issued was actually issued. Operator decision, 2026-09-19.
+
 18. **Record the MCP side, not only the hook side.** The probe holds the
     `tools/list` result already and reduced it to two integers. The live run of
     2026-09-19 showed why that is not enough: the gateway listed 42 tools while

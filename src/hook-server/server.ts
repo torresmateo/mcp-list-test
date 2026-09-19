@@ -30,10 +30,11 @@
  * actually sent. Decision 7 is untouched by it — a 401 is not a hit, records
  * nothing, and therefore has no response to record either.
  */
-import { createHash, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { captureHeaders, redactValue } from "../redact.ts";
 
 /** Repo root, so a relative log path means the same thing from any cwd. */
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
@@ -62,8 +63,8 @@ export interface HookHit {
    * and a hit that cannot be tied back to the request that caused it is a hit
    * we can only count, not explain.
    *
-   * Values are verbatim except for {@link CREDENTIAL_HEADERS}, whose secret is
-   * replaced by a descriptor at capture time — see {@link captureHeaders}. The
+   * Values are verbatim except for credential-bearing names, whose secret is
+   * replaced by a descriptor at capture time — see `src/redact.ts`. The
    * secret therefore never reaches the store, the JSONL log or `/hits`, so it
    * cannot travel on into a run file and into the public `evidence/` directory.
    * Nothing real is lost: the server has already verified the bearer, so a
@@ -84,7 +85,18 @@ export interface HookHit {
    * separately and the gap between them is the interesting part.
    */
   handlingMs: number;
-  /** The body exactly as the gateway sent it, unfiltered. */
+  /**
+   * The body exactly as the gateway sent it, unfiltered (DESIGN.md decision 17).
+   *
+   * Deliberately **not** put through `redactValue`, unlike {@link headers} and
+   * {@link responseBody}. This is the gateway's description of its catalogue: an
+   * `authorization` key in tool metadata here names what a tool *requires*, not
+   * a secret it carries, and a key-based rule cannot tell those apart — it would
+   * delete the measurement to protect something that was never a credential. A
+   * real credential that lands here is caught by `RUNBOOK.md` step 10's
+   * value-based grep over the whole evidence directory, which has its own
+   * positive control. See the header of `src/redact.ts`.
+   */
   payload: Record<string, unknown>;
   /**
    * The HTTP status this hook answered with — DESIGN.md decision 19.
@@ -96,12 +108,21 @@ export interface HookHit {
    */
   responseStatus: number;
   /**
-   * The body this hook sent back, as the `AccessHookResult` it serialised.
+   * The body this hook sent back — the `AccessHookResult` it serialised, with
+   * credential values replaced at capture by {@link redactValue}.
    *
    * The same value, not a reconstruction of it: {@link postAccess} builds the
-   * decision once, and the bytes on the wire are `JSON.stringify` of exactly
-   * this object, so `JSON.stringify(hit.responseBody)` reproduces the response
-   * byte for byte.
+   * decision once and sends `JSON.stringify` of it, so
+   * `JSON.stringify(hit.responseBody)` reproduces the response byte for byte
+   * **except** where a credential value was replaced by its descriptor — and
+   * the descriptor names the length of what it replaced, so even that is
+   * checkable.
+   *
+   * Redacted for the same reason the headers are: the decision echoes
+   * `ToolkitInfo` **as received**, so anything a gateway put under an
+   * `authorization`, `cookie`, `set-cookie`, `proxy-authorization` or
+   * `x-api-key` key in tool metadata would otherwise travel out of here into a
+   * run file and into the public `evidence/` directory.
    *
    * This is the direction that was missing. A hook that records what it was
    * asked and not what it answered cannot show that the deny it believes it
@@ -169,74 +190,6 @@ function unauthorized(): Response {
       "www-authenticate": 'Bearer realm="access-hook"',
     },
   });
-}
-
-/**
- * Headers whose value is a credential. Matched by name, case-insensitively.
- *
- * Deliberately short and about *names only*: these are the headers that carry
- * a secret by definition. Nothing here pattern-matches on a value — a gateway's
- * `traceparent`, `user-agent` or anything else we have never seen is exactly
- * what this instrument exists to discover, and guessing at values would start
- * redacting the evidence.
- */
-const CREDENTIAL_HEADERS = new Set([
-  "authorization",
-  "proxy-authorization",
-  "cookie",
-  "set-cookie",
-  "x-api-key",
-]);
-
-/**
- * The subset whose value begins with an auth scheme (RFC 7235). The scheme is
- * kept in the clear because it is shape, not secret. A cookie has no scheme —
- * its first token is already a value — so it is redacted whole.
- */
-const SCHEMED_CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization"]);
-
-/** `Bearer <token>` -> scheme and credential; no match means "no scheme". */
-const AUTH_SCHEME = /^([A-Za-z][A-Za-z0-9._~+-]*)[ \t]+(\S[\s\S]*)$/;
-
-/** First 8 hex of SHA-256: stable across hits, useless for recovering the value. */
-function shortDigest(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 8);
-}
-
-/**
- * What a redacted value becomes: `<redacted len=43 sha256=1f3a9c2b>`.
- *
- * A descriptor rather than a bare `<redacted>`, because the three things we
- * actually need from a credential header survive it — the header was present,
- * it had a plausible shape, and it was *the same value on every hit*. That last
- * one is the only diagnostic the raw bytes would have given us, and a constant
- * placeholder would throw it away. `len` is the byte length of the portion that
- * was removed, and the digest is over that same portion.
- */
-function redact(secret: string): string {
-  return `<redacted len=${Buffer.byteLength(secret, "utf8")} sha256=${shortDigest(secret)}>`;
-}
-
-/**
- * Every header that arrived, with credential values redacted before the record
- * exists. There is no path by which the raw secret is stored and cleaned up
- * later: it is replaced here, once, on the way in.
- */
-function captureHeaders(headers: Headers): Record<string, string> {
-  const captured: Record<string, string> = {};
-  for (const [name, value] of headers) {
-    // The runtime lower-cases header names; `toLowerCase` makes the match
-    // independent of that rather than dependent on it.
-    const key = name.toLowerCase();
-    if (!CREDENTIAL_HEADERS.has(key)) {
-      captured[name] = value;
-      continue;
-    }
-    const schemed = SCHEMED_CREDENTIAL_HEADERS.has(key) ? AUTH_SCHEME.exec(value) : null;
-    captured[name] =
-      schemed === null ? redact(value) : `${schemed[1]} ${redact(schemed[2] as string)}`;
-  }
-  return captured;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -403,10 +356,12 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
       return json({ error: "missing user_id" }, 400);
     }
 
-    // Built once and used twice, on purpose: the response carries
-    // `JSON.stringify(decision)` and the hit carries `decision`, so the
-    // recorded body is the sent body rather than a second construction of it
-    // that could drift.
+    // Built once, sent as it is, recorded redacted. The gateway has to receive
+    // the real `ToolkitInfo` or it cannot act on the deny; what lands on disk
+    // goes through `redactValue` first, at capture, so no unredacted copy is
+    // ever held. `redactValue` copies rather than mutating, which matters here:
+    // the decision carries `ToolkitInfo` objects taken straight from `payload`,
+    // and `payload` is stored unfiltered on purpose.
     const decision = accessDecision(body);
     const response = json(decision);
     // Everything the answer needed is done; what remains is bookkeeping, and
@@ -420,7 +375,7 @@ export function startHookServer(options: StartHookServerOptions): HookServer {
       handlingMs: millisSince(received.at),
       payload: body,
       responseStatus: response.status,
-      responseBody: decision,
+      responseBody: redactValue(decision) as Record<string, unknown>,
     });
     return response;
   }

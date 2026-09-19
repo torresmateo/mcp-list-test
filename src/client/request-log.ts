@@ -106,6 +106,41 @@ const EOL = /\r\n|\r|\n/;
 const FRAME_BOUNDARY = /\r\n\r\n|\r\n\r|\r\n\n|\n\r\n|\r\r\n|\n\n|\r\r|\n\r/;
 
 /**
+ * How a response body is cut into messages.
+ *
+ * **Decided by the media type, never guessed from the bytes.** A blank line
+ * means "end of frame" in `text/event-stream` and means *nothing at all* in
+ * `application/json`, where it is insignificant whitespace a pretty-printer is
+ * free to emit. Scanning for one without asking what the body is splits a
+ * legal JSON document in half and loses the message — a frame the capture
+ * cannot read must never fail to a quiet `null`.
+ *
+ *  - `sse` — cut at a blank line; `data:` lines carry the message.
+ *  - `whole` — the entire body is one message, whatever is in it.
+ *  - `unknown` — the media type is one we have no rule for. Treated as
+ *    `whole`, because a single undivided body is the shape that cannot lose
+ *    data: at worst the capture fails to parse it and says so. It is a
+ *    **named** state rather than a silent fallback so the row can report it.
+ */
+type Framing = "sse" | "whole" | "unknown";
+
+/**
+ * The framing a `Content-Type` calls for.
+ *
+ * Only the media type is read; parameters like `charset` are not part of the
+ * decision. An absent header is `unknown` rather than an assumption.
+ */
+export function framingFor(contentType: string | null): Framing {
+  if (contentType === null) return "unknown";
+  const media = contentType.split(";", 1)[0]!.trim().toLowerCase();
+  if (media === "text/event-stream") return "sse";
+  // `application/json`, and the `+json` structured suffix (RFC 6839) that a
+  // gateway is free to use for a JSON-RPC body.
+  if (media === "application/json" || media.endsWith("+json")) return "whole";
+  return "unknown";
+}
+
+/**
  * One entry of a `tools/list` result, exactly as it arrived on the wire.
  *
  * The index signature is the courier rule this project applies to every
@@ -154,14 +189,37 @@ export interface OutboundRequest {
   requestFrame: string;
   /**
    * The JSON-RPC reply frame for this request — the raw text as it arrived,
-   * credential values redacted in place — or `null` when the stream ended
-   * without one.
+   * credential values redacted in place — or `null` when none was recorded.
    *
-   * `null` is a measurement — "no reply to this id was seen" — and is the same
-   * condition `responseObserved: false` reports. It is never an empty object:
-   * a `{}` here would read as a gateway that answered with nothing.
+   * `null` is a measurement, and {@link responseFrameAbsence} says which one.
+   * It is never an empty object: a `{}` here would read as a gateway that
+   * answered with nothing.
    */
   responseFrame: string | null;
+  /**
+   * The rule used to cut this response into messages, chosen from the
+   * `Content-Type` and never guessed from the bytes.
+   *
+   * Recorded because it changes what every other field on this row means: a
+   * body read as `whole` was never split at a blank line, and one read as
+   * `unknown` was read under a rule nobody wrote for that media type. A reader
+   * who cannot see which rule applied cannot tell a missing frame from a
+   * mis-framed one.
+   */
+  responseFraming: Framing;
+  /**
+   * Why {@link responseFrame} is `null`, or `null` itself when a frame was
+   * recorded. Three states, and conflating them is the bug this field exists
+   * to prevent:
+   *
+   *  - `"unanswered"` — the body ended with no message carrying this request's
+   *    id, and everything that did arrive parsed. The gateway did not answer.
+   *  - `"unreadable"` — bytes arrived that could not be read as JSON under the
+   *    chosen framing. **We could not read the answer**, which is a different
+   *    statement from "there was no answer" and must never render as one.
+   *  - `null` — a frame was recorded.
+   */
+  responseFrameAbsence: "unanswered" | "unreadable" | null;
   /** `params.cursor`, present only when this request followed a cursor. */
   cursor?: string;
   /** ISO-8601 instant the request left the client. */
@@ -345,11 +403,18 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
   function observe(
     body: ReadableStream<Uint8Array>,
     wanted: Map<JsonRpcId, OutboundRequest>,
-    onReply: (observed: boolean) => void,
+    framing: Framing,
+    onReply: (observed: boolean, unreadable: boolean) => void,
   ): ReadableStream<Uint8Array> {
     const decoder = new TextDecoder();
     let buffered = "";
     let replied = false;
+    // Set when bytes arrived that could not be read as JSON under `framing`.
+    // Without it an HTML error page and an empty body both end as
+    // `responseFrame: null`, and "we could not read the answer" would be
+    // indistinguishable from "there was no answer" — the quiet null this
+    // capture exists to stop producing.
+    let unreadable = false;
 
     /**
      * One reconstructed message payload.
@@ -368,6 +433,7 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
       try {
         parsed = JSON.parse(trimmed);
       } catch {
+        unreadable = true;
         return;
       }
       const messages = Array.isArray(parsed) ? parsed : [parsed];
@@ -396,10 +462,11 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         // once.
         if (entry.responseFrame === null) {
           entry.responseFrame = redactJsonText(sources[position] ?? trimmed);
+          entry.responseFrameAbsence = null;
         }
         if (!replied) {
           replied = true;
-          onReply(true);
+          onReply(true, false);
         }
       }
     };
@@ -429,8 +496,11 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
           // it would with no wrapper at all.
           controller.enqueue(chunk);
           buffered += decoder.decode(chunk, { stream: true });
-          // SSE frames end at a blank line; `data:` lines carry the message. A
-          // plain JSON body has neither and is parsed when the body ends.
+          // Only an SSE body is cut here. A blank line inside a JSON document
+          // is insignificant whitespace a pretty-printer is free to emit, and
+          // splitting on it would hand `consume` two halves of one message and
+          // lose both (issue #31, round 2 finding 2).
+          if (framing !== "sse") return;
           for (;;) {
             const boundary = FRAME_BOUNDARY.exec(buffered);
             if (boundary === null) break;
@@ -440,13 +510,15 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
           }
         },
         flush() {
-          // A plain JSON body has no SSE framing at all, so whatever is left in
-          // the buffer *is* the message. A trailing SSE frame that the server
-          // ended without a blank line after it does have `data:` lines, and
-          // those are what carry it.
-          const payload = dataPayload(buffered);
-          consume(payload === "" ? buffered : payload);
-          if (!replied) onReply(false);
+          // Whatever is left is the last message. Under `sse` that is a
+          // trailing frame the server ended without a blank line after it, and
+          // its `data:` lines are the only thing that carries one — a frame of
+          // pure `event:` or comment lines is valid SSE that simply says
+          // nothing, and feeding the framing text to `consume` would report it
+          // as an unreadable body. Under `whole` and `unknown` the buffer is
+          // the entire body, which was never cut.
+          consume(framing === "sse" ? dataPayload(buffered) : buffered);
+          if (!replied) onReply(false, unreadable);
         },
       }),
     );
@@ -472,6 +544,9 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
     const startedAt = performance.now();
     const response = await baseFetch(url, init);
 
+    // Decided once, from the media type, and recorded on every row it framed.
+    const framing = framingFor(response.headers.get("content-type"));
+
     const recorded: OutboundRequest[] = requests.map(request => {
       const entry: OutboundRequest = {
         index: entries.length,
@@ -481,6 +556,11 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         // `null` until a reply carrying this id is seen, which is also what it
         // stays when the stream ends without one.
         responseFrame: null,
+        responseFraming: framing,
+        // Assume the worst that is still true: nothing answered. Narrowed to
+        // `unreadable` if bytes turn out to have arrived that we could not
+        // read, and cleared when a frame is recorded.
+        responseFrameAbsence: "unanswered",
         ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
         sentAt: sentAt.toISOString(),
         finishedAt: sentAt.toISOString(),
@@ -495,13 +575,18 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
       return entry;
     });
 
-    const settle = (observed: boolean): void => {
+    const settle = (observed: boolean, unreadable = false): void => {
       const durationMs = Math.round((performance.now() - startedAt) * 1000) / 1000;
       const finishedAt = new Date().toISOString();
       for (const entry of recorded) {
         entry.durationMs = durationMs;
         entry.finishedAt = finishedAt;
         entry.responseObserved = observed;
+        // Only for rows still without a frame: a batch where one id was
+        // answered and another was not must not relabel the answered one.
+        if (entry.responseFrame === null && unreadable) {
+          entry.responseFrameAbsence = "unreadable";
+        }
       }
     };
 
@@ -520,8 +605,8 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
     }
 
     const wanted = new Map(recorded.map(entry => [entry.jsonRpcId, entry] as const));
-    const observed = observe(response.body, wanted, seen => {
-      settle(seen);
+    const observed = observe(response.body, wanted, framing, (seen, unreadable) => {
+      settle(seen, unreadable);
       resolveReplied();
     });
 

@@ -89,6 +89,24 @@ export interface RunRequest {
    * `arcadeToolkit`. See `src/client/request-log.ts`.
    */
   responseFrame: string | null;
+  /**
+   * The rule used to cut this response into messages — `sse`, `whole`, or
+   * `unknown` — chosen from the `Content-Type` and never guessed from the
+   * bytes. It changes what every other field on this row means, so it is
+   * recorded rather than re-derived.
+   */
+  responseFraming: string;
+  /**
+   * Why `responseFrame` is `null`: `"unanswered"` when the body ended with no
+   * message carrying this request's id, `"unreadable"` when bytes arrived that
+   * could not be read as JSON under that framing, and `null` when a frame was
+   * recorded.
+   *
+   * "We could not read the answer" and "there was no answer" are different
+   * findings and a reader must never have to guess which one a `null` frame
+   * means.
+   */
+  responseFrameAbsence: string | null;
   /** Present only when this request followed a pagination cursor. */
   cursor?: string;
   sentAt: string;
@@ -189,6 +207,11 @@ export interface RunRepetitionOptions {
   apiKey: string;
   hookPublicUrl: string;
   hits: HitsClient;
+  /**
+   * How long one JSON-RPC request may wait for its reply. Omitted leaves the
+   * SDK's own 60 s default. See {@link openSession}'s `requestTimeoutMs`.
+   */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -349,6 +372,8 @@ function toRunRequest(entry: OutboundRequest): RunRequest {
     method: entry.method,
     requestFrame: entry.requestFrame,
     responseFrame: entry.responseFrame,
+    responseFraming: entry.responseFraming,
+    responseFrameAbsence: entry.responseFrameAbsence,
     ...(entry.cursor === undefined ? {} : { cursor: entry.cursor }),
     sentAt: entry.sentAt,
     finishedAt: entry.finishedAt,
@@ -403,6 +428,9 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
       apiKey: options.apiKey,
       fetchImpl: log.fetch,
       observedRevision: () => log.negotiatedProtocolVersion,
+      ...(options.requestTimeoutMs === undefined
+        ? {}
+        : { requestTimeoutMs: options.requestTimeoutMs }),
     });
     revisionNegotiated = session.negotiatedRevision;
     protocolEra = session.era;
@@ -412,7 +440,7 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
     // future client does not send one.
     await log.flush();
 
-    const listed = await listTools(session.client);
+    const listed = await listTools(session.client, session.requestOptions);
     await log.flush();
     // `toolsListed` and `gmailToolsListed` keep their meaning and their source:
     // the tools the *client* ended up with, which is what every existing run
@@ -496,7 +524,10 @@ export async function runRepetition(options: RunRepetitionOptions): Promise<Run>
  * no cursor, so the SDK walks every page itself. How many requests that became
  * is read back off the request log, never assumed.
  */
-async function listTools(client: Client): Promise<string[]> {
-  const result = await client.listTools();
+async function listTools(
+  client: Client,
+  requestOptions: { timeout?: number },
+): Promise<string[]> {
+  const result = await client.listTools(undefined, requestOptions);
   return result.tools.map(tool => tool.name);
 }

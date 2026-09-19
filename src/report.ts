@@ -81,6 +81,19 @@ export interface RunRequest {
    * observed"; a string is the frame the gateway sent.
    */
   responseFrame?: string | null;
+  /**
+   * The rule used to cut this response into messages — `sse`, `whole` or
+   * `unknown` — recorded by the probe from the `Content-Type` (#31 round 2).
+   * `undefined` on a run file written before it existed.
+   */
+  responseFraming?: string;
+  /**
+   * Why `responseFrame` is `null`. `"unanswered"` is "the gateway did not
+   * answer"; `"unreadable"` is "we could not read what it sent", which is a
+   * different finding and must not render as the first one. `undefined` on a
+   * run file that predates the distinction.
+   */
+  responseFrameAbsence?: string;
 }
 
 /**
@@ -459,6 +472,11 @@ export function parseRun(file: string, text: string): Run {
         // A response frame does — `null` is "no reply carrying this id was seen".
         requestFrame: optionalFrameText(file, entry, "requestFrame", false) ?? undefined,
         responseFrame: optionalFrameText(file, entry, "responseFrame", true),
+        responseFraming: optionalString(file, entry, "responseFraming"),
+        responseFrameAbsence:
+          entry["responseFrameAbsence"] === null
+            ? undefined
+            : optionalString(file, entry, "responseFrameAbsence"),
       }),
     };
   });
@@ -2315,6 +2333,7 @@ function requestDetail(
       request.responseObserved === undefined ? undefined : request.responseObserved ? "yes" : "no",
     ),
     detailRow("cursor followed", request.cursor),
+    detailRow("response framing", request.responseFraming),
     detailRow("hookHitsAfter (cumulative)", String(request.hookHitsAfter)),
     `</dl>`,
     requestBodyNote(request, run, file),
@@ -2348,11 +2367,7 @@ function mcpFrameBlocks(request: RunRequest, frames: McpFramePlacement): string 
   if (frames.response !== null) {
     parts.push(rawFrameBlock(request.responseFrame!, frames.response, "response frame"));
   } else if (request.responseFrame === null) {
-    parts.push(
-      `<p class="empty">No reply carrying this request\u2019s JSON-RPC id was seen on the ` +
-        `wire. That is a measurement, not a missing one \u2014 the stream ended first, which ` +
-        `is what <code>response observed: no</code> above reports.</p>`,
-    );
+    parts.push(responseFrameAbsenceNote(request));
   } else {
     parts.push(
       `<p class="empty">not recorded \u2014 this run file predates the MCP frame capture.</p>`,
@@ -2360,6 +2375,38 @@ function mcpFrameBlocks(request: RunRequest, frames: McpFramePlacement): string 
   }
 
   return parts.join("\n");
+}
+
+/**
+ * Why no reply frame was recorded — and the two answers that must never be
+ * printed as each other.
+ *
+ * "The gateway did not answer" is a measurement about the gateway. "We could
+ * not read what it sent" is a measurement about this instrument, and it is a
+ * *louder* one: it means bytes crossed the wire and the capture could not make
+ * a frame of them. Round 2's finding was a legal JSON body silently becoming
+ * the first answer when it was really neither, so the two now say themselves.
+ */
+function responseFrameAbsenceNote(request: RunRequest): string {
+  const framing =
+    request.responseFraming === undefined
+      ? ""
+      : ` The body was framed as <code>${escapeHtml(request.responseFraming)}</code>, from its` +
+        ` <code>Content-Type</code>.`;
+
+  if (request.responseFrameAbsence === "unreadable") {
+    return (
+      `<p class="empty"><strong>The reply could not be read.</strong> Bytes came back that ` +
+      `this capture could not parse as JSON under the framing it was given, so no frame was ` +
+      `recorded \u2014 which is <em>not</em> the same as the gateway failing to answer, and is ` +
+      `a defect in the instrument rather than a finding about the gateway.${framing}</p>`
+    );
+  }
+  return (
+    `<p class="empty">No reply carrying this request\u2019s JSON-RPC id was seen on the wire. ` +
+    `That is a measurement, not a missing one \u2014 the stream ended first, which is what ` +
+    `<code>response observed: no</code> above reports.${framing}</p>`
+  );
 }
 
 /**

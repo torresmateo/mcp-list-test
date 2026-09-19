@@ -8,7 +8,7 @@
  * up would report "one list call" where three requests went out, and a reader
  * would have no way to tell.
  *
- * Three things it records that a naive wrapper would not:
+ * Four things it records that a naive wrapper would not:
  *
  *  - **Completion, not just dispatch.** `fetch` resolves when the response
  *    *headers* arrive, which on a Streamable HTTP SSE response is before the

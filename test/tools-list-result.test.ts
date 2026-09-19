@@ -13,7 +13,10 @@
  *    the failure this project keeps finding.
  *
  * Nothing here mocks the unit under test. The gateway and the counter are the
- * real servers on ephemeral ports; `$PORT_WEB` belongs to the operator.
+ * real servers on ephemeral ports; `$PORT_WEB` belongs to the operator, and
+ * every variable the probe reads is passed explicitly on every spawn — `bun
+ * test` does not load `.env.local` but the child it spawns through `bun run`
+ * does, and an explicitly-set value beats it even when empty.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -81,6 +84,7 @@ async function runProbe(options: {
   gatewayUrl: string;
   hookUrl: string;
   args?: string[];
+  env?: Record<string, string>;
 }): Promise<ProbeResult> {
   const out = outputDir();
   const child = Bun.spawn(
@@ -108,6 +112,12 @@ async function runProbe(options: {
         ARCADE_MCP_URL: options.gatewayUrl,
         HOOK_BEARER_TOKEN: HOOK_TOKEN,
         HOOK_PUBLIC_URL: "https://tools-list-test-tunnel.example",
+        // Explicitly blank, so an `ARCADE_USER_ID_PREFIX` sitting in somebody's
+        // `.env.local` cannot reach these runs. A malformed one there would
+        // exit the probe non-zero and fail this suite for a reason that has
+        // nothing to do with what it measures.
+        ARCADE_USER_ID_PREFIX: "",
+        ...options.env,
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -332,6 +342,41 @@ describe("the run file records both sides of the comparison", () => {
     expect(called.url).not.toBe(polled.url);
     expect(fake.hookCalls.map(call => call.status)).toEqual([200]);
     expect(result.stdout).toContain("not offered to the hook: not measured (no hook hits");
+  }, SPAWN_TIMEOUT_MS);
+
+  test("a configured user-id prefix and the wire capture hold on the same run", async () => {
+    // Both sides of one session under a non-default id. `toolsListResult` is
+    // read off the wire in the same `fetch` wrapper that reads the Arcade user
+    // header, and the id has to survive that header *and* the
+    // `GET /hits?user_id=` query for `hookHits` to be non-empty at all — so a
+    // run that has the vendor field, the bypass set and a matching
+    // `payload.user_id` has exercised both paths at once.
+    const hook = hookServer();
+    const fake = gateway(hook, {
+      tools: ["Slack_PostMessage", "Arcade_ListApps"],
+      toolsOfferedToHook: ["Slack_PostMessage"],
+    });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      env: { ARCADE_USER_ID_PREFIX: "mateo.lab-01" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    const run = result.runs[0]!;
+    expect(run.userId).toMatch(/^mateo\.lab-01-2025-11-25-\d+-\d+$/);
+    // The id reached the gateway, the hook, and the counter the probe polled.
+    for (const request of run.requests as Loose[]) expect(request.userIdHeader).toBe(run.userId);
+    expect(run.hookHits.map((hit: Loose) => hit.payload.user_id)).toEqual([run.userId]);
+    expect(fake.hookCalls.map(call => call.userId)).toEqual([run.userId]);
+    // And the capture on the same request is intact: the non-spec field the
+    // SDK's parse would have eaten, and the derived set it feeds.
+    expect((run.toolsListResult as Loose[]).map(tool => tool.fakeGatewayExtension)).toEqual([
+      "not named by the MCP spec",
+      "not named by the MCP spec",
+    ]);
+    expect(run.toolsNotOfferedToHook).toEqual(["Arcade_ListApps"]);
   }, SPAWN_TIMEOUT_MS);
 
   test("a run that never listed writes null for both fields", async () => {

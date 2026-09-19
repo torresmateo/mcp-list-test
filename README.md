@@ -178,7 +178,7 @@ results/20260918T203958539Z-2025-11-25-1.json
 
 Every outbound JSON-RPC request goes through a wrapping `fetch`, so the run
 records what the client actually sent rather than what it was asked to send.
-That matters in two places a count alone would mislead you:
+That matters in three places a count alone would mislead you:
 
 - **Pagination is a number, not something you infer.** The SDK walks
   `tools/list` pages for you, so one call can be three requests. `requests[]`

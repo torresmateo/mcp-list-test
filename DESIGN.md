@@ -76,9 +76,11 @@ Interfaces other slices inherit. Change them only by amending this file.
 | `ARCADE_MCP_URL`    | operator            | Streamable HTTP endpoint of the test gateway         |
 | `HOOK_BEARER_TOKEN` | operator            | Token the gateway sends; hook rejects anything else  |
 | `HOOK_PUBLIC_URL`   | operator            | ngrok URL, printed in run JSON for provenance only   |
+| `ARCADE_USER_ID_PREFIX` | operator, optional | Replaces `probe` in the generated `user_id`. Defaults to `probe`. |
 
 Anything needed by the live probe that is missing makes it exit non-zero with
-the variable name. Nothing skips.
+the variable name. Nothing skips. `ARCADE_USER_ID_PREFIX` is the one optional
+entry: absent, the default applies; it never causes an exit.
 
 ### Probe CLI
 
@@ -89,7 +91,10 @@ bun run probe --protocol <2025-11-25|2026-07-28> [--repetitions N] [--out result
 Default repetitions: 5. Runs are serial. Exit code is 0 only if every
 repetition negotiated the requested revision. Per repetition the probe:
 
-1. Generates `user_id = probe-<revision>-<timestamp>-<n>`.
+1. Generates `user_id = <prefix>-<revision>-<timestamp>-<n>`, where `<prefix>`
+   is `$ARCADE_USER_ID_PREFIX` or `probe`. **The `-<n>` suffix is not
+   configurable**: each repetition must be a distinct end user, or a cached
+   session or reused authorization can hide the behaviour being measured.
 2. Sends it in the Arcade user header on every request, with
    `Authorization: Bearer $ARCADE_API_KEY`.
 3. Requests `protocolVersion = <revision>` in `initialize` and sets the
@@ -284,6 +289,15 @@ session. Until answered, decision 5 stands.
 6. Do any request-scoped identifiers (trace id, session id) reach the hook that
    would allow exact attribution instead of quiescence windows?
 7. Which header or claim becomes `user_id` for an MCP gateway call?
+   **Header name answered** (operator, 2026-09-18): `Arcade-User-Id`, as spelled
+   in the Arcade Dashboard. An earlier confirmation said `Arcade-User-ID`; the
+   live gateway accepted that spelling and ran fine, so the correction is
+   fidelity to the Dashboard, **not** a fix for a failure — and it is itself a
+   small finding: Arcade matches the header case-insensitively, as RFC 9110
+   requires. The remaining half — whether the gateway derives the hook payload's
+   `user_id` from that header — is what the live run's step 6 `MATCH`/`MISMATCH`
+   check answers, and cannot be shown offline because the fake reads the same
+   constant the probe sends.
 8. Does the `tools/list` path differ between MCP revisions `2025-11-25` and
    `2026-07-28`? Note these are different eras (decision 15), so any difference
    may be the handshake rather than the list path itself.

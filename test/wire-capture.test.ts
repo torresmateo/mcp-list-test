@@ -552,23 +552,47 @@ describe("capture happens inside the pass-through and always terminates", () => 
   /**
    * Round 2 finding 2, verbatim: a legal, pretty-printed JSON body whose
    * insignificant blank line the scanner treated as an SSE frame boundary.
+   *
+   * It carries a **trailing newline**, which is what round 3 found being
+   * trimmed away — and which is why every assertion about it below compares
+   * bytes rather than a parsed or trimmed equivalent.
    */
   const PRETTY_JSON_BODY = '{\n  "jsonrpc": "2.0",\n\n  "id": 7,\n  "result": {"ok": true}\n}\n';
 
-  test("a pretty-printed JSON body is never split at its blank line", async () => {
-    // `JSON.parse` accepts this body. Framing it as SSE cut it in half before
-    // `flush` ever saw it, and the log recorded `responseObserved: false,
-    // responseFrame: null` — a legal wire shape becoming a quiet "no response",
-    // the same class as the CRLF bug.
+  /** Byte length, so "whole" is checked as a count and not as a feeling. */
+  const bytes = (value: string): number => Buffer.byteLength(value, "utf8");
+
+  test("a JSON body is stored byte for byte, trailing newline included", async () => {
+    // Round 3's finding, and the reason it survived round 2: the assertion
+    // here used to read `PRETTY_JSON_BODY.trim()`, which is the implementation
+    // restated as a requirement. Written that way it passed while the frame
+    // was 60 bytes of a 61-byte body. It compares the bytes now, so
+    // reintroducing a `.trim()` anywhere on this path fails it.
     const { log } = await send(streaming([PRETTY_JSON_BODY], "application/json"));
 
     const entry = log.entries[0]!;
     expect(entry.responseFraming).toBe("whole");
     expect(entry.responseObserved).toBe(true);
-    // Whole, including the blank line: this is the raw body, not a reflow of it.
-    expect(entry.responseFrame).toBe(PRETTY_JSON_BODY.trim());
-    expect(entry.responseFrame).toContain('"2.0",\n\n');
     expect(entry.responseFrameAbsence).toBeNull();
+
+    const frame = entry.responseFrame as string;
+    expect(bytes(frame)).toBe(bytes(PRETTY_JSON_BODY));
+    expect(frame).toBe(PRETTY_JSON_BODY);
+    // Named individually so a failure says which end was eaten.
+    expect(frame.endsWith("}\n")).toBe(true);
+    expect(frame).toContain('"2.0",\n\n');
+  });
+
+  test("leading whitespace on a JSON body survives too", async () => {
+    // The other end of the same rule. `JSON.parse` ignores whitespace around a
+    // document, so nothing downstream needs it gone — and "whole" has to mean
+    // whole at both ends or it means whatever the implementation felt like.
+    const padded = `\n  ${PRETTY_JSON_BODY}`;
+    const { log } = await send(streaming([padded], "application/json"));
+
+    const frame = log.entries[0]!.responseFrame as string;
+    expect(bytes(frame)).toBe(bytes(padded));
+    expect(frame).toBe(padded);
   });
 
   test("the same bytes under text/event-stream are framed as SSE, not taken whole", async () => {
@@ -595,7 +619,50 @@ describe("capture happens inside the pass-through and always terminates", () => 
       expect(entry.responseFraming, contentType).toBe(
         contentType.endsWith("+json") ? "whole" : "unknown",
       );
-      expect(entry.responseFrame, contentType).toBe(PRETTY_JSON_BODY.trim());
+      // Bytes, and untrimmed: a body read under a rule nobody wrote for it is
+      // the last place to start quietly editing what was stored.
+      const frame = entry.responseFrame as string;
+      expect(bytes(frame), contentType).toBe(bytes(PRETTY_JSON_BODY));
+      expect(frame, contentType).toBe(PRETTY_JSON_BODY);
+    }
+  });
+
+  test("SSE strips only the framing, and keeps every byte of the payload", async () => {
+    // The same assumption, checked on the other side of the fence. For
+    // `text/event-stream` the `data:` prefix, the **one** optional space the
+    // spec allows after the colon, and the terminating blank line are framing
+    // and are genuinely not payload. Everything else is, including a second
+    // space, trailing spaces, and the newline that joins multi-line data.
+    //
+    // Each case names the exact payload rather than deriving it, so a change
+    // that trimmed either end fails here with a byte count.
+    const message = '{"jsonrpc":"2.0","id":7,"result":{"ok":true}}';
+    const cases: { name: string; wire: string; payload: string }[] = [
+      { name: "one space after the colon", wire: `data: ${message}\n\n`, payload: message },
+      { name: "no space after the colon", wire: `data:${message}\n\n`, payload: message },
+      {
+        // Only the first space is framing; the second and the trailing two are
+        // the data field's own value.
+        name: "extra spaces are payload",
+        wire: `data:  ${message}  \n\n`,
+        payload: ` ${message}  `,
+      },
+      {
+        name: "multi-line data joins with a newline",
+        wire: 'data: {"jsonrpc":"2.0","id":7,\ndata: "result":{"ok":true}}\n\n',
+        payload: '{"jsonrpc":"2.0","id":7,\n"result":{"ok":true}}',
+      },
+      { name: "CRLF terminator", wire: `data: ${message}\r\n\r\n`, payload: message },
+    ];
+
+    for (const { name, wire, payload } of cases) {
+      const { log } = await send(streaming([wire], "text/event-stream"));
+      const frame = log.entries[0]!.responseFrame as string;
+      expect(bytes(frame), name).toBe(bytes(payload));
+      expect(frame, name).toBe(payload);
+      // The framing really is gone, rather than the payload happening to match.
+      expect(frame.includes("data:"), name).toBe(false);
+      expect(/[\r\n]\s*$/.test(frame), name).toBe(false);
     }
   });
 

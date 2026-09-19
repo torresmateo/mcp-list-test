@@ -427,21 +427,28 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
      * between the wire and somebody's idea of it.
      */
     const consume = (text: string): void => {
-      const trimmed = text.trim();
-      if (trimmed === "") return;
+      // Trimmed only to ask "is there anything here at all". Nothing trimmed is
+      // ever stored: `text` has already had its framing removed by the caller,
+      // so whatever whitespace is left belongs to the payload. A body of
+      // `{...}\n` is 61 bytes on the wire and has to be 61 bytes on the record
+      // — storing 60 of them is a re-serialisation by a shorter name.
+      if (text.trim() === "") return;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(trimmed);
+        // `JSON.parse` ignores whitespace around a document, so the raw text
+        // parses exactly as a trimmed copy would and there is no reason to
+        // make one.
+        parsed = JSON.parse(text);
       } catch {
         unreadable = true;
         return;
       }
       const messages = Array.isArray(parsed) ? parsed : [parsed];
       // Source slices, so a batched reply gives each row its own message text
-      // rather than the batch it arrived in. `trimmed` rather than `text`:
-      // whitespace *around* the message is the framing's, not the message's —
-      // everything inside it, duplicate keys and spacing included, is kept.
-      const sources = (Array.isArray(parsed) ? splitTopLevelJsonArray(trimmed) : null) ?? [trimmed];
+      // rather than the batch it arrived in. An element's slice starts at the
+      // element — the brackets and commas around it are the *batch's* framing,
+      // not the message's — while a single message is the body as it stands.
+      const sources = (Array.isArray(parsed) ? splitTopLevelJsonArray(text) : null) ?? [text];
       for (const [position, message] of messages.entries()) {
         const version = protocolVersionIn(message);
         if (version !== undefined) negotiated = version;
@@ -461,7 +468,7 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         // first reply carrying an id wins, because a JSON-RPC id is answered
         // once.
         if (entry.responseFrame === null) {
-          entry.responseFrame = redactJsonText(sources[position] ?? trimmed);
+          entry.responseFrame = redactJsonText(sources[position] ?? text);
           entry.responseFrameAbsence = null;
         }
         if (!replied) {

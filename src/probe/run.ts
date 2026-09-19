@@ -100,14 +100,30 @@ export interface RunRepetitionOptions {
   repetition: number;
   /** Epoch ms shared by every repetition of one invocation, per DESIGN.md's id shape. */
   timestamp: number;
+  /** Already resolved and validated by `loadUserIdPrefix`; `probe` by default. */
+  userIdPrefix: string;
   apiKey: string;
   hookPublicUrl: string;
   hits: HitsClient;
 }
 
-/** DESIGN.md Contracts -> Probe CLI step 1. */
-export function userIdFor(revision: string, timestamp: number, repetition: number): string {
-  return `probe-${revision}-${timestamp}-${repetition}`;
+/**
+ * DESIGN.md Contracts -> Probe CLI step 1: `<prefix>-<revision>-<timestamp>-<n>`.
+ *
+ * Only `<prefix>` is the operator's — `$ARCADE_USER_ID_PREFIX`, resolved and
+ * validated by `loadUserIdPrefix`, defaulting to `probe`. **The trailing `-<n>`
+ * is not configurable.** It is what makes five repetitions five distinct end
+ * users; collapse them onto one id and a cached session or a reused
+ * authorization can serve four of them without touching the access path, and
+ * the run would report a healthy-looking count of something it never measured.
+ */
+export function userIdFor(
+  prefix: string,
+  revision: string,
+  timestamp: number,
+  repetition: number,
+): string {
+  return `${prefix}-${revision}-${timestamp}-${repetition}`;
 }
 
 /**
@@ -147,7 +163,12 @@ function message(error: unknown): string {
 /** Runs one repetition. Never throws for a gateway failure — it reports one. */
 export async function runRepetition(options: RunRepetitionOptions): Promise<Run> {
   const startedAt = new Date();
-  const userId = userIdFor(options.revision, options.timestamp, options.repetition);
+  const userId = userIdFor(
+    options.userIdPrefix,
+    options.revision,
+    options.timestamp,
+    options.repetition,
+  );
 
   let hookHits: HookHit[] = [];
   const log = createRequestLog({

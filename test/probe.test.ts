@@ -128,6 +128,10 @@ async function runProbe(
       ARCADE_MCP_URL: options.gatewayUrl ?? "http://127.0.0.1:1/mcp",
       HOOK_BEARER_TOKEN: HOOK_TOKEN,
       HOOK_PUBLIC_URL: "https://probe-test-tunnel.example",
+      // Explicitly blank so the default-prefix assertions cannot be satisfied
+      // by an `ARCADE_USER_ID_PREFIX` sitting in somebody's `.env.local` — the
+      // child *does* load it, and an explicit empty value is what beats it.
+      ARCADE_USER_ID_PREFIX: "",
       ...options.env,
     },
     stdout: "pipe",
@@ -343,6 +347,125 @@ describe("attribution", () => {
     // question 7). `Arcade-User-ID` also worked against the live gateway; this
     // pins the Dashboard's spelling, not a fix.
     expect(ARCADE_USER_ID_HEADER).toBe("Arcade-User-Id");
+  }, SPAWN_TIMEOUT_MS);
+
+  test("five repetitions under one configured prefix are five distinct end users", async () => {
+    /**
+     * The `-<n>` suffix is not a formatting detail and is not configurable
+     * (DESIGN.md Contracts -> Probe CLI step 1). It is what makes each
+     * repetition a distinct end user. Collapse five repetitions onto one id and
+     * a cached session or a reused authorization can serve four of them without
+     * the gateway touching the access path at all — and the report would show a
+     * perfectly healthy count of something that was never measured.
+     *
+     * So the assertion is not "the strings differ". It is that the hook counter
+     * holds five separate keys, each with its own hit, which is the only
+     * evidence that five separate end users reached the gateway.
+     */
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerList: 1 });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      env: { ARCADE_USER_ID_PREFIX: "five-users" },
+      args: ["--repetitions", "5"],
+    });
+
+    expect(result.exitCode).toBe(0);
+    const ids = result.runs.map(run => run.userId as string);
+    expect(ids).toHaveLength(5);
+    expect(new Set(ids).size).toBe(5);
+    for (const [index, id] of ids.entries()) {
+      expect(id).toMatch(/^five-users-2025-11-25-\d+-\d+$/);
+      expect(id.endsWith(`-${index + 1}`)).toBe(true);
+    }
+    // One shared prefix and one shared timestamp: `-<n>` is the only thing that
+    // differs, so it is the only thing keeping them apart.
+    expect(new Set(ids.map(id => id.slice(0, id.lastIndexOf("-")))).size).toBe(1);
+
+    // The gateway called the hook once per repetition, under five different
+    // ids, and the counter filed them under five different keys.
+    expect(fake.hookCalls.map(call => call.userId)).toEqual(ids);
+    for (const id of ids) {
+      const stored = (await (await fetch(`${hook.url}/hits?user_id=${encodeURIComponent(id)}`)).json()) as Loose;
+      expect(stored.count).toBe(1);
+      expect(stored.hits.map((hit: Loose) => hit.payload.user_id)).toEqual([id]);
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  test("a configured prefix replaces `probe` all the way to the stored hit", async () => {
+    // Not just in the run JSON the probe wrote about itself: the id has to
+    // survive the Arcade user header and the `GET /hits?user_id=` query, which
+    // is the round trip that a mangled prefix would break invisibly.
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerList: 1 });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      env: { ARCADE_USER_ID_PREFIX: "mateo.lab-01" },
+      args: ["--repetitions", "2"],
+    });
+
+    expect(result.exitCode).toBe(0);
+    for (const run of result.runs) {
+      expect(run.userId).toMatch(/^mateo\.lab-01-2025-11-25-\d+-\d+$/);
+      expect(run.userId).not.toContain("probe-");
+      for (const request of run.requests as Loose[]) expect(request.userIdHeader).toBe(run.userId);
+      expect(run.hookHits.map((hit: Loose) => hit.payload.user_id)).toEqual([run.userId]);
+    }
+  }, SPAWN_TIMEOUT_MS);
+
+  test("an unset prefix changes nothing: the ids still read `probe-...`", async () => {
+    // Criterion 6. `ARCADE_USER_ID_PREFIX` is optional, and absent it must not
+    // be observable anywhere — not an exit, not a warning, not a different id.
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerList: 1 });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      args: ["--repetitions", "1"],
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("ARCADE_USER_ID_PREFIX");
+    expect(result.runs[0]!.userId).toMatch(/^probe-2025-11-25-\d+-1$/);
+    expect(fake.hookCalls.map(call => call.userId)).toEqual([result.runs[0]!.userId]);
+  }, SPAWN_TIMEOUT_MS);
+
+  test("a prefix that would not survive the header and the query exits non-zero", async () => {
+    /**
+     * The trap this guard exists for. The prefix reaches an HTTP header *and* a
+     * `GET /hits?user_id=` query, and a value the two encode differently has
+     * the hook called under one id and polled under another. What the operator
+     * sees then is `hookHits: []` — a clean zero indistinguishable from "the
+     * hook never fired", which is the measurement this repo exists to make.
+     *
+     * So it exits before a byte goes out, naming the variable, and it does not
+     * quietly fall back to `probe`: a run that measured `probe-...` while the
+     * operator believed it measured their prefix is the same silent-wrong
+     * result wearing a different hat.
+     */
+    const hook = hookServer();
+    const fake = gateway(hook, { hookCallsPerList: 1 });
+
+    const result = await runProbe({
+      gatewayUrl: fake.url,
+      hookUrl: hook.url,
+      env: { ARCADE_USER_ID_PREFIX: "my probe" },
+      args: ["--repetitions", "1"],
+    });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("ARCADE_USER_ID_PREFIX");
+    // Nothing happened: no session, no hook call, no run file that a later
+    // reader could mistake for a measurement.
+    expect(result.files).toEqual([]);
+    expect(fake.hookCalls).toEqual([]);
+    // And it did not fall back.
+    expect(result.stdout).not.toContain("probe-2025-11-25");
   }, SPAWN_TIMEOUT_MS);
 
   test("the run file carries every field the counter records per hit", async () => {

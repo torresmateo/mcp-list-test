@@ -18,6 +18,11 @@
  * is what "byte-identical across all five runs" means. Why the gateway sends it
  * that way is a question for the engine team, not for the renderer.
  *
+ * One caveat, stated so nobody reads more into the measurement than is there:
+ * this payload's structure inflates slightly less under pretty-printing and
+ * HTML escaping than the operator's did (2.77x against 3.17x), so the saving it
+ * measures is a little **conservative** — the real file gains more, not less.
+ *
  * This is a builder rather than committed JSON because the files are ~1.7 MB
  * each: committing five of them would put 8 MB of generated data in a repo
  * whose whole point is a handful of run files. A test that needs the data
@@ -44,7 +49,16 @@ export const CATALOGUE_TOOLS = 8_258;
  */
 const CATALOGUE_USER_ID = "probe-2025-11-25-catalogue";
 
-type ToolVersions = { version: string; metadata: { scopes: string[]; description: string } }[];
+type ToolVersions = {
+  version: string;
+  metadata: {
+    scopes: string[];
+    category: string;
+    deprecated: boolean;
+    requiresAuth: boolean;
+    description: string;
+  };
+}[];
 type Toolkits = Record<string, { tools: Record<string, ToolVersions> }>;
 
 interface Payload {
@@ -60,7 +74,13 @@ function toolkits(toolkitCount: number, toolCount: number): Toolkits {
     built[toolkit]!.tools[`Tool_${String(index).padStart(4, "0")}`] = [
       {
         version: "1.0.0",
-        metadata: { scopes: ["read", "write"], description: "" },
+        metadata: {
+          scopes: ["read", "write"],
+          category: "operations",
+          deprecated: false,
+          requiresAuth: true,
+          description: "",
+        },
       },
     ];
   }
@@ -79,7 +99,7 @@ function toolkits(toolkitCount: number, toolCount: number): Toolkits {
  * very saving it exists to measure.
  *
  * Every character used is ASCII, so one added character is one added byte, and
- * the measured size is hit exactly: issue #25's criterion 7 is a claim about
+ * the measured size is hit exactly: issue #25's criterion 9 is a claim about
  * how much a report shrinks, and an approximate fixture would make it an
  * approximate claim.
  */

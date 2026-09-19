@@ -32,6 +32,28 @@ export interface RunRequest {
    * it, and `undefined` here means *absent*, never zero.
    */
   durationMs?: number;
+  /**
+   * What the probe already records about a request beyond the four fields
+   * DESIGN.md's Run JSON example spells out. `src/probe/run.ts` writes every
+   * one of these; the renderer simply did not read them until issue #25 asked
+   * for a row a reader can expand. Optional for the usual reason — a run file
+   * written before the probe recorded a field carries nothing for it, and
+   * `undefined` is *absent*, not a value.
+   *
+   * There is no MCP request or response **body** here, and that is not an
+   * oversight to paper over: `src/client/request-log.ts` deliberately pipes the
+   * response through instead of cloning it, so nothing ever captured one. The
+   * row says `body not recorded` rather than rendering `{}` as though it were
+   * the payload.
+   */
+  jsonRpcId?: number;
+  finishedAt?: string;
+  status?: number;
+  userIdHeader?: string;
+  authorizationScheme?: string;
+  responseObserved?: boolean;
+  /** Written only when this `tools/list` request followed a `nextCursor`. */
+  cursor?: string;
 }
 
 /**
@@ -189,6 +211,18 @@ function optionalNullableNumber(
   return value;
 }
 
+/** As {@link optionalNumber}, for a string field the run file may not carry. */
+function optionalString(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") fail(file, `${key} must be a string`);
+  return value;
+}
+
 function optionalBoolean(
   file: string,
   holder: Record<string, unknown>,
@@ -264,7 +298,16 @@ export function parseRun(file: string, text: string): Run {
       method: requireString(file, entry, "method"),
       sentAt: requireString(file, entry, "sentAt"),
       hookHitsAfter: requireNumber(file, entry, "hookHitsAfter"),
-      ...defined({ durationMs: optionalNumber(file, entry, "durationMs") }),
+      ...defined({
+        durationMs: optionalNumber(file, entry, "durationMs"),
+        jsonRpcId: optionalNumber(file, entry, "jsonRpcId"),
+        finishedAt: optionalString(file, entry, "finishedAt"),
+        status: optionalNumber(file, entry, "status"),
+        userIdHeader: optionalString(file, entry, "userIdHeader"),
+        authorizationScheme: optionalString(file, entry, "authorizationScheme"),
+        responseObserved: optionalBoolean(file, entry, "responseObserved"),
+        cursor: optionalString(file, entry, "cursor"),
+      }),
     };
   });
 
@@ -458,6 +501,85 @@ export function methodSplit(run: Run): MethodSplitEntry[] {
   const entries = order.map((method) => ({ method, hits: counts.get(method)! }));
   if (unattributed > 0) entries.push({ method: NOT_ATTRIBUTED, hits: unattributed });
   return entries;
+}
+
+/**
+ * One thing that crossed a wire during a run: an MCP request the client sent,
+ * or a hook hit the counter received.
+ *
+ * Two sides, one sequence. The run JSON keeps them in separate arrays and the
+ * report used to render them as two separate tables, which left the reader to
+ * correlate timestamps by eye to answer the only question that matters — which
+ * request caused which hit.
+ */
+export type WireEvent =
+  | {
+      side: "client";
+      at: string;
+      /** Index into `run.requests`. */
+      index: number;
+      request: RunRequest;
+    }
+  | {
+      side: "hook";
+      at: string;
+      /** Index into `run.hookHits`. */
+      index: number;
+      hit: HookHit;
+      /** The method attributed to this hit, or `null` for {@link NOT_ATTRIBUTED}. */
+      causedBy: string | null;
+    };
+
+/**
+ * Everything that crossed a wire in one run, in chronological order.
+ *
+ * Requests are placed at `sentAt` and hits at `receivedAt`. On an exact tie the
+ * request comes first, because a hit is a consequence of a request and the sort
+ * is stable over an array built requests-first — putting the effect above the
+ * cause would misread the storyline the table exists to tell.
+ *
+ * An unparseable timestamp sorts as `0` rather than `NaN`, which would make the
+ * comparison non-transitive and the order arbitrary.
+ */
+export function wireEvents(run: Run): WireEvent[] {
+  const attributed = attributeHits(run);
+  const events: WireEvent[] = [
+    ...run.requests.map((request, index): WireEvent => ({
+      side: "client",
+      at: request.sentAt,
+      index,
+      request,
+    })),
+    ...run.hookHits.map((hit, index): WireEvent => ({
+      side: "hook",
+      at: hit.receivedAt,
+      index,
+      hit,
+      causedBy: attributed[index] ?? null,
+    })),
+  ];
+  const time = (value: string): number => {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  };
+  return events.sort((a, b) => time(a.at) - time(b.at));
+}
+
+/**
+ * Milliseconds from the run's first wire event to `at`.
+ *
+ * The first event is the origin rather than a `startedAt` field: the run JSON's
+ * `startedAt` is not part of the schema DESIGN.md records, and an offset a
+ * reader can re-derive from the timestamps already in the table beats one that
+ * depends on a field half the run files do not carry. `null` when either end
+ * cannot be parsed — an absence, never a `0` that looks like simultaneity.
+ */
+export function offsetMs(origin: string | undefined, at: string): number | null {
+  if (origin === undefined) return null;
+  const from = Date.parse(origin);
+  const to = Date.parse(at);
+  if (Number.isNaN(from) || Number.isNaN(to)) return null;
+  return to - from;
 }
 
 /**
@@ -731,6 +853,26 @@ export function payloadLabel(file: string, hitIndex: number): string {
   return `hit ${hitIndex + 1} of ${file}`;
 }
 
+/**
+ * Above this many bytes of compact JSON, the embedded copy is stored compact
+ * instead of pretty-printed.
+ *
+ * Not a size cap — **nothing is ever truncated**; compact means whitespace
+ * removed and nothing else. The threshold exists because the two readers of the
+ * stored copy want different things. Below it, the stored text is what a person
+ * actually reads in the no-script fallback, and indenting it costs a few
+ * kilobytes. Above it, nobody reads a 1.6 MB payload as a wall of text — the
+ * explorer formats it on expand — so the indentation is pure weight: on the
+ * live evidence, pretty-printing and escaping turned a 1,598,220 B payload into
+ * 5,061,881 characters, three quarters of a megabyte of which is indentation
+ * for a form no reader uses.
+ *
+ * 64 KiB because every payload in the repository's fixtures, and any payload a
+ * person would sit and read, is far below it, while the catalogue payload that
+ * made the live report 26 MB is twenty-four times above it.
+ */
+export const PRETTY_PAYLOAD_MAX_BYTES = 65_536;
+
 /** Where one hook payload is rendered, and whether it is a repeat of another. */
 export interface PayloadPlacement {
   /** This occurrence's own anchor id, so a repeat can be linked to as well. */
@@ -738,9 +880,15 @@ export interface PayloadPlacement {
   /** sha-256 over the payload bytes — the same string `bodyBytes` counts. */
   digest: string;
   /**
+   * The id of the `<pre>` that holds this payload's one embedded copy. Equal to
+   * {@link anchor} on the first occurrence and to the first occurrence's anchor
+   * on a repeat, so a repeat's explorer reads the same embedded data instead of
+   * a second copy of it.
+   */
+  storedAt: string;
+  /**
    * Set only when this payload is **byte-identical** to an earlier one, which
-   * is where the body is rendered. `undefined` means this occurrence carries
-   * the full body.
+   * is where the body is stored. `undefined` means this occurrence carries it.
    */
   sameAs?: { anchor: string; label: string };
 }
@@ -795,13 +943,14 @@ export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
       if (earlier === undefined) {
         const digest = createHash("sha256").update(body).digest("hex");
         seen.set(body, { anchor, label: payloadLabel(file, index), digest });
-        return { anchor, digest };
+        return { anchor, digest, storedAt: anchor };
       }
       repeats += 1;
-      charsSaved += escapeHtml(prettyPayload(hit.payload)).length;
+      charsSaved += escapeHtml(storedPayload(hit.payload)).length;
       return {
         anchor,
         digest: earlier.digest,
+        storedAt: earlier.anchor,
         sameAs: { anchor: earlier.anchor, label: earlier.label },
       };
     });
@@ -822,9 +971,19 @@ function payloadText(payload: unknown): string {
   return JSON.stringify(payload) ?? "null";
 }
 
-/** The payload as the report prints it. */
-function prettyPayload(payload: unknown): string {
-  return JSON.stringify(payload, null, 2) ?? "null";
+/**
+ * The payload as the document embeds it: pretty-printed while it is small
+ * enough for a person to read as text, compact once it is not.
+ *
+ * Complete either way — see {@link PRETTY_PAYLOAD_MAX_BYTES}. The explorer
+ * parses this same text, so there is exactly one copy of a payload in the
+ * document no matter which form it took.
+ */
+export function storedPayload(payload: unknown): string {
+  const compact = payloadText(payload);
+  return Buffer.byteLength(compact, "utf8") > PRETTY_PAYLOAD_MAX_BYTES
+    ? compact
+    : (JSON.stringify(payload, null, 2) ?? "null");
 }
 
 // ---------------------------------------------------------------------------
@@ -927,16 +1086,32 @@ section.run { border-top: 1px solid #e2e4ec; padding-top: .5rem; margin-top: 2re
 .callout-warn { border-color: #e6c072; background: #fdf6e6; }
 .callout-ok { border-color: #a8dcb8; background: #f1faf3; }
 .callout-unknown { border-color: #c9ccd8; background: #f4f5f8; }
-table.hits td.headers { font-size: .72rem; line-height: 1.35; max-width: 26rem; }
-table.hits .hdr { word-break: break-all; }
-details.payload { border: 1px solid #e2e4ec; border-radius: 4px; background: #fbfbfd; margin: 0 0 .5rem; }
-details.payload > summary {
-  cursor: pointer; padding: .4rem .6rem; font-size: .76rem; word-break: break-all;
+table.wire tr.event.hook > td:first-child { border-left: 3px solid #7f8cc4; }
+table.wire tr.event.client > td:first-child { border-left: 3px solid #16181d; }
+table.wire tr.detail > td { background: #fafbfd; padding: .35rem .55rem; }
+details.event > summary {
+  cursor: pointer; font-size: .76rem; word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #2b2f3a;
 }
-details.payload > pre { margin: 0; border: 0; border-top: 1px solid #e2e4ec; border-radius: 0 0 4px 4px; }
-details.payload.repeat > summary { color: #5a5f70; }
-p.repeat-note { margin: 0; padding: .5rem .6rem; border-top: 1px solid #e2e4ec; font-size: .8rem; }
+details.event > summary::marker { color: #7f8cc4; }
+details.event dl.meta { margin: .5rem 0 .5rem 1.1rem; font-size: .8rem; }
+details.event h5 { margin: .8rem 0 .3rem 1.1rem; font-size: .78rem; color: #44485a; }
+details.raw { margin: .4rem 0 .4rem 1.1rem; }
+details.raw > summary { cursor: pointer; font-size: .75rem; color: #5a5f70; }
+details.raw > pre { margin: .3rem 0 0; }
+.headers { margin-left: 1.1rem; font-size: .72rem; line-height: 1.4; }
+.hdr { word-break: break-all; }
+p.repeat-note { margin: .4rem 0 .4rem 1.1rem; font-size: .8rem; word-break: break-all; }
+.json { margin: .4rem 0 .4rem 1.1rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .76rem; }
+.json details { margin-left: .9rem; }
+.json > details { margin-left: 0; }
+.json summary { cursor: pointer; }
+.json .k { color: #7a4fbf; }
+.json .s { color: #14622f; }
+.json .n { color: #1f4fd8; }
+.json .b, .json .z { color: #8a1c1c; }
+.json .c { color: #8b90a0; }
+.json .leaf { margin-left: .9rem; }
 nav ol { margin: .25rem 0 0; padding-left: 1.4rem; font-size: .85rem; }
 nav a { color: #1f4fd8; }
 footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
@@ -946,6 +1121,122 @@ footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
   pre { white-space: pre-wrap; word-break: break-word; }
   nav { display: none; }
 }
+`.trim();
+
+/**
+ * The JSON explorer (issue #25 criterion 6).
+ *
+ * Inline, and inline only: the engine team opens this file from a directory
+ * with no network, so an external script or a CDN stylesheet would make the
+ * evidence unreadable exactly where it is read. The self-containment test
+ * forbids `script src=`, `link href=`, `@import` and off-file `url(`; an inline
+ * `<script>` is the one mechanism left, and it is the right one here because a
+ * nested-`<details>` tree for an 8,258-tool payload would be megabytes of HTML
+ * on its own.
+ *
+ * Three rules it lives by:
+ *
+ * - **It reads the payload that is already on the page.** Each payload is
+ *   embedded once, as the text of a `<pre>`; this script parses that text. It
+ *   never carries a second copy, and a byte-identical repeat points at the same
+ *   `<pre>` rather than embedding its own.
+ * - **It is lazy twice over.** A payload is parsed the first time a row is
+ *   opened, and each object or array builds its children the first time *it* is
+ *   opened. Opening one row of a 26 MB report must not build a tree for the
+ *   whole document.
+ * - **It is an enhancement, never a dependency.** With scripting off, every
+ *   payload is still there, whole, inside `<details><summary>raw JSON</summary>`
+ *   — this script adds a tree beside it and removes nothing.
+ */
+const EXPLORER = `
+(function () {
+  var cache = {};
+  function payloadOf(id) {
+    if (!(id in cache)) {
+      var host = document.getElementById(id);
+      try {
+        cache[id] = host === null ? undefined : JSON.parse(host.textContent);
+      } catch (error) {
+        cache[id] = undefined;
+      }
+    }
+    return cache[id];
+  }
+  function span(className, text) {
+    var element = document.createElement("span");
+    element.className = className;
+    element.textContent = text;
+    return element;
+  }
+  function count(n, noun) {
+    return n + " " + noun + (n === 1 ? "" : "s");
+  }
+  function scalarText(value) {
+    if (value === null) return "null";
+    if (typeof value === "string") return JSON.stringify(value);
+    return String(value);
+  }
+  function scalarClass(value) {
+    if (value === null) return "z";
+    if (typeof value === "string") return "s";
+    if (typeof value === "number") return "n";
+    return "b";
+  }
+  function keyText(key) {
+    return key === null ? "" : key + ": ";
+  }
+  function node(key, value) {
+    var isArray = Array.isArray(value);
+    if (value === null || typeof value !== "object") {
+      var leaf = document.createElement("div");
+      leaf.className = "leaf";
+      if (key !== null) leaf.appendChild(span("k", keyText(key)));
+      leaf.appendChild(span(scalarClass(value), scalarText(value)));
+      return leaf;
+    }
+    var keys = isArray ? null : Object.keys(value);
+    var size = isArray ? value.length : keys.length;
+    var branch = document.createElement("details");
+    var head = document.createElement("summary");
+    if (key !== null) head.appendChild(span("k", keyText(key)));
+    head.appendChild(
+      span("c", isArray ? "[" + count(size, "item") + "]" : "{" + count(size, "key") + "}")
+    );
+    branch.appendChild(head);
+    var built = false;
+    branch.addEventListener("toggle", function () {
+      if (built || branch.open !== true) return;
+      built = true;
+      for (var i = 0; i < size; i += 1) {
+        var childKey = isArray ? String(i) : keys[i];
+        branch.appendChild(node(childKey, isArray ? value[i] : value[childKey]));
+      }
+    });
+    return branch;
+  }
+  function render(mount) {
+    if (mount.getAttribute("data-rendered") === "yes") return;
+    mount.setAttribute("data-rendered", "yes");
+    var value = payloadOf(mount.getAttribute("data-payload"));
+    if (value === undefined) {
+      mount.appendChild(span("c", "payload could not be parsed - the raw JSON below is the evidence"));
+      return;
+    }
+    var tree = node(null, value);
+    if (tree.tagName === "DETAILS") tree.open = true;
+    mount.appendChild(tree);
+  }
+  var rows = document.querySelectorAll("details.event");
+  for (var i = 0; i < rows.length; i += 1) {
+    (function (row) {
+      row.addEventListener("toggle", function () {
+        if (row.open !== true) return;
+        var mounts = row.querySelectorAll(".json");
+        for (var j = 0; j < mounts.length; j += 1) render(mounts[j]);
+      });
+    })(rows[i]);
+  }
+})();
 `.trim();
 
 function statusBadge(status: RunStatus): string {
@@ -1153,28 +1444,29 @@ function runToolsListNotice(run: Run): string {
  * top: the secret never reached disk, and a second pass of eliding would
  * destroy the descriptor's one diagnostic — the same digest on every hit means
  * the same value arrived every time. Repeated descriptors are printed in full,
- * hit after hit, for exactly that reason.
+ * hit after hit, for exactly that reason — including when this hit's payload
+ * collapsed into an earlier one. Deduplication is a statement about payload
+ * bodies and about nothing else.
  */
-function headersCell(headers: Record<string, string> | undefined): string {
-  if (headers === undefined) return `<td class="text empty">not recorded</td>`;
+function headersList(headers: Record<string, string> | undefined): string {
+  if (headers === undefined) return `<p class="empty">Headers not recorded for this hit.</p>`;
   const names = Object.keys(headers);
-  if (names.length === 0) return `<td class="text empty">none</td>`;
-  const lines = names
-    .map(
-      (name) =>
-        `<div class="hdr"><code>${escapeHtml(name)}</code>: ` +
-        `<code>${escapeHtml(headers[name]!)}</code></div>`,
-    )
-    .join("");
-  return `<td class="text headers">${lines}</td>`;
-}
-
-function hitNumberCell(value: number | undefined, format: (n: number) => string = String): string {
-  return value === undefined ? unmeasured() : num(format(value));
+  if (names.length === 0) return `<p class="empty">This hit arrived with no headers.</p>`;
+  return (
+    `<div class="headers">` +
+    names
+      .map(
+        (name) =>
+          `<div class="hdr"><code>${escapeHtml(name)}</code>: ` +
+          `<code>${escapeHtml(headers[name]!)}</code></div>`,
+      )
+      .join("") +
+    `</div>`
+  );
 }
 
 /**
- * The method that caused this hit (issue #25 criterion 1).
+ * The method that caused this hit (issue #25 criterion 4).
  *
  * `not attributed` is styled as an absence, not printed as a method, because it
  * is the one answer the reader must not read as "some request did this".
@@ -1185,7 +1477,7 @@ function causedByCell(method: string | null): string {
     : `<td class="text">${escapeHtml(method)}</td>`;
 }
 
-/** `initialize 1 · tools/list 3`, for one run (issue #25 criterion 3). */
+/** `initialize 1 · tools/list 3`, for one run. */
 export function formatMethodSplit(run: Run): string {
   const entries = methodSplit(run);
   if (entries.length === 0) return "no requests and no hook hits";
@@ -1193,25 +1485,17 @@ export function formatMethodSplit(run: Run): string {
 }
 
 /**
- * The one-line summary a reader decides on before expanding a payload
- * (issue #25 criterion 4): which hit, which method caused it, when it arrived,
- * how big it was, how much it carried, and its digest.
+ * The line a reader decides on before expanding a hook hit's payload: how big
+ * it was, how much it carried, and its digest.
  *
  * Counts the run file does not carry read `not recorded` here for the same
  * reason they do in every other cell: `0 tools` would be a measurement.
  */
-function payloadSummaryLine(
-  hit: HookHit,
-  index: number,
-  method: string | null,
-  placement: PayloadPlacement,
-): string {
+function payloadSummaryLine(hit: HookHit, placement: PayloadPlacement): string {
   const plural = (count: number, noun: string): string =>
     `${count} ${noun}${count === 1 ? "" : "s"}`;
   const parts = [
-    `hit ${index + 1}`,
-    method ?? NOT_ATTRIBUTED,
-    hit.receivedAt,
+    "payload",
     hit.bodyBytes === undefined ? "size not recorded" : `${hit.bodyBytes} B`,
     hit.toolkitCount === undefined
       ? "toolkits not recorded"
@@ -1224,37 +1508,206 @@ function payloadSummaryLine(
 }
 
 /**
- * One raw payload, collapsed (issue #25 criteria 4 and 5).
+ * One hook hit's payload: the explorer's mount point, and the one embedded copy
+ * of the payload that both the explorer and a scriptless reader use.
  *
- * `<details>`/`<summary>` and nothing else: the engine team opens this file
- * from a directory with no network, so expanding must cost no script and no
- * request. A repeat renders the statement instead of the body — and names and
- * links the hit that carries it, so "identical" is checkable rather than
- * asserted at the reader.
+ * The `<pre>` is not a second copy of the data — it *is* the data. The script
+ * reads its `textContent`, parses it, renders the tree next to it and hides it;
+ * with no script it stays exactly where it is, complete, which is what keeps
+ * the evidence from depending on scripting.
+ *
+ * A byte-identical repeat embeds nothing and points its explorer at the copy
+ * the first occurrence embedded, so the reader still expands a full tree
+ * without the document carrying the payload twice.
  */
-function payloadBlock(
-  hit: HookHit,
-  index: number,
-  method: string | null,
-  placement: PayloadPlacement,
-): string {
-  const summary = `<summary>${payloadSummaryLine(hit, index, method, placement)}</summary>`;
-  if (placement.sameAs === undefined) {
+function payloadDetail(hit: HookHit, placement: PayloadPlacement): string {
+  const mount = `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"></div>`;
+
+  if (placement.sameAs !== undefined) {
     return [
-      `<details class="payload" id="${escapeHtml(placement.anchor)}">`,
-      summary,
-      `<pre>${escapeHtml(prettyPayload(hit.payload))}</pre>`,
-      `</details>`,
+      mount,
+      `<p class="repeat-note">Byte-identical to ` +
+        `<a href="#${escapeHtml(placement.sameAs.anchor)}">` +
+        `${escapeHtml(placement.sameAs.label)}</a>, which carries the one embedded copy. ` +
+        `Compared byte for byte, not by size or by tool count; sha-256 of the payload is ` +
+        `<code>${escapeHtml(placement.digest)}</code>.</p>`,
     ].join("\n");
   }
   return [
-    `<details class="payload repeat" id="${escapeHtml(placement.anchor)}">`,
-    summary,
-    `<p class="repeat-note">Byte-identical to ` +
-      `<a href="#${escapeHtml(placement.sameAs.anchor)}">${escapeHtml(placement.sameAs.label)}</a>` +
-      `, which carries the body. Compared byte for byte, not by size or by tool count; ` +
-      `sha-256 of the payload is <code>${escapeHtml(placement.digest)}</code>.</p>`,
+    mount,
+    `<details class="raw"><summary>raw JSON</summary>`,
+    `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(storedPayload(hit.payload))}</pre>`,
     `</details>`,
+  ].join("\n");
+}
+
+/** One `<dt>`/`<dd>` pair, with `not recorded` for anything the run file lacks. */
+function detailRow(term: string, value: string | undefined): string {
+  return `<dt>${escapeHtml(term)}</dt><dd>${
+    value === undefined ? metaUnmeasured() : escapeHtml(value)
+  }</dd>`;
+}
+
+/**
+ * What the run JSON holds about one MCP request (issue #25 criterion 5).
+ *
+ * There is no body, and the row says so in those words. `src/client/request-log.ts`
+ * pipes the response through instead of cloning it, so no MCP request or
+ * response body was ever captured — rendering `{}` here would put an empty
+ * object where a reader expects the payload, which is the plausible-but-wrong
+ * rendering this report exists to avoid. A later slice adds capture; the row is
+ * shaped so a body slots in beside this list when it does.
+ */
+function requestDetail(request: RunRequest): string {
+  return [
+    `<dl class="meta">`,
+    detailRow("method", request.method),
+    detailRow("JSON-RPC id", request.jsonRpcId === undefined ? undefined : String(request.jsonRpcId)),
+    detailRow("sent at", request.sentAt),
+    detailRow("finished at", request.finishedAt),
+    detailRow("HTTP status", request.status === undefined ? undefined : String(request.status)),
+    detailRow(
+      "client-observed round trip",
+      request.durationMs === undefined ? undefined : `${formatMs(request.durationMs)} ms`,
+    ),
+    detailRow("user-id header observed", request.userIdHeader),
+    detailRow("authorization scheme", request.authorizationScheme),
+    detailRow(
+      "response observed",
+      request.responseObserved === undefined ? undefined : request.responseObserved ? "yes" : "no",
+    ),
+    detailRow("cursor followed", request.cursor),
+    detailRow("hookHitsAfter (cumulative)", String(request.hookHitsAfter)),
+    `</dl>`,
+    `<p class="empty">body not recorded — <code>src/client/request-log.ts</code> pipes the ` +
+      `response through rather than cloning it, so no MCP body was captured for this request.</p>`,
+  ].join("\n");
+}
+
+/** A running total over values some records may not carry. */
+interface RunningTotal {
+  sum: number;
+  recorded: number;
+  total: number;
+}
+
+function runningCell(running: RunningTotal): string {
+  // No hits yet is a genuine zero — nothing has been sent — so it is printed as
+  // a number. `not recorded` is reserved for hits that happened and whose size
+  // the run file never measured.
+  if (running.total === 0) return num(0);
+  if (running.recorded === 0) return unmeasured();
+  return num(`${running.sum}${partial(running.recorded, running.total, "hits")}`);
+}
+
+/**
+ * One ordered table per run of everything that crossed a wire, both sides
+ * interleaved (issue #25 criteria 1–5).
+ *
+ * Replaces the request timeline and the hook-hit table this report used to
+ * render side by side. Every number those two carried is still here — the
+ * client-observed round trip, the hook server's handling time, the cumulative
+ * snapshot, the payload shape — but a reader no longer has to correlate two
+ * lists by timestamp to answer the question the whole report is about.
+ *
+ * The two latency numbers keep their own columns and can never land on the same
+ * row: a request row has no hook handling time and a hit row has no client
+ * round trip, so there is nothing for a reader to add together.
+ */
+function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
+  const { file, run } = entry;
+  const events = wireEvents(run);
+  const origin = events[0]?.at;
+
+  let hits = 0;
+  const bytes: RunningTotal = { sum: 0, recorded: 0, total: 0 };
+
+  const rows = events.map((event, order) => {
+    const offset = offsetMs(origin, event.at);
+    const common = [
+      num(order + 1),
+      `<td class="text">${event.side === "client" ? "client → gateway" : "gateway → hook"}</td>`,
+    ];
+    const when = [
+      `<td class="text">${escapeHtml(event.at)}</td>`,
+      offset === null ? unmeasured() : num(`+${formatMs(offset)}`),
+    ];
+
+    if (event.side === "client") {
+      const detail = [
+        `<tr class="detail">`,
+        `<td colspan="10">`,
+        `<details class="event"><summary>body not recorded · ` +
+          `${escapeHtml(event.request.method)} request · what the run JSON holds</summary>`,
+        requestDetail(event.request),
+        `</details>`,
+        `</td>`,
+        `</tr>`,
+      ].join("\n");
+      return [
+        `<tr class="event client">`,
+        ...common,
+        `<td class="text">${escapeHtml(event.request.method)}</td>`,
+        `<td class="text empty">—</td>`,
+        ...when,
+        num(hits),
+        runningCell(bytes),
+        event.request.durationMs === undefined
+          ? unmeasured()
+          : num(formatMs(event.request.durationMs)),
+        `<td class="num empty">—</td>`,
+        `</tr>`,
+        detail,
+      ].join("\n");
+    }
+
+    hits += 1;
+    bytes.total += 1;
+    if (event.hit.bodyBytes !== undefined) {
+      bytes.sum += event.hit.bodyBytes;
+      bytes.recorded += 1;
+    }
+    const placement = placements[event.index]!;
+    const detail = [
+      `<tr class="detail">`,
+      `<td colspan="10">`,
+      `<details class="event" id="${escapeHtml(placement.anchor)}--row">` +
+        `<summary>${payloadSummaryLine(event.hit, placement)}</summary>`,
+      payloadDetail(event.hit, placement),
+      `<h5>captured request headers</h5>`,
+      headersList(event.hit.headers),
+      `</details>`,
+      `</td>`,
+      `</tr>`,
+    ].join("\n");
+
+    return [
+      `<tr class="event hook">`,
+      ...common,
+      `<td class="text">POST /access</td>`,
+      causedByCell(event.causedBy),
+      ...when,
+      num(hits),
+      runningCell(bytes),
+      `<td class="num empty">—</td>`,
+      event.hit.handlingMs === undefined ? unmeasured() : num(formatMs(event.hit.handlingMs)),
+      `</tr>`,
+      detail,
+    ].join("\n");
+  });
+
+  const header =
+    `<thead><tr><th>#</th><th class="text">side</th><th class="text">what</th>` +
+    `<th class="text">caused by</th><th class="text">at</th><th>+ms from<br>first event</th>` +
+    `<th>hook hits<br>(cumulative)</th><th>bytes to hook<br>(cumulative)</th>` +
+    `<th>client-observed<br>round trip (ms)</th><th>hook server<br>handling (ms)</th>` +
+    `</tr></thead>`;
+
+  return [
+    `<table class="wire" id="${escapeHtml(file)}--wire">`,
+    header,
+    `<tbody>\n${rows.join("\n")}\n</tbody>`,
+    `</table>`,
   ].join("\n");
 }
 
@@ -1266,81 +1719,18 @@ export function payloadDedupeNote(plan: PayloadPlan): string {
   if (plan.occurrences === 0) return `<p class="sub">No hook payloads in this report.</p>`;
   if (plan.repeats === 0) {
     return (
-      `<p class="sub">No two of the ${plan.occurrences} raw payloads in this report are ` +
-      `byte-identical, so every one is rendered in full.</p>`
+      `<p class="sub">No two of the ${plan.occurrences} hook payloads in this report are ` +
+      `byte-identical, so every one is embedded in full.</p>`
     );
   }
   return (
-    `<p class="sub">${plan.repeats} of the ${plan.occurrences} raw payloads are ` +
+    `<p class="sub">${plan.repeats} of the ${plan.occurrences} hook payloads are ` +
     `<strong>byte-identical repeats</strong> of an earlier hit; ${plan.distinct} distinct ` +
-    `payloads are rendered in full and each repeat shows its digest and a link to the hit ` +
-    `that carries the body. The comparison is over the payload bytes, not over ` +
-    `<code>bodyBytes</code> or the toolkit and tool counts: a payload that differs anywhere ` +
-    `is rendered in full, so nothing a hit carried can be hidden by this.</p>`
+    `payloads are embedded once each, and every repeat shows its digest, links the hit that ` +
+    `carries the copy, and expands from that same copy. The comparison is over the payload ` +
+    `bytes, not over <code>bodyBytes</code> or the toolkit and tool counts: a payload that ` +
+    `differs anywhere is embedded in full, so nothing a hit carried can be hidden by this.</p>`
   );
-}
-
-/**
- * One row per hook hit: what it carried, how big it was, and what the hook
- * server spent answering it (issue #16 criterion 3). The raw payloads still
- * follow underneath — this table is the shape, not a replacement for the body.
- */
-function hitTable(run: Run): string {
-  const attributed = attributeHits(run);
-  const rows = run.hookHits
-    .map((hit, index) =>
-      [
-        "<tr>",
-        num(index + 1),
-        causedByCell(attributed[index] ?? null),
-        `<td class="text">${escapeHtml(hit.receivedAt)}</td>`,
-        hitNumberCell(hit.toolkitCount),
-        hitNumberCell(hit.toolCount),
-        hitNumberCell(hit.versionCount),
-        hitNumberCell(hit.bodyBytes),
-        hitNumberCell(hit.handlingMs, formatMs),
-        headersCell(hit.headers),
-        "</tr>",
-      ].join(""),
-    )
-    .join("\n");
-
-  return [
-    `<table class="hits">`,
-    `<thead><tr><th>hit</th><th class="text">caused by</th><th class="text">received at</th>` +
-      `<th>toolkits</th><th>tools</th>` +
-      `<th>versions</th><th>bodyBytes</th><th>hook server<br>handling (ms)</th>` +
-      `<th class="text">captured request headers</th></tr></thead>`,
-    `<tbody>\n${rows}\n</tbody>`,
-    `</table>`,
-  ].join("\n");
-}
-
-function timelineTable(run: Run): string {
-  const deltas = hitsPerRequest(run);
-  const rows = run.requests
-    .map((request, index) =>
-      [
-        "<tr>",
-        num(request.id),
-        `<td class="text">${escapeHtml(request.method)}</td>`,
-        `<td class="text">${escapeHtml(request.sentAt)}</td>`,
-        num(request.hookHitsAfter),
-        num(deltas[index] ?? 0),
-        request.durationMs === undefined ? unmeasured() : num(formatMs(request.durationMs)),
-        "</tr>",
-      ].join(""),
-    )
-    .join("\n");
-
-  return [
-    `<table class="timeline">`,
-    `<thead><tr><th>id</th><th class="text">method</th><th class="text">sent at</th>` +
-      `<th>hookHitsAfter<br>(cumulative)</th><th>hook hits<br>(this request)</th>` +
-      `<th>client-observed<br>round trip (ms)</th></tr></thead>`,
-    `<tbody>\n${rows}\n</tbody>`,
-    `</table>`,
-  ].join("\n");
 }
 
 /** `not recorded` as a `<dd>` value, kept distinct from a measured value of 0. */
@@ -1351,7 +1741,6 @@ function metaUnmeasured(): string {
 function runSection(entry: LoadedRun, placements: PayloadPlacement[]): string {
   const { file, run } = entry;
   const profile = profileHits(run.hookHits);
-  const attributed = attributeHits(run);
   const meta: [string, string][] = [
     ["revision requested", escapeHtml(run.revisionRequested)],
     ["revision negotiated", escapeHtml(formatRevisionNegotiated(run.revisionNegotiated))],
@@ -1402,14 +1791,10 @@ function runSection(entry: LoadedRun, placements: PayloadPlacement[]): string {
     ["error", run.error === null ? '<span class="empty">none</span>' : escapeHtml(run.error)],
   ];
 
-  const payloads =
-    run.hookHits.length === 0
-      ? `<p class="empty">No hook hits recorded for this run.</p>`
-      : run.hookHits
-          .map((hit, index) =>
-            payloadBlock(hit, index, attributed[index] ?? null, placements[index]!),
-          )
-          .join("\n");
+  const timeline =
+    run.requests.length === 0 && run.hookHits.length === 0
+      ? `<p class="empty">Nothing crossed a wire in this run.</p>`
+      : wireTable(entry, placements);
 
   return [
     `<section class="run" id="${escapeHtml(file)}">`,
@@ -1418,17 +1803,13 @@ function runSection(entry: LoadedRun, placements: PayloadPlacement[]): string {
     `<dl class="meta">`,
     ...meta.map(([term, value]) => `<dt>${term}</dt><dd>${value}</dd>`),
     `</dl>`,
-    `<h4>request timeline</h4>`,
-    timelineTable(run),
-    ...(run.hookHits.length === 0
-      ? []
-      : [`<h4>hook hits (${run.hookHits.length})</h4>`, hitTable(run)]),
-    `<h4>raw hook payloads (${run.hookHits.length})</h4>`,
-    run.hookHits.length === 0
-      ? ""
-      : `<p class="sub">Collapsed by default — the summary line carries size, toolkits and ` +
-        `tools so you can decide before opening. Expanding needs no script and no network.</p>`,
-    payloads,
+    `<h4>wire timeline (${run.requests.length} requests, ${run.hookHits.length} hook hits)</h4>`,
+    `<p class="sub">Every request the client sent and every hit the counter received, in one` +
+      ` sequence, oldest first. Each row expands: a hook hit shows its payload and its headers,` +
+      ` an MCP request shows what the run JSON holds for it. Expanding needs no network, and no` +
+      ` scripting — the explorer is an enhancement over a plain <code>&lt;pre&gt;</code> that is` +
+      ` already there.</p>`,
+    timeline,
     `</section>`,
   ].join("\n");
 }
@@ -1511,6 +1892,9 @@ ${toc}
 ${loaded.map((entry, index) => runSection(entry, plan.perRun[index]!)).join("\n\n")}
 
 <footer>Generated by <code>bun run report</code>. Print to PDF from the browser.</footer>
+<script>
+${EXPLORER}
+</script>
 </body>
 </html>
 `;

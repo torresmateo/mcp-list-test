@@ -353,8 +353,9 @@ await hook.close();
 ## The report
 
 `bun run report` turns the run files into one HTML page. The summary table has
-a row per protocol revision; the run sections below it have the request
-timeline, a row per hook hit, and the raw payloads.
+a row per protocol revision; each run section below it has **one ordered wire
+timeline** — every request the client sent and every hit the counter received,
+interleaved oldest first — and every row expands.
 
 | Summary column | What it says |
 | -------------- | ------------ |
@@ -396,15 +397,70 @@ carries none of these fields, and those cells read `not recorded` rather than
 only some of a revision's runs carry a field, the cell says so —
 `612 (3 of 6 hits)`.
 
-### Per-hit detail
+### The wire timeline
 
-Each run section lists its hits: `receivedAt`, toolkit/tool/version counts,
-`bodyBytes`, the hook server's `handlingMs`, and every captured request header.
+One table per run, both sides in one sequence. Each row says which side it was
+(`client → gateway` or `gateway → hook`), what crossed (`initialize`,
+`tools/list`, `POST /access`), when, and how many milliseconds after the run's
+first event — so the ordering is legible without arithmetic. Two running totals
+accumulate down the table, cumulative hook hits and cumulative bytes sent to the
+hook, and they grow on the row that caused them.
+
+The two latency numbers keep separate columns and can never land on the same
+row: a request row has no hook handling time and a hit row has no client round
+trip. There is nothing to add together.
+
+### Every hook hit names the request that caused it
+
+`hookHitsAfter` is cumulative per user id, so the hits whose index falls between
+two consecutive snapshots are the ones that request caused. The report derives
+that — no probe field was added and the run JSON is unchanged — and each run
+states its own split, `initialize 2 · tools/list 2`, beside its other metadata.
+
+A hit that arrived after the last snapshot reads **`not attributed`**. No
+request can be shown to have caused it, and folding it into the first method
+would invent an attribution the data does not support.
+
+### Per-row detail
+
+Every row expands, collapsed by default. A hook hit shows its payload and every
+captured request header; an MCP request shows what the run JSON holds — method,
+JSON-RPC id, status, round trip, the user-id header observed — and says **`body
+not recorded`**, because `src/client/request-log.ts` pipes the response through
+rather than cloning it and no MCP body was ever captured. An empty object is
+never rendered as though it were the payload.
+
 Credential headers arrive already redacted by the counter and are printed
 exactly as stored, on every hit — a repeated `Bearer <redacted len=43
 sha256=1f3a9c2b>` is the evidence that the same value arrived every time, so
-nothing is collapsed into "same as above". The raw payload still follows as
-pretty-printed JSON.
+nothing is collapsed into "same as above". That holds whatever happened to the
+payloads: deduplication is a statement about payload bodies and nothing else.
+
+### The JSON explorer, and the report that fits in a browser
+
+Payloads open as a collapsible tree. Large objects and arrays are summarised —
+`{125 keys}`, `[8258 items]` — until you open them, and each level builds only
+when you expand it, so opening one row of a report does not build a tree for the
+document. The script is **inline**: the engine team opens this file from a
+directory with no network, so nothing is fetched. With scripting off, every
+payload is still there, whole, inside `<details><summary>raw JSON</summary>` —
+the explorer is an enhancement over evidence that is already on the page.
+
+Each distinct payload is embedded **once**. The live run's 1.6 MB catalogue
+payload was byte-identical across all five runs and was inlined five times; now
+one copy is embedded and every other hit points at it, showing its sha-256 and
+naming the hit that carries it. The comparison is over the payload bytes, not
+over `bodyBytes` or the tool counts: a payload that differs anywhere — by one
+tool — is embedded in full, and a test covers exactly that case, because a
+report that quietly hid a difference between two hits would be the failure this
+whole project exists to catch.
+
+Above 64 KiB the embedded copy is stored compact rather than pretty-printed.
+Compact means whitespace removed and nothing else; nothing is ever truncated.
+Below that threshold the stored text is what a person actually reads in the
+no-script fallback, so it stays indented. Above it, the explorer does the
+formatting and the indentation is weight nobody reads — on the live evidence it
+turned a 1,598,220 B payload into 5,061,881 characters.
 
 ## The offline fake gateway
 
@@ -469,6 +525,12 @@ stay green without network access.
 
 Slice #16 extended the report to decision 17's profile: payload shape and size,
 `tools/list` requests actually issued, and the two latency numbers side by side.
+
+Slice #25 reorganised the run sections after the operator's live run produced a
+26.0 MB `report.html` that no reader could open and no row of which said which
+request had caused a hook hit. The two per-run tables became one ordered wire
+timeline, every hit is attributed to the request that caused it, payloads open
+in an inline JSON explorer, and each distinct payload is embedded once.
 
 What has not happened yet is the part no test can stand in for: a run against
 the real Arcade gateway, with the hook counter behind a tunnel. Until then the

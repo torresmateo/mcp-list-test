@@ -207,10 +207,10 @@ async function loadFixture(file: string) {
 }
 
 describe("run fixtures", () => {
-  // These fixtures are a second implementation of the run-JSON schema that the
-  // probe slice produces. If they drift, both slices pass their own tests and
-  // the report mis-renders real runs, so pin them to DESIGN.md Contracts ->
-  // Run JSON key for key.
+  // The minimum schema-1 run file: the keys DESIGN.md Contracts -> Run JSON
+  // specified before any profile or result field was added. Pinned key for key
+  // because a renderer that only ever saw a modern run file would be free to
+  // assume fields that half the evidence does not carry.
   const RUN_KEYS = [
     "schema",
     "revisionRequested",
@@ -225,7 +225,7 @@ describe("run fixtures", () => {
     "error",
   ].sort();
 
-  test("carry exactly the fields DESIGN.md Contracts -> Run JSON specifies", async () => {
+  test("carry exactly the original schema-1 fields, and none of the later ones", async () => {
     const files = await fixtureFiles();
     expect(files.length).toBeGreaterThanOrEqual(6);
 
@@ -541,9 +541,17 @@ function cell(html: string, revision: string, label: string): string {
 }
 
 describe("profile fixtures", () => {
-  // Second implementation of the shape `src/probe/run.ts` writes and
-  // `src/hook-server/server.ts` records. If these drift from the real writers,
-  // both slices pass their own tests while the report mis-renders real runs.
+  // Second implementation of the shape `src/probe/run.ts` wrote **as of #16**,
+  // and of what `src/hook-server/server.ts` records.
+  //
+  // Deliberately frozen there. #27 added `toolsListResult` and
+  // `toolsNotOfferedToHook` to what the probe writes, and these fixtures do not
+  // carry them — that is the point of keeping them: they are what proves the
+  // renderer still reads a run file written before those fields existed, and
+  // says `not recorded` rather than inventing one. The guard against drifting
+  // from the *current* probe lives on `TOOLS_LIST_DIR` below, which carries the
+  // full set; without that one, this list would go on passing while quietly
+  // describing a shape nothing writes any more.
   const RUN_KEYS = [
     "schema",
     "revisionRequested",
@@ -1655,4 +1663,302 @@ describe("report size on the live-evidence shape", () => {
     // the fixtures a person actually reads.
     for (const body of small) expect(body).toContain("\n  ");
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// #27's run-JSON fields, read by this renderer after the rebase onto 973c1ea
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs carrying `toolsListResult` and `toolsNotOfferedToHook`, one per state.
+ *
+ * `-1` a result plus one tool that bypassed the hook; `-2` no hook hits, so
+ * `toolsNotOfferedToHook` is `null`; `-3` the gateway returned an empty list
+ * and every listed tool was offered, so it is `[]`; `-4` no result was
+ * assembled; `-5` the same result as `-1`, assembled across two paged
+ * requests.
+ */
+const TOOLS_LIST_DIR = "test/fixtures/tools-list-result";
+
+/** The `tools not offered to hook` value from a run's meta list, as plain text. */
+function notOfferedOf(html: string, file: string): string {
+  const match = /<dt>tools not offered to hook<\/dt><dd>([\s\S]*?)<\/dd>/.exec(
+    sectionFor(html, file),
+  );
+  if (match === null) throw new Error(`no 'tools not offered to hook' in ${file}`);
+  return stripTags(match[1]!);
+}
+
+/** The `<h4>tools/list result</h4>` block of one run, as raw HTML. */
+function toolsListBlock(html: string, file: string): string {
+  const section = sectionFor(html, file);
+  const start = section.indexOf("<h4>tools/list result</h4>");
+  expect(start, `no tools/list result block in ${file}`).toBeGreaterThan(-1);
+  return section.slice(start);
+}
+
+describe("a run file carrying #27's fields", () => {
+  test("renders, with the tools/list result embedded whole and off the wire", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "tools-list-result.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const first = loaded.find(({ file }) => file.endsWith("-1.json"))!;
+    const tools = first.run.toolsListResult as { name: string }[];
+
+    expect(tools).toHaveLength(3);
+    const block = toolsListBlock(html, first.file);
+    expect(summaryLineOf(block)).toContain("3 tools");
+    expect(block).toContain(escaped(JSON.stringify(tools, null, 2)));
+
+    // Whole means whole: a vendor field the MCP spec does not name is exactly
+    // what #27 exists to preserve, and trimming it here would undo that.
+    expect(block).toContain("arcadeToolkit");
+    expect(block).toContain("Default_Ping");
+    expect(JSON.parse(JSON.stringify(tools))).toEqual(tools);
+  });
+
+  test("the tools/list row stops claiming `body not recorded` once the result is there", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "tools-list-row.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const first = loaded.find(({ file }) => file.endsWith("-1.json"))!;
+    const rows = wireTimeline(html, first.file).rows.filter((row) => row.side === "client");
+
+    const listRow = rows.find((row) => row.cells.includes("tools/list"))!;
+    const initRow = rows.find((row) => row.cells.includes("initialize"))!;
+
+    // The claim this rebase existed to catch: #27 made request-log capture the
+    // result, so saying it was not recorded would be false.
+    expect(summaryLineOf(listRow.detail)).toContain("response body recorded for the run");
+    expect(summaryLineOf(listRow.detail)).not.toContain("body not recorded");
+    expect(listRow.detail).toContain("is</strong> recorded for this run");
+    expect(listRow.detail).toContain(`href="#${first.file}--tools-list"`);
+
+    // `initialize` still records no body, and still says so: #27 captured
+    // `result.tools`, not request bodies.
+    expect(summaryLineOf(initRow.detail)).toContain("body not recorded");
+    expect(initRow.detail).toContain("no MCP body is kept per request");
+  });
+
+  test("a paged run says the result is the run's list, not the row's page", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "tools-list-paged.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const paged = loaded.find(({ run }) => (run.toolsListRequests ?? 0) > 1)!;
+
+    expect(paged.run.requests.filter((request) => request.method === "tools/list")).toHaveLength(2);
+    expect(toolsListBlock(html, paged.file)).toContain(
+      "Assembled across 2 <code>tools/list</code> requests, in page order",
+    );
+    for (const row of wireTimeline(html, paged.file).rows.filter(
+      (candidate) => candidate.side === "client" && candidate.cells.includes("tools/list"),
+    )) {
+      expect(stripTags(row.detail)).toContain("assembled list, concatenated across 2");
+      expect(stripTags(row.detail)).toContain("not this row");
+    }
+  });
+
+  test("an identical result across runs is embedded once, like a hook payload", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "tools-list-dedupe.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const withResult = loaded.filter(({ run }) => Array.isArray(run.toolsListResult));
+    const bodies = new Set(withResult.map(({ run }) => JSON.stringify(run.toolsListResult)));
+
+    expect(withResult.length).toBeGreaterThan(bodies.size); // the fixtures repeat
+    expect(html.match(/<pre id="[^"]*--tools-list-json">/g) ?? []).toHaveLength(bodies.size);
+    expect(html).toContain("identical to the tools/list result of");
+  });
+});
+
+describe("tools not offered to hook keeps its four states apart", () => {
+  test("`null` reads `cannot say`, never 0, never [], never none", async () => {
+    // The distinction this whole renderer is an instrument for. `null` means
+    // the run saw no hook hits, so it is not evidence about what was offered;
+    // "none" would turn that absence into the finding "nothing bypassed the
+    // hook", which is a false claim dressed as a measurement.
+    const { html } = await renderDir(TOOLS_LIST_DIR, "not-offered-null.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+
+    const noHits = loaded.find(
+      ({ run }) => run.toolsNotOfferedToHook === null && run.hookHits.length === 0,
+    )!;
+    const text = notOfferedOf(html, noHits.file);
+
+    expect(text).toBe("cannot say — this run observed no hook hits");
+    expect(text).not.toBe("0");
+    expect(text).not.toContain("none");
+    expect(text).not.toContain("[]");
+    expect(text).not.toContain("nothing bypassed");
+    expect(sectionFor(html, noHits.file)).not.toContain(
+      "<dt>tools not offered to hook</dt><dd>0</dd>",
+    );
+
+    // …and the other `null` run, which had hits but no result, names its own
+    // reason rather than borrowing that one.
+    const noResult = loaded.find(
+      ({ run }) => run.toolsNotOfferedToHook === null && run.hookHits.length > 0,
+    )!;
+    expect(notOfferedOf(html, noResult.file)).toBe(
+      "cannot say — this run assembled no tools/list result",
+    );
+  });
+
+  test("`[]` is a measurement and reads as one", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "not-offered-empty.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const empty = loaded.find(({ run }) => run.toolsNotOfferedToHook?.length === 0)!;
+
+    expect(notOfferedOf(html, empty.file)).toBe(
+      "none — every listed tool appeared in a hook payload",
+    );
+    expect(notOfferedOf(html, empty.file)).not.toContain("not recorded");
+    expect(notOfferedOf(html, empty.file)).not.toContain("cannot say");
+
+    // Its `toolsListResult` is `[]` too, and that is also a measurement — the
+    // gateway returned an empty list, which is what a hook denying everything
+    // produces — not a missing one.
+    expect(empty.run.toolsListResult).toEqual([]);
+    expect(toolsListBlock(html, empty.file)).toContain("returned an <strong>empty list</strong>");
+    expect(toolsListBlock(html, empty.file)).not.toContain("not recorded");
+  });
+
+  test("a non-empty list names the tools instead of counting them", async () => {
+    const { html } = await renderDir(TOOLS_LIST_DIR, "not-offered-names.html");
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const named = loaded.find(({ run }) => (run.toolsNotOfferedToHook?.length ?? 0) > 0)!;
+
+    // An absence is not evidence: the engine team opens this file to learn
+    // *which* tools were never submitted to access control.
+    for (const name of named.run.toolsNotOfferedToHook!) {
+      expect(notOfferedOf(html, named.file)).toContain(name);
+    }
+    expect(notOfferedOf(html, named.file)).toContain("Default_Ping");
+  });
+
+  test("a run file that predates #27 reads `not recorded`, not `none`", async () => {
+    const { html } = await renderFixtures("not-offered-absent.html");
+    const file = (await fixtureFiles())[0]!;
+
+    expect(notOfferedOf(html, file)).toBe("not recorded");
+    expect(toolsListBlock(html, file)).toContain("predates the");
+    // Absent, `null` and `[]` are three different sentences and none of them is
+    // this one.
+    expect(notOfferedOf(html, file)).not.toContain("cannot say");
+    expect(notOfferedOf(html, file)).not.toContain("none");
+  });
+});
+
+describe("the tools-list-result fixtures track what the probe writes today", () => {
+  // The drift guard the rebase onto 973c1ea needed. `test/fixtures/profile`
+  // is frozen at #16's shape on purpose, so without this one every key-set
+  // assertion in this file would keep passing while describing a run JSON that
+  // `src/probe/run.ts` stopped writing — the kind of stale-but-green guard a
+  // clean `git rebase` cannot flag.
+  const RUN_KEYS = [
+    "schema",
+    "revisionRequested",
+    "revisionNegotiated",
+    "status",
+    "userId",
+    "hookPublicUrl",
+    "requests",
+    "hookHits",
+    "toolsListed",
+    "gmailToolsListed",
+    "toolsListResult",
+    "toolsNotOfferedToHook",
+    "error",
+    "toolsListRequests",
+    "cursorFollowed",
+    "toolsListDurationMs",
+    "protocolEra",
+    "startedAt",
+    "finishedAt",
+  ].sort();
+
+  test("carry every key `src/probe/run.ts` writes, #27's pair included", async () => {
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    expect(loaded.length).toBeGreaterThanOrEqual(4);
+
+    for (const { file } of loaded) {
+      const raw = await Bun.file(`${REPO_ROOT}${TOOLS_LIST_DIR}/${file}`).json();
+      expect(Object.keys(raw).sort(), `${file} top-level keys`).toEqual(RUN_KEYS);
+      // `null` has to survive as `null`: writing the key with an explicit null
+      // is how the probe says "cannot say", and a fixture that dropped the key
+      // would be testing the absent case instead.
+      expect(Object.hasOwn(raw, "toolsNotOfferedToHook"), file).toBe(true);
+      expect(Object.hasOwn(raw, "toolsListResult"), file).toBe(true);
+    }
+  });
+
+  test("cover all four states of toolsNotOfferedToHook", async () => {
+    const loaded = await loadDir(TOOLS_LIST_DIR);
+    const states = loaded.map(({ run }) =>
+      run.toolsNotOfferedToHook === undefined
+        ? "absent"
+        : run.toolsNotOfferedToHook === null
+          ? "null"
+          : run.toolsNotOfferedToHook.length === 0
+            ? "empty"
+            : "named",
+    );
+    expect(new Set(states)).toEqual(new Set(["null", "empty", "named"]));
+    // The fourth state, `absent`, is what every pre-#27 fixture in this repo
+    // is, so it is covered by `test/fixtures/runs` rather than duplicated here.
+    const legacy = await loadFixture((await fixtureFiles())[0]!);
+    expect(legacy.toolsNotOfferedToHook).toBeUndefined();
+  });
+});
+
+describe("every anchor in the document is unique and every mount resolves", () => {
+  // The guard for a bug the HTML assertions could not see and a browser found:
+  // the `tools/list` result block and the `<pre>` holding its embedded copy
+  // were both given `<file>--tools-list`. `document.getElementById` returns the
+  // first match, so the explorer read the *block* — summary line included —
+  // and every payload silently failed to parse, leaving the report looking
+  // fine and working not at all.
+  const DIRS = [
+    FIXTURE_DIR,
+    PROFILE_DIRS.identical,
+    PROFILE_DIRS.paged,
+    ISSUE_25_DIRS.differs,
+    TOOLS_LIST_DIR,
+  ];
+
+  for (const dir of DIRS) {
+    test(`ids are unique and mounts parse in ${dir}`, async () => {
+      const { html } = await renderDir(dir, `ids-${dir.replaceAll("/", "-")}.html`);
+
+      const ids = [...html.matchAll(/\sid="([^"]*)"/g)].map((match) => match[1]!);
+      const seen = new Set<string>();
+      const duplicates = ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false)));
+      expect(duplicates, `duplicate ids in ${dir}`).toEqual([]);
+
+      // Every embedded body is reachable by the id the explorer looks up, and
+      // what it finds is the payload and nothing else.
+      const stored = new Map(
+        [...html.matchAll(/<pre id="([^"]*)">([\s\S]*?)<\/pre>/g)].map((match) => [
+          match[1]!,
+          match[2]!,
+        ]),
+      );
+      const mounts = [...html.matchAll(/data-payload="([^"]*)"/g)].map((match) => match[1]!);
+      expect(mounts.length).toBeGreaterThan(0);
+
+      for (const id of mounts) {
+        expect(stored.has(id), `${dir}: no <pre id="${id}"> for a mount`).toBe(true);
+        const decoded = stored
+          .get(id)!
+          .replaceAll("&quot;", '"')
+          .replaceAll("&#39;", "'")
+          .replaceAll("&gt;", ">")
+          .replaceAll("&lt;", "<")
+          .replaceAll("&amp;", "&");
+        expect(() => JSON.parse(decoded), `${dir}: ${id} did not parse`).not.toThrow();
+      }
+
+      // …and every fragment link lands on an element that exists.
+      const targets = [...html.matchAll(/href="#([^"]*)"/g)].map((match) => match[1]!);
+      for (const target of targets) {
+        expect(new Set(ids).has(target), `${dir}: dangling link #${target}`).toBe(true);
+      }
+    });
+  }
 });

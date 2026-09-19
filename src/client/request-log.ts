@@ -22,7 +22,7 @@
  *    result carries it. Reading it here means the probe does not depend on how
  *    the client reports — or rejects — a revision it does not implement.
  *  - **Which identity headers went out.** Header names and the user id only,
- *    never the API key. An absent `Arcade-User-ID` makes the gateway file its
+ *    never the API key. An absent `Arcade-User-Id` makes the gateway file its
  *    hook hits under a key nobody polls, and the probe would print a clean,
  *    wrong zero; recording what was sent is what tells "the hook never fired"
  *    apart from "we never identified ourselves".
@@ -39,7 +39,7 @@
  * `notifications/initialized` cannot slip its hits into `initialize`'s
  * snapshot — and by {@link RequestLog.flush} at the end of an operation.
  */
-import { ARCADE_USER_ID_HEADER } from "./headers.ts";
+import { readArcadeUserId } from "./headers.ts";
 
 /** A JSON-RPC id as it appears on the wire. */
 export type JsonRpcId = string | number;
@@ -259,7 +259,11 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
     if (requests.length === 0) return await baseFetch(url, init);
 
     const headers = new Headers(init?.headers);
-    const userIdHeader = headers.get(ARCADE_USER_ID_HEADER);
+    // Through the shared reader rather than a lookup of its own: it is the one
+    // place that knows header names are case-insensitive, and a transport that
+    // rewrote the name — HTTP/2 lowercases it on the wire — must still be
+    // recorded as identified, not as an anonymous request.
+    const userIdHeader = readArcadeUserId(headers) ?? null;
     const scheme = authorizationScheme(headers);
 
     const sentAt = new Date();
@@ -276,7 +280,7 @@ export function createRequestLog(options: RequestLogOptions = {}): RequestLog {
         finishedAt: sentAt.toISOString(),
         durationMs: 0,
         status: response.status,
-        userIdHeader: userIdHeader === null || userIdHeader === "" ? null : userIdHeader,
+        userIdHeader,
         authorizationScheme: scheme,
         responseObserved: false,
         hookHitsAfter: null,

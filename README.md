@@ -85,16 +85,17 @@ of quietly measuring `2025-11-25` and labelling the file `2026-07-28`.
 ## Configuration
 
 `.env.local` is never committed. `scripts/orca-setup.sh` writes the port block;
-the operator adds the four credentials by hand. The names are fixed by the
-Environment table in `DESIGN.md`:
+the operator adds the four credentials by hand. A fifth entry is optional. The
+names are fixed by the Environment table in `DESIGN.md`:
 
-| Variable            | Written by              | Meaning                                             |
-| ------------------- | ----------------------- | --------------------------------------------------- |
-| `PORT_WEB`          | `scripts/orca-setup.sh` | Hook counter listen port                            |
-| `ARCADE_API_KEY`    | operator                | Bearer for the gateway                              |
-| `ARCADE_MCP_URL`    | operator                | Streamable HTTP endpoint of the test gateway        |
-| `HOOK_BEARER_TOKEN` | operator                | Token the gateway sends; hook rejects anything else |
-| `HOOK_PUBLIC_URL`   | operator                | ngrok URL, recorded in run JSON for provenance      |
+| Variable                | Written by              | Meaning                                             |
+| ----------------------- | ----------------------- | --------------------------------------------------- |
+| `PORT_WEB`              | `scripts/orca-setup.sh` | Hook counter listen port                            |
+| `ARCADE_API_KEY`        | operator                | Bearer for the gateway                              |
+| `ARCADE_MCP_URL`        | operator                | Streamable HTTP endpoint of the test gateway        |
+| `HOOK_BEARER_TOKEN`     | operator                | Token the gateway sends; hook rejects anything else |
+| `HOOK_PUBLIC_URL`       | operator                | ngrok URL, recorded in run JSON for provenance      |
+| `ARCADE_USER_ID_PREFIX` | operator, **optional**  | Replaces `probe` in the generated `user_id`. Unset or empty, the default applies and nothing else changes. Supplied and invalid — `" "` included — is an exit, not a fallback |
 
 Nothing skips when a variable is absent. Every command that needs one loads it
 through `loadEnv()` in `src/env.ts`, which exits non-zero and prints
@@ -106,10 +107,49 @@ $ bun run probe --protocol 2025-11-25
 missing ARCADE_API_KEY
 ```
 
+`ARCADE_USER_ID_PREFIX` is the one optional entry, and it is the only one whose
+*absence* is not an error. A value it cannot use still is:
+
+```console
+$ ARCADE_USER_ID_PREFIX="my probe" bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX="my probe": must match ^[A-Za-z0-9._-]+$
+
+$ ARCADE_USER_ID_PREFIX=" " bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX=" ": must match ^[A-Za-z0-9._-]+$
+```
+
+Two cases, and the line between them is the whole point:
+
+| `.env.local` says | What happens |
+| --- | --- |
+| nothing, or `ARCADE_USER_ID_PREFIX=` | The variable was not supplied. `probe` applies and nothing about the run changes |
+| `ARCADE_USER_ID_PREFIX=" "`, or anything else failing the rule | The variable *was* supplied and is wrong. Exit 1 naming it |
+
+A lone space is the second case. It is the easiest version of this mistake to
+make and the hardest to spot in a `.env.local`, and treating it as an omission
+would produce a completed run under `probe` with every number looking healthy.
+
+The alphabet is narrow because the prefix ends up in two places that do not
+agree on what survives: the Arcade user header, and the `GET /hits?user_id=`
+query the probe polls the counter with. A space is legal in a header value and
+becomes `%20` or `+` in a query; `%` starts an escape on one path and means
+nothing on the other. A prefix the two encode differently has the hook called
+under one id and polled under another, and the run reports `hookHits: []` — a
+clean zero indistinguishable from "the hook never fired", which is the thing
+this repo exists to measure. So a bad value is a non-zero exit naming the
+variable, and it never falls back to `probe`: a run that quietly measured the
+default while the operator believed it measured their prefix is the same wrong
+answer wearing a different hat — and `probe` is a real key that really works, so
+nothing in the output would look wrong.
+
 ## The probe
 
 `bun run probe --protocol <revision>` is the measurement. Per repetition it
-generates a fresh user id, opens a new MCP session against `$ARCADE_MCP_URL`
+generates a fresh user id — `<prefix>-<revision>-<timestamp>-<n>`, where
+`<prefix>` is `$ARCADE_USER_ID_PREFIX` or `probe`, and the trailing `-<n>` is
+**not configurable**, because five repetitions have to be five distinct end
+users or a cached session can hide the behaviour being measured — opens a new
+MCP session against `$ARCADE_MCP_URL`
 over Streamable HTTP with the v2 SDK client, sends `initialize` then one
 `tools/list`, and writes one JSON file to `results/`.
 
@@ -374,7 +414,7 @@ It applies the hook's answer the way the engine documents `AccessHookResult`:
 is the fail-open the pre-#21 hook triggered, and a fake that could not
 reproduce it could not show the bug.
 
-It fails loudly rather than plausibly. A request without the `Arcade-User-ID`
+It fails loudly rather than plausibly. A request without the `Arcade-User-Id`
 header is an MCP error, never an invented user id. A hook that does not answer
 `200` yields an *empty* tool list, never the unfiltered one — a hook we could
 not consult is not a hook that allowed everything. And every outbound hook call
@@ -384,7 +424,11 @@ which leave the hit count at `0`.
 
 `src/client/headers.ts` holds the one thing the probe and the fake have to
 agree on: `ARCADE_USER_ID_HEADER`, the header carrying the user id the hook
-counter keys on. Both read the constant; neither repeats the string.
+counter keys on. Both read the constant; neither repeats the string. It is
+spelled `Arcade-User-Id`, the way the Arcade Dashboard spells it — and every
+*reader* of it matches case-insensitively, because header names are
+case-insensitive (RFC 9110) and HTTP/2 lowercases them on the wire, so a
+case-sensitive reader would see no user header at all against a real gateway.
 
 ## Status
 

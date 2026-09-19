@@ -31,7 +31,7 @@ are not optional.
 - [Step 1 — start the hook counter](#step-1--start-the-hook-counter)
 - [Step 2 — start ngrok and prove the tunnel works](#step-2--start-ngrok-and-prove-the-tunnel-works)
 - [Step 3 — Dashboard: project, gateway, extension](#step-3--dashboard-project-gateway-extension)
-- [Step 4 — fill the four env vars](#step-4--fill-the-four-env-vars)
+- [Step 4 — fill the env vars: four required, one optional](#step-4--fill-the-env-vars-four-required-one-optional)
 - [Step 5 — run the probe](#step-5--run-the-probe)
 - [Step 6 — the verification gate: before you trust any count](#step-6--the-verification-gate-before-you-trust-any-count)
 - [Step 7 — generate the report](#step-7--generate-the-report)
@@ -73,7 +73,8 @@ openssl rand -hex 32
 ```
 
 Put it in `.env.local` now as `HOOK_BEARER_TOKEN=...`. The hook counter will not
-start without it. The other three variables come in step 4.
+start without it. The other three required variables — and one optional one —
+come in step 4.
 
 > **`.env.local` is rewritten, not merged.** `scripts/orca-setup.sh` truncates
 > the file every time it runs (`scripts/orca-setup.sh` writes it with `>`), so
@@ -224,10 +225,13 @@ traffic. It is normal for it to show none yet, because nothing has called
 
 ---
 
-## Step 4 — fill the four env vars
+## Step 4 — fill the env vars: four required, one optional
 
 `.env.local` is **never committed** (it is gitignored) and is the only place
-these live. The names are fixed by `DESIGN.md` → Contracts → Environment:
+these live. The names are fixed by `DESIGN.md` → Contracts → Environment.
+
+**Four are required.** Leave any of them out and every command that needs it
+exits non-zero:
 
 ```sh
 # append to .env.local, below the block scripts/orca-setup.sh wrote
@@ -237,6 +241,27 @@ HOOK_BEARER_TOKEN=...         # already there from step 0
 HOOK_PUBLIC_URL=...           # the ngrok URL from step 2, no trailing /access
 ```
 
+**One is optional, and you can skip the rest of this box if you do not want
+it.** `ARCADE_USER_ID_PREFIX` replaces the literal `probe` at the front of the
+generated user ids, so a run is recognisable as yours in the hook log:
+
+```sh
+ARCADE_USER_ID_PREFIX=mateo-2026-09-18   # optional; `probe` if you omit the line
+```
+
+Set it and the ids read `mateo-2026-09-18-2025-11-25-<timestamp>-1` through
+`-5`; leave it out and they read `probe-2025-11-25-<timestamp>-1` through `-5`,
+which is what every example in this runbook shows. The trailing `-1` … `-5` is
+yours to read, not to configure: it is what makes the five repetitions five
+distinct end users, and five repetitions sharing one id would let a cached
+session serve four of them without the gateway consulting the hook at all.
+
+Allowed characters are `A-Z a-z 0-9 . _ -` and nothing else, because the prefix
+goes out in an HTTP header *and* comes back in the `GET /hits?user_id=` query
+the probe polls with. A space or a `%` is encoded differently on the two paths,
+which would have the hook called under one id and polled under another — and
+that shows up as `hookHits: []`, the clean zero step 6 exists to catch.
+
 Then, in your working terminal:
 
 ```sh
@@ -245,11 +270,40 @@ set -a; . ./.env.local; set +a
 
 **You should see** nothing. That is success.
 
-**If you do not:** every command in this repo that needs one of these exits
-non-zero and prints `missing <VARIABLE>`, naming the first it could not find, in
-the order of the table above. Nothing skips, nothing defaults. A variable set to
-an empty value counts as missing, so a stray `ARCADE_API_KEY=` is the same as no
-line at all.
+**If you do not:** every command in this repo that needs one of the four
+required variables exits non-zero and prints `missing <VARIABLE>`, naming the
+first it could not find, in the order of the table above. Nothing skips, nothing
+defaults. A variable set to an empty value counts as missing, so a stray
+`ARCADE_API_KEY=` is the same as no line at all.
+
+`ARCADE_USER_ID_PREFIX` is the one exception to "missing is an error" — and the
+only one. Omit the line, or leave it as a bare `ARCADE_USER_ID_PREFIX=`, and you
+get `probe`, silently and by design.
+
+**Supplying a bad value is a different thing from not supplying one, and the
+probe treats it differently.** It refuses before it sends a byte, rather than
+measuring under the default and letting you believe otherwise:
+
+```console
+$ ARCADE_USER_ID_PREFIX="my probe" bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX="my probe": must match ^[A-Za-z0-9._-]+$
+```
+
+Exit 1, no run file, no session. Fix the value or delete the line.
+
+**A line holding only spaces or a tab is a bad value, not an omission**, and it
+refuses the same way:
+
+```console
+$ ARCADE_USER_ID_PREFIX=" " bun run probe --protocol 2025-11-25
+invalid ARCADE_USER_ID_PREFIX=" ": must match ^[A-Za-z0-9._-]+$
+```
+
+That is deliberate, and it is the one case here worth slowing down for. A stray
+space is invisible in `.env.local`, and the alternative — quietly falling back
+to `probe` — would give you a run that finished, wrote its files and filled in
+every number, all under an id you did not choose. Nothing in step 6 would flag
+it, because `probe` is a real key the counter really answers for.
 
 ---
 
@@ -301,7 +355,7 @@ failure is evidence rather than a message that scrolled past.
 
 The counter is keyed entirely on `user_id` from the hook payload
 (`DESIGN.md` decision 5). If the gateway does not populate that from the
-`Arcade-User-ID` header the probe sends, the hook is called under a different id
+`Arcade-User-Id` header the probe sends, the hook is called under a different id
 or none, `GET /hits?user_id=` finds nothing, and the probe reports a clean zero,
 **indistinguishable from "the hook never fired"**. Check this on the first run,
 before reading a single number as a finding.
@@ -547,7 +601,7 @@ It must contain, at minimum:
    ```sh
    curl -sS -X POST "$ARCADE_MCP_URL" \
      -H "Authorization: Bearer $ARCADE_API_KEY" \
-     -H "Arcade-User-ID: runbook-era-check" \
+     -H "Arcade-User-Id: runbook-era-check" \
      -H 'Content-Type: application/json' \
      -H 'Accept: application/json, text/event-stream' \
      -H 'MCP-Protocol-Version: 2026-07-28' \
@@ -672,8 +726,9 @@ that matters. Start a fresh tunnel next time; treat the old URL as spent.
 | Symptom | Most likely cause | What to check |
 | --- | --- | --- |
 | `missing ARCADE_API_KEY` (or any other) | `.env.local` was rewritten by `scripts/orca-setup.sh`, or you never ran `set -a; . ./.env.local; set +a` in this shell | Re-read step 4. Empty values count as missing. |
+| `invalid ARCADE_USER_ID_PREFIX=...` | The optional prefix has a character the header and the `/hits` query would encode differently | Step 4. Use only `A-Z a-z 0-9 . _ -`, or delete the line to get `probe`. It never falls back on its own — a run under the default that you believed was under your prefix is a wrong answer you cannot see. |
 | Probe runs clean, every `hookHits=0` | The gateway never reached the counter | Re-run step 2's three curls *now*, without restarting ngrok. Then check the extension is enabled and attached to this gateway. |
-| `hookHits` non-empty but `MISMATCH` on `user_id` | The gateway is not deriving `user_id` from the `Arcade-User-ID` header | Nothing to fix locally. Record it. The counts in that run are attributed to the wrong key and are not usable. |
+| `hookHits` non-empty but `MISMATCH` on `user_id` | The gateway is not deriving `user_id` from the `Arcade-User-Id` header | Nothing to fix locally. Record it. The counts in that run are attributed to the wrong key and are not usable. |
 | Hits in terminal 1 but `count: 0` from `/hits` | You are polling a different user id, or a second probe is running | Runs must be serial; two probes against one gateway pollute each other's counts. |
 | `401` in terminal 1's output | The Dashboard's bearer token and `HOOK_BEARER_TOKEN` differ | A 401 is **not counted**, so this looks like silence in the numbers. Fix the token in the Dashboard. |
 | `tools/list` returns Gmail tools | Not necessarily anything | Record `gmailToolsListed` and call it out in `NOTES.md`. It does not mean the hook never fired; `hookHits` answers that. |

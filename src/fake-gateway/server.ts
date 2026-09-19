@@ -39,7 +39,7 @@ import {
   WebStandardStreamableHTTPServerTransport,
   isInitializeRequest,
 } from "@modelcontextprotocol/server";
-import { readArcadeUserId } from "../client/headers.ts";
+import { ARCADE_USER_ID_HEADER, readArcadeUserId } from "../client/headers.ts";
 
 /** The MCP endpoint path; `FakeGateway.url` already includes it. */
 const MCP_PATH = "/mcp";
@@ -308,7 +308,10 @@ export function startFakeGateway(options: StartFakeGatewayOptions): FakeGateway 
     if (userId === undefined) {
       // Loud, on purpose. Inventing an id here would file the hook hits under
       // a key nobody polls, and the caller would read a plausible 0.
-      throw new ProtocolError(ProtocolErrorCode.InvalidRequest, "missing Arcade-User-ID header");
+      throw new ProtocolError(
+        ProtocolErrorCode.InvalidRequest,
+        `missing ${ARCADE_USER_ID_HEADER} header`,
+      );
     }
     return userId;
   }

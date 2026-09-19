@@ -10,15 +10,21 @@
  * `fetch`, polls the hook counter to quiescence after each of them, and writes
  * one run JSON to `--out` in the DESIGN.md schema.
  *
- * Nothing here skips or falls back. A missing credential, an unreachable
- * gateway, an unreachable hook counter and a negotiated revision other than
- * the one requested are all non-zero exits that say which one happened,
- * because every one of them would otherwise produce a zero that looks exactly
- * like the answer we came to measure.
+ * Nothing here skips or falls back. A missing credential, a malformed
+ * `ARCADE_USER_ID_PREFIX`, an unreachable gateway, an unreachable hook counter
+ * and a negotiated revision other than the one requested are all non-zero exits
+ * that say which one happened, because every one of them would otherwise
+ * produce a zero that looks exactly like the answer we came to measure.
  */
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { loadEnv, MissingEnvError, REQUIRED_PROBE_ENV } from "./env.ts";
+import {
+  InvalidEnvError,
+  loadEnv,
+  loadUserIdPrefix,
+  MissingEnvError,
+  REQUIRED_PROBE_ENV,
+} from "./env.ts";
 import { assertRequestableRevision, UnsupportedRevisionError } from "./client/session.ts";
 import { HitsClient, HitsError } from "./probe/hits.ts";
 import { runRepetition, type Run } from "./probe/run.ts";
@@ -141,6 +147,13 @@ export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
   const env = loadEnv(REQUIRED_PROBE_ENV);
 
+  // Also before a byte goes out. The prefix ends up in the Arcade user header
+  // *and* in the `GET /hits?user_id=` query, so a value the two paths encode
+  // differently would have the hook called under one id and polled under
+  // another: `hookHits: []`, which reads exactly like "the hook never fired".
+  // A bad value is a non-zero exit naming the variable, never the default.
+  const userIdPrefix = loadUserIdPrefix();
+
   // Validated before a single byte goes out: `Client.connect()` offers the
   // first legacy entry of its supported list, so a revision it cannot request
   // would silently measure a different one under the name that was asked for.
@@ -172,6 +185,7 @@ export async function main(argv: string[]): Promise<number> {
       revision: args.revision,
       repetition,
       timestamp,
+      userIdPrefix,
       apiKey: env.ARCADE_API_KEY,
       hookPublicUrl: env.HOOK_PUBLIC_URL,
       hits,
@@ -210,6 +224,7 @@ if (import.meta.main) {
     // it exists to keep is the message and the exit code, and both are kept here.
     const expected =
       error instanceof MissingEnvError ||
+      error instanceof InvalidEnvError ||
       error instanceof UsageError ||
       error instanceof UnsupportedRevisionError ||
       error instanceof HitsError;

@@ -9,14 +9,22 @@
  * string. When question 7 is answered, this is the single line that changes.
  *
  * Arcade's documented "Arcade Headers" auth mode is the shape the probe uses:
- * `Authorization: Bearer <api key>` plus `Arcade-User-ID: <end user id>` on
+ * `Authorization: Bearer <api key>` plus `Arcade-User-Id: <end user id>` on
  * every request. HTTP header names are case-insensitive on the wire, so every
  * reader here must match case-insensitively; only the spelling we *send* has
  * to be the documented one.
+ *
+ * The spelling below is the Arcade Dashboard's (operator ruling, 2026-09-18,
+ * DESIGN.md open question 7). `Arcade-User-ID` was what we sent before, and the
+ * live gateway accepted it and ran fine — the change is fidelity to the
+ * Dashboard, not a fix for a failure. That both spellings work is the finding
+ * worth keeping: Arcade matches header names case-insensitively, as RFC 9110
+ * requires, and HTTP/2 lowercases them on the wire anyway. A reader here that
+ * became case-*sensitive* would therefore be a regression, whatever it matched.
  */
 
 /** The header carrying the end-user id the hook counter keys its hits on. */
-export const ARCADE_USER_ID_HEADER = "Arcade-User-ID";
+export const ARCADE_USER_ID_HEADER = "Arcade-User-Id";
 
 /** Anything a header can arrive as: `Headers`, or a plain bag from a server SDK. */
 export type HeaderBag = Headers | Record<string, string | string[] | undefined>;

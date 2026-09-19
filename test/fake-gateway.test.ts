@@ -457,6 +457,58 @@ describe("a missing user header", () => {
   });
 });
 
+describe("the user header is read case-insensitively", () => {
+  /**
+   * HTTP header names are case-insensitive (RFC 9110 §5.1), and HTTP/2
+   * lowercases every one of them on the wire (RFC 9113 §8.2.1). A reader that
+   * matched `Arcade-User-Id` exactly would therefore see *no* user header on a
+   * real HTTP/2 connection, reject the request or file the hit under a key
+   * nobody polls, and `GET /hits` would answer 0 — the clean zero this whole
+   * harness exists to tell apart from "the hook never fired".
+   *
+   * This is also why the spelling change in issue #23 is not a bug fix: Arcade
+   * accepted `Arcade-User-ID` against the live gateway precisely because both
+   * sides match case-insensitively. The assertion below keeps our side that way.
+   */
+  for (const spelling of ["arcade-user-id", "ARCADE-USER-ID", "Arcade-User-ID", "aRcAdE-uSeR-iD"]) {
+    test(`\`${spelling}\` identifies the caller and the hit is filed under it`, async () => {
+      const hook = hookServer();
+      const fake = gateway(hook, { hookCallsPerInitialize: 1 });
+      const userId = `u-case-${spelling.toLowerCase()}`;
+
+      const response = await fetch(fake.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          [spelling]: userId,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "case-test-client", version: "0.1.0" },
+          },
+        }),
+      });
+      const message = parseJsonRpc(await response.text());
+
+      // Not "it did not error": the id the gateway read, all the way through to
+      // the payload the counter stored. A reader that had invented an id would
+      // also produce a non-error response.
+      expect(message.error).toBeUndefined();
+      expect(message.result.protocolVersion).toBe(LATEST_PROTOCOL_VERSION);
+      expect(fake.hookCalls.map(call => call.userId)).toEqual([userId]);
+      const stored = await hits(hook, userId);
+      expect(stored.count).toBe(1);
+      expect(stored.hits.map(hit => hit.payload.user_id)).toEqual([userId]);
+    });
+  }
+});
+
 describe("the fail-open trap: neither `only` nor `deny` means no change (issue #21)", () => {
   /**
    * The bug this slice fixes, pinned from the outside.

@@ -11,6 +11,7 @@
  * file from a directory with no network, so everything is inlined and nothing
  * is fetched. `test/report.test.ts` asserts that by scanning the output.
  */
+import { createHash } from "node:crypto";
 import { mkdir, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
@@ -31,6 +32,28 @@ export interface RunRequest {
    * it, and `undefined` here means *absent*, never zero.
    */
   durationMs?: number;
+  /**
+   * What the probe already records about a request beyond the four fields
+   * DESIGN.md's Run JSON example spells out. `src/probe/run.ts` writes every
+   * one of these; the renderer simply did not read them until issue #25 asked
+   * for a row a reader can expand. Optional for the usual reason — a run file
+   * written before the probe recorded a field carries nothing for it, and
+   * `undefined` is *absent*, not a value.
+   *
+   * There is no MCP request or response **body** here, and that is not an
+   * oversight to paper over: `src/client/request-log.ts` deliberately pipes the
+   * response through instead of cloning it, so nothing ever captured one. The
+   * row says `body not recorded` rather than rendering `{}` as though it were
+   * the payload.
+   */
+  jsonRpcId?: number;
+  finishedAt?: string;
+  status?: number;
+  userIdHeader?: string;
+  authorizationScheme?: string;
+  responseObserved?: boolean;
+  /** Written only when this `tools/list` request followed a `nextCursor`. */
+  cursor?: string;
 }
 
 /**
@@ -97,6 +120,34 @@ export interface Run {
    * `null` when none went out; `undefined` when the run does not record it.
    */
   toolsListDurationMs?: number | null;
+  /**
+   * The `tools/list` result as it came off the wire, whole, in page order
+   * (added by #27, DESIGN.md decision 18).
+   *
+   * Entries travel through untouched — the courier rule the probe applies. The
+   * renderer reads nothing inside them; it shows them.
+   *
+   * Three states, and they are three different statements:
+   * `undefined` is a run file written before #27 and says nothing at all;
+   * `null` is "no result was ever assembled" (the run died first);
+   * `[]` is the real measurement "the gateway returned an empty list", which is
+   * what a hook that denied everything produces.
+   */
+  toolsListResult?: unknown[] | null;
+  /**
+   * Tool names the gateway listed that appear in **no** hook payload: tools
+   * never submitted to access control, so no policy could have denied them.
+   *
+   * Four states, none of which may be collapsed into another. `undefined` is a
+   * pre-#27 run file. `null` is *cannot say* — the run observed no hook hits,
+   * or assembled no result, so it is not evidence of anything. `[]` is the
+   * measurement "every listed tool appeared in a hook payload". A non-empty
+   * list names the tools that bypassed the hook.
+   *
+   * Rendering `null` as "none" would be the project's characteristic bug in a
+   * different costume: an absence printed as a finding.
+   */
+  toolsNotOfferedToHook?: string[] | null;
 }
 
 /** One run file: its basename (which becomes the section id) and its contents. */
@@ -188,6 +239,52 @@ function optionalNullableNumber(
   return value;
 }
 
+/** As {@link optionalNumber}, for a string field the run file may not carry. */
+function optionalString(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") fail(file, `${key} must be a string`);
+  return value;
+}
+
+/**
+ * An array the run file may not carry and may record as an explicit `null`.
+ *
+ * Elements are not inspected. `toolsListResult` is the gateway's own list
+ * travelling through this renderer the way it travelled through the probe —
+ * validating its shape would start trimming the evidence, which is the failure
+ * #27 exists to prevent.
+ */
+function optionalNullableArray(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): unknown[] | null | undefined {
+  const value = holder[key];
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (!Array.isArray(value)) fail(file, `${key} must be an array or null`);
+  return value;
+}
+
+/** As {@link optionalNullableArray}, for a list of names the report prints. */
+function optionalNullableStringArray(
+  file: string,
+  holder: Record<string, unknown>,
+  key: string,
+): string[] | null | undefined {
+  const value = optionalNullableArray(file, holder, key);
+  if (value === undefined || value === null) return value;
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") fail(file, `${key}[${index}] must be a string`);
+    return entry;
+  });
+}
+
 function optionalBoolean(
   file: string,
   holder: Record<string, unknown>,
@@ -263,7 +360,16 @@ export function parseRun(file: string, text: string): Run {
       method: requireString(file, entry, "method"),
       sentAt: requireString(file, entry, "sentAt"),
       hookHitsAfter: requireNumber(file, entry, "hookHitsAfter"),
-      ...defined({ durationMs: optionalNumber(file, entry, "durationMs") }),
+      ...defined({
+        durationMs: optionalNumber(file, entry, "durationMs"),
+        jsonRpcId: optionalNumber(file, entry, "jsonRpcId"),
+        finishedAt: optionalString(file, entry, "finishedAt"),
+        status: optionalNumber(file, entry, "status"),
+        userIdHeader: optionalString(file, entry, "userIdHeader"),
+        authorizationScheme: optionalString(file, entry, "authorizationScheme"),
+        responseObserved: optionalBoolean(file, entry, "responseObserved"),
+        cursor: optionalString(file, entry, "cursor"),
+      }),
     };
   });
 
@@ -302,6 +408,8 @@ export function parseRun(file: string, text: string): Run {
       toolsListRequests: optionalNumber(file, parsed, "toolsListRequests"),
       cursorFollowed: optionalBoolean(file, parsed, "cursorFollowed"),
       toolsListDurationMs: optionalNullableNumber(file, parsed, "toolsListDurationMs"),
+      toolsListResult: optionalNullableArray(file, parsed, "toolsListResult"),
+      toolsNotOfferedToHook: optionalNullableStringArray(file, parsed, "toolsNotOfferedToHook"),
     }),
   };
 }
@@ -378,6 +486,164 @@ export function hitsForMethod(run: Run, method: string): number | undefined {
     total = (total ?? 0) + (deltas[index] ?? 0);
   });
   return total;
+}
+
+/** What a hit no request can account for is called, everywhere it is printed. */
+export const NOT_ATTRIBUTED = "not attributed";
+
+/**
+ * The method that caused each hook hit, in `run.hookHits` order.
+ *
+ * Derived, not recorded: `hookHitsAfter` is the cumulative count for the run's
+ * user id at the moment the request finished (DESIGN.md Contracts -> Run JSON),
+ * and `hookHits` is in arrival order, so the hits whose index falls between two
+ * consecutive snapshots are the ones that request caused. That is the whole
+ * attribution — it needs no new probe field and no run-JSON change, which
+ * matters because the run JSON is a contract the probe slice and the operator's
+ * committed evidence both already depend on.
+ *
+ * `null` is a real answer, not a fallback. A hit past the last snapshot arrived
+ * after the probe stopped looking and **no request can be shown to have caused
+ * it**; folding it into the first method, or into the nearest one, would invent
+ * an attribution the data does not support. It renders as
+ * {@link NOT_ATTRIBUTED}.
+ */
+export function attributeHits(run: Run): (string | null)[] {
+  const attributed: (string | null)[] = run.hookHits.map(() => null);
+  let previous = 0;
+  for (const request of run.requests) {
+    const after = request.hookHitsAfter;
+    for (let index = previous; index < after && index < attributed.length; index += 1) {
+      attributed[index] = request.method;
+    }
+    // Snapshots are cumulative and so never decrease; clamping rather than
+    // assigning keeps a malformed non-monotonic run from re-attributing hits
+    // that an earlier request already claimed.
+    if (after > previous) previous = after;
+  }
+  return attributed;
+}
+
+/** One method and the hits attributed to it in a single run. */
+export interface MethodSplitEntry {
+  method: string;
+  hits: number;
+}
+
+/**
+ * Hits per method for one run, in the order the methods were first issued,
+ * with any unattributable hits last.
+ *
+ * Counts the hits the run section actually renders, so a reader can check the
+ * split by counting rows in the hit table. A method that was issued and caused
+ * nothing keeps its entry with `0`: that zero is a measurement — the request
+ * went out and the hook did not fire — and dropping the row would read like the
+ * method was never issued.
+ */
+export function methodSplit(run: Run): MethodSplitEntry[] {
+  const counts = new Map<string, number>();
+  const order: string[] = [];
+  const note = (method: string): void => {
+    if (!counts.has(method)) {
+      counts.set(method, 0);
+      order.push(method);
+    }
+  };
+
+  for (const request of run.requests) note(request.method);
+
+  let unattributed = 0;
+  for (const method of attributeHits(run)) {
+    if (method === null) {
+      unattributed += 1;
+      continue;
+    }
+    note(method);
+    counts.set(method, counts.get(method)! + 1);
+  }
+
+  const entries = order.map((method) => ({ method, hits: counts.get(method)! }));
+  if (unattributed > 0) entries.push({ method: NOT_ATTRIBUTED, hits: unattributed });
+  return entries;
+}
+
+/**
+ * One thing that crossed a wire during a run: an MCP request the client sent,
+ * or a hook hit the counter received.
+ *
+ * Two sides, one sequence. The run JSON keeps them in separate arrays and the
+ * report used to render them as two separate tables, which left the reader to
+ * correlate timestamps by eye to answer the only question that matters — which
+ * request caused which hit.
+ */
+export type WireEvent =
+  | {
+      side: "client";
+      at: string;
+      /** Index into `run.requests`. */
+      index: number;
+      request: RunRequest;
+    }
+  | {
+      side: "hook";
+      at: string;
+      /** Index into `run.hookHits`. */
+      index: number;
+      hit: HookHit;
+      /** The method attributed to this hit, or `null` for {@link NOT_ATTRIBUTED}. */
+      causedBy: string | null;
+    };
+
+/**
+ * Everything that crossed a wire in one run, in chronological order.
+ *
+ * Requests are placed at `sentAt` and hits at `receivedAt`. On an exact tie the
+ * request comes first, because a hit is a consequence of a request and the sort
+ * is stable over an array built requests-first — putting the effect above the
+ * cause would misread the storyline the table exists to tell.
+ *
+ * An unparseable timestamp sorts as `0` rather than `NaN`, which would make the
+ * comparison non-transitive and the order arbitrary.
+ */
+export function wireEvents(run: Run): WireEvent[] {
+  const attributed = attributeHits(run);
+  const events: WireEvent[] = [
+    ...run.requests.map((request, index): WireEvent => ({
+      side: "client",
+      at: request.sentAt,
+      index,
+      request,
+    })),
+    ...run.hookHits.map((hit, index): WireEvent => ({
+      side: "hook",
+      at: hit.receivedAt,
+      index,
+      hit,
+      causedBy: attributed[index] ?? null,
+    })),
+  ];
+  const time = (value: string): number => {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  };
+  return events.sort((a, b) => time(a.at) - time(b.at));
+}
+
+/**
+ * Milliseconds from the run's first wire event to `at`.
+ *
+ * The first event is the origin rather than a `startedAt` field: the run JSON's
+ * `startedAt` is not part of the schema DESIGN.md records, and an offset a
+ * reader can re-derive from the timestamps already in the table beats one that
+ * depends on a field half the run files do not carry. `null` when either end
+ * cannot be parsed — an absence, never a `0` that looks like simultaneity.
+ */
+export function offsetMs(origin: string | undefined, at: string): number | null {
+  if (origin === undefined) return null;
+  const from = Date.parse(origin);
+  const to = Date.parse(at);
+  if (Number.isNaN(from) || Number.isNaN(to)) return null;
+  return to - from;
 }
 
 /**
@@ -638,6 +904,445 @@ export function summarize(loaded: LoadedRun[]): RevisionSummary[] {
 }
 
 // ---------------------------------------------------------------------------
+// Raw payloads: where each one is rendered, and which are repeats
+// ---------------------------------------------------------------------------
+
+/** The anchor id of one hit's raw-payload block. */
+export function payloadAnchor(file: string, hitIndex: number): string {
+  return `${file}--payload-${hitIndex + 1}`;
+}
+
+/** How a reader is told which hit a payload block belongs to. */
+export function payloadLabel(file: string, hitIndex: number): string {
+  return `hit ${hitIndex + 1} of ${file}`;
+}
+
+/**
+ * The anchor id of one run's `tools/list` result **block** — what a row links
+ * to. Present on every run that has a block, repeats included.
+ */
+export function toolsListAnchor(file: string): string {
+  return `${file}--tools-list`;
+}
+
+/** The id of the `<pre>` holding one hit's shared `toolkits` object. */
+export function toolkitsStoreId(file: string, hitIndex: number): string {
+  return `${file}--toolkits-${hitIndex + 1}`;
+}
+
+/**
+ * The id of the `<pre>` holding the embedded copy, distinct from
+ * {@link toolsListAnchor}.
+ *
+ * They must not be the same string. The explorer finds its data with
+ * `document.getElementById`, so a block and the `<pre>` inside it sharing an id
+ * makes the lookup return the block — whose `textContent` is the summary line
+ * plus the JSON — and every payload silently fails to parse. That is a bug no
+ * assertion about the HTML would catch and only a browser shows, which is how
+ * this one was found.
+ */
+export function toolsListStoreId(file: string): string {
+  return `${file}--tools-list-json`;
+}
+
+export function toolsListLabel(file: string): string {
+  return `the tools/list result of ${file}`;
+}
+
+/**
+ * Above this many bytes of compact JSON, the embedded copy is stored compact
+ * instead of pretty-printed.
+ *
+ * Not a size cap — **nothing is ever truncated**; compact means whitespace
+ * removed and nothing else. The threshold exists because the two readers of the
+ * stored copy want different things. Below it, the stored text is what a person
+ * actually reads in the no-script fallback, and indenting it costs a few
+ * kilobytes. Above it, nobody reads a 1.6 MB payload as a wall of text — the
+ * explorer formats it on expand — so the indentation is pure weight: on the
+ * live evidence, pretty-printing and escaping turned a 1,598,220 B payload into
+ * 5,061,881 characters, three quarters of a megabyte of which is indentation
+ * for a form no reader uses.
+ *
+ * 64 KiB because every payload in the repository's fixtures, and any payload a
+ * person would sit and read, is far below it, while the catalogue payload that
+ * made the live report 26 MB is twenty-four times above it.
+ */
+export const PRETTY_PAYLOAD_MAX_BYTES = 65_536;
+
+/**
+ * Above this many bytes, a `toolkits` object shared by more than one payload is
+ * stored once and referenced, instead of being re-embedded inside each payload.
+ *
+ * The live evidence is the reason. Its five catalogue payloads are **not**
+ * byte-identical — they differ in `user_id` — so whole-payload deduplication
+ * correctly declines to collapse them, and the report carried five copies of
+ * the same 1.6 MB `toolkits` object for the sake of five different id strings.
+ * Splitting the shared part out recovers that without collapsing anything the
+ * payloads actually disagree about.
+ *
+ * Only worth it when the shared part is large: below this, the reference costs
+ * more than the object, and splitting a small payload into two pieces would
+ * make it harder to read for no gain. 64 KiB, the same line
+ * {@link PRETTY_PAYLOAD_MAX_BYTES} draws, so a payload is either small and
+ * whole and indented, or large and stored the economical way.
+ */
+export const TOOLKITS_STORE_MIN_BYTES = 65_536;
+
+/** The key whose value is eligible to be stored once and shared. */
+const SHARED_KEY = "toolkits";
+
+/**
+ * A large `toolkits` object stored once, outside the payloads that carry it.
+ *
+ * The payload is still shown whole: its own fields are rendered from its own
+ * bytes and the shared object from the store's, so nothing is rewritten and no
+ * `$ref` is invented inside evidence JSON. The explorer reassembles the two
+ * into the exact payload the gateway sent.
+ */
+export interface SharedToolkits {
+  /** Which key was stored separately. Always `toolkits` today. */
+  key: string;
+  /** id of the `<pre>` holding the one copy. */
+  storeId: string;
+  /** sha-256 of the shared object's bytes. */
+  digest: string;
+  /** True when this payload's block is the one that emits the store. */
+  emitsStore: boolean;
+  /** Where the copy is, when this payload is not the one that emits it. */
+  sameAs?: { anchor: string; label: string };
+}
+
+/** Where one hook payload is rendered, and whether it is a repeat of another. */
+export interface PayloadPlacement {
+  /** This occurrence's own anchor id, so a repeat can be linked to as well. */
+  anchor: string;
+  /** sha-256 over the payload bytes — the same string `bodyBytes` counts. */
+  digest: string;
+  /**
+   * The id of the `<pre>` that holds this payload's one embedded copy. Equal to
+   * {@link anchor} on the first occurrence and to the first occurrence's anchor
+   * on a repeat, so a repeat's explorer reads the same embedded data instead of
+   * a second copy of it.
+   */
+  storedAt: string;
+  /**
+   * Set only when this payload is **byte-identical** to an earlier one, which
+   * is where the body is stored. `undefined` means this occurrence carries it.
+   */
+  sameAs?: { anchor: string; label: string };
+  /**
+   * Set when this payload's `toolkits` object is large and shared with another
+   * payload, so it lives in its own store and {@link storedAt} holds only this
+   * payload's remaining fields.
+   */
+  sharedToolkits?: SharedToolkits;
+}
+
+/**
+ * Every kind of body this report can place, with the words it is counted in.
+ *
+ * **One table, two jobs.** The keys are the kinds the plan tallies and the
+ * values are the nouns the sentence prints, so the total and the named parts
+ * cannot drift apart: both are derived from this. A kind cannot be counted
+ * without being nameable, because {@link BodyKind} *is* the key set — adding a
+ * placement kind without a label here is a type error, not a quietly wrong
+ * number.
+ *
+ * That is the point. Round 1's finding was `tools/list` results counted as hook
+ * payloads; round 2's was shared `toolkits` objects counted as nothing at all.
+ * Both came from a sentence assembled by hand beside a total assembled
+ * separately. Two special cases invited a third, so there are no special cases
+ * now.
+ *
+ * The shared object is **named rather than excluded**: it is a real `<pre>` on
+ * the page with its own bytes and its own digest, and a total called "bodies"
+ * that silently left some bodies out would be the same class of untruth in the
+ * other direction. Insertion order is print order.
+ */
+export const BODY_KINDS = {
+  "hook-payload": { one: "hook payload", many: "hook payloads" },
+  "shared-toolkits": { one: "shared toolkits object", many: "shared toolkits objects" },
+  "tools-list-result": { one: "tools/list result", many: "tools/list results" },
+} as const;
+
+export type BodyKind = keyof typeof BODY_KINDS;
+
+/** The kinds in print order, from the one table that defines them. */
+export const BODY_KIND_ORDER = Object.keys(BODY_KINDS) as BodyKind[];
+
+/** How many bodies of one kind were placed, and how many were repeats. */
+export interface BodyCount {
+  occurrences: number;
+  repeats: number;
+}
+
+export interface PayloadPlan {
+  /** One entry per loaded run, each with one placement per hook hit. */
+  perRun: PayloadPlacement[][];
+  /**
+   * One entry per loaded run for its `toolsListResult`, or `null` where the run
+   * has no result to embed. It shares the hook payloads' store, so a result
+   * repeated across repetitions of the same gateway is embedded once too.
+   */
+  toolsListPerRun: (PayloadPlacement | null)[];
+  /**
+   * Every placement, tallied by kind — the single structure both the total and
+   * the printed sentence are derived from. See {@link BODY_KINDS}.
+   */
+  bodies: Record<BodyKind, BodyCount>;
+  /** Every placement, whatever its kind. Always the sum over {@link bodies}. */
+  occurrences: number;
+  /** Distinct bodies — how many are embedded at all. */
+  distinct: number;
+  /** Placements that are repeats and therefore embed nothing. */
+  repeats: number;
+  /**
+   * Characters of escaped, stored JSON the repeats did not re-emit.
+   * The measurement behind "the report shrank", kept here so a test can pin it
+   * instead of trusting that a smaller file means the right thing happened.
+   */
+  charsSaved: number;
+}
+
+/** An empty tally with an entry for every kind, so none can be forgotten. */
+function emptyBodies(): Record<BodyKind, BodyCount> {
+  return Object.fromEntries(
+    BODY_KIND_ORDER.map((kind) => [kind, { occurrences: 0, repeats: 0 }]),
+  ) as Record<BodyKind, BodyCount>;
+}
+
+/**
+ * Decides, for every hook payload in the report, whether it renders in full or
+ * as a pointer to an earlier byte-identical one.
+ *
+ * **Identical is computed, never assumed.** The map is keyed by the payload's
+ * own JSON text, so two payloads collapse only when every byte matches — not
+ * when their `toolkitCount` and `bodyBytes` happen to agree, and not because a
+ * digest matched. The digest is printed for the reader to verify; the decision
+ * does not rest on it. A payload that differs anywhere, by one tool or by one
+ * character, is rendered in full: this project exists to measure a hook whose
+ * behaviour is invisible unless measured, and a report that quietly hid a
+ * difference between two hits would be the exact failure it is built to catch.
+ *
+ * Deduplication is document-wide, not per run, because the measured evidence
+ * has the catalogue payload byte-identical *across* runs — which is where
+ * almost all of the duplication was.
+ */
+export function planPayloads(loaded: LoadedRun[]): PayloadPlan {
+  const seen = new Map<string, { anchor: string; label: string; digest: string }>();
+  const perRun: PayloadPlacement[][] = [];
+  const toolsListPerRun: (PayloadPlacement | null)[] = [];
+  const bodies = emptyBodies();
+  let charsSaved = 0;
+
+  /**
+   * How many hook payloads in the whole report carry each large `toolkits`
+   * object, worked out before anything is placed.
+   *
+   * Splitting a payload is only worth doing when the object is actually shared,
+   * and that is a property of the document, not of the payload in hand — so it
+   * cannot be decided while walking the payloads one at a time.
+   */
+  const sharedCounts = new Map<string, number>();
+  for (const { run } of loaded) {
+    for (const hit of run.hookHits) {
+      const text = shareableToolkitsText(hit.payload);
+      if (text !== undefined) sharedCounts.set(text, (sharedCounts.get(text) ?? 0) + 1);
+    }
+  }
+
+  /**
+   * Places one body in the shared store, or points it at the copy already
+   * there, and tallies it under its kind.
+   *
+   * Every placement goes through here and every placement declares a kind, so
+   * the total the report prints is the sum of the parts it names. There is no
+   * second path that could add to one without the other.
+   */
+  const place = (
+    kind: BodyKind,
+    body: string,
+    anchor: string,
+    label: string,
+    displayDigest?: string,
+  ): PayloadPlacement => {
+    const tally = bodies[kind];
+    tally.occurrences += 1;
+    const earlier = seen.get(body);
+    if (earlier === undefined) {
+      const digest = createHash("sha256").update(body).digest("hex");
+      seen.set(body, { anchor, label, digest });
+      return { anchor, digest: displayDigest ?? digest, storedAt: anchor };
+    }
+    tally.repeats += 1;
+    charsSaved += escapeHtml(storedText(body)).length;
+    return {
+      anchor,
+      digest: displayDigest ?? earlier.digest,
+      storedAt: earlier.anchor,
+      sameAs: { anchor: earlier.anchor, label: earlier.label },
+    };
+  };
+
+  /**
+   * One hook payload, split in two when its `toolkits` object is large and
+   * carried by more than one payload in this report.
+   *
+   * Split means *stored* in two parts, never *shown* in two: the payload's own
+   * fields come from its own bytes, the shared object from the store's, and the
+   * explorer puts them back together into exactly what the gateway sent.
+   * Nothing is rewritten — inventing a `$ref` inside evidence JSON would make
+   * the raw block stop being the gateway's bytes, which is the failure this
+   * report is an instrument against.
+   *
+   * The split adds a second placement, of a second kind. It is counted as one,
+   * named as one, and neither of those is optional.
+   */
+  const placeHookPayload = (
+    payload: unknown,
+    file: string,
+    index: number,
+  ): PayloadPlacement => {
+    const whole = payloadText(payload);
+    const wholeDigest = createHash("sha256").update(whole).digest("hex");
+    const anchor = payloadAnchor(file, index);
+    const label = payloadLabel(file, index);
+    const toolkits = shareableToolkitsText(payload);
+
+    if (toolkits === undefined || (sharedCounts.get(toolkits) ?? 0) < 2) {
+      return place("hook-payload", whole, anchor, label, wholeDigest);
+    }
+
+    // Own fields first, keyed on their own bytes: two payloads that agree on
+    // everything but the shared object share this store too, and one that does
+    // not gets its own.
+    const own = place(
+      "hook-payload",
+      withoutShared(payload),
+      anchor,
+      `the own fields of ${label}`,
+      wholeDigest,
+    );
+    const store = place(
+      "shared-toolkits",
+      toolkits,
+      toolkitsStoreId(file, index),
+      `the toolkits of ${label}`,
+    );
+    return {
+      ...own,
+      sharedToolkits: {
+        key: SHARED_KEY,
+        storeId: store.storedAt,
+        digest: store.digest,
+        emitsStore: store.sameAs === undefined,
+        ...(store.sameAs === undefined ? {} : { sameAs: store.sameAs }),
+      },
+    };
+  };
+
+  for (const { file, run } of loaded) {
+    // Hook payloads first, then the run's `tools/list` result: the same order
+    // the run section renders them in, so "the first occurrence carries the
+    // body" means the first one a reader meets.
+    perRun.push(run.hookHits.map((hit, index) => placeHookPayload(hit.payload, file, index)));
+
+    toolsListPerRun.push(
+      Array.isArray(run.toolsListResult)
+        ? place(
+            "tools-list-result",
+            payloadText(run.toolsListResult),
+            toolsListStoreId(file),
+            toolsListLabel(file),
+          )
+        : null,
+    );
+  }
+
+  // Derived, never accumulated alongside: the total is the sum of exactly the
+  // parts the sentence names, by construction rather than by agreement.
+  const counts = BODY_KIND_ORDER.map((kind) => bodies[kind]);
+  return {
+    perRun,
+    toolsListPerRun,
+    bodies,
+    occurrences: counts.reduce((sum, count) => sum + count.occurrences, 0),
+    distinct: seen.size,
+    repeats: counts.reduce((sum, count) => sum + count.repeats, 0),
+    charsSaved,
+  };
+}
+
+/**
+ * The payload's `toolkits` value as JSON, when it is big enough to be worth
+ * storing apart. `undefined` when the payload is not shaped like the
+ * access-hook contract, or when the object is small enough that splitting it
+ * would cost more than it saves.
+ */
+function shareableToolkitsText(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const toolkits = payload[SHARED_KEY];
+  if (!isRecord(toolkits)) return undefined;
+  const text = payloadText(toolkits);
+  return Buffer.byteLength(text, "utf8") >= TOOLKITS_STORE_MIN_BYTES ? text : undefined;
+}
+
+/** The payload as JSON with the shared key removed, key order otherwise intact. */
+function withoutShared(payload: unknown): string {
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload as Record<string, unknown>)) {
+    if (key !== SHARED_KEY) rest[key] = value;
+  }
+  return payloadText(rest);
+}
+
+/**
+ * The payload's bytes as a comparison key and as the digest's input.
+ *
+ * Compact, not pretty-printed: it is the same string the hook counter measured
+ * for `bodyBytes`, so a digest printed here can be reproduced from the run JSON
+ * with `jq -cj '.hookHits[N].payload' run.json | shasum -a 256`.
+ */
+function payloadText(payload: unknown): string {
+  return JSON.stringify(payload) ?? "null";
+}
+
+/** {@link payloadText}, for callers outside the plan. */
+function payloadTextOf(value: unknown): string {
+  return payloadText(value);
+}
+
+/**
+ * The payload as the document embeds it: pretty-printed while it is small
+ * enough for a person to read as text, compact once it is not.
+ *
+ * Complete either way — see {@link PRETTY_PAYLOAD_MAX_BYTES}. The explorer
+ * parses this same text, so there is exactly one copy of a payload in the
+ * document no matter which form it took.
+ */
+export function storedPayload(payload: unknown): string {
+  return storedText(payloadText(payload));
+}
+
+/**
+ * {@link storedPayload} for a body the caller already serialised.
+ *
+ * The plan works in JSON text — that is what it compares and digests — so it
+ * must not have to parse a body back into a value just to ask how long the
+ * stored form would be.
+ */
+export function storedText(compact: string): string {
+  return Buffer.byteLength(compact, "utf8") > PRETTY_PAYLOAD_MAX_BYTES
+    ? compact
+    : prettyText(compact);
+}
+
+/** Re-indents compact JSON. Same bytes, same order, whitespace added. */
+function prettyText(compact: string): string {
+  return JSON.stringify(JSON.parse(compact), null, 2) ?? "null";
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -737,8 +1442,32 @@ section.run { border-top: 1px solid #e2e4ec; padding-top: .5rem; margin-top: 2re
 .callout-warn { border-color: #e6c072; background: #fdf6e6; }
 .callout-ok { border-color: #a8dcb8; background: #f1faf3; }
 .callout-unknown { border-color: #c9ccd8; background: #f4f5f8; }
-table.hits td.headers { font-size: .72rem; line-height: 1.35; max-width: 26rem; }
-table.hits .hdr { word-break: break-all; }
+table.wire tr.event.hook > td:first-child { border-left: 3px solid #7f8cc4; }
+table.wire tr.event.client > td:first-child { border-left: 3px solid #16181d; }
+table.wire tr.detail > td { background: #fafbfd; padding: .35rem .55rem; }
+details.event > summary {
+  cursor: pointer; font-size: .76rem; word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #2b2f3a;
+}
+details.event > summary::marker { color: #7f8cc4; }
+details.event dl.meta { margin: .5rem 0 .5rem 1.1rem; font-size: .8rem; }
+details.event h5 { margin: .8rem 0 .3rem 1.1rem; font-size: .78rem; color: #44485a; }
+details.raw { margin: .4rem 0 .4rem 1.1rem; }
+details.raw > summary { cursor: pointer; font-size: .75rem; color: #5a5f70; }
+details.raw > pre { margin: .3rem 0 0; }
+.headers { margin-left: 1.1rem; font-size: .72rem; line-height: 1.4; }
+.hdr { word-break: break-all; }
+p.repeat-note { margin: .4rem 0 .4rem 1.1rem; font-size: .8rem; word-break: break-all; }
+.json { margin: .4rem 0 .4rem 1.1rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .76rem; }
+.json details { margin-left: .9rem; }
+.json > details { margin-left: 0; }
+.json summary { cursor: pointer; }
+.json .k { color: #7a4fbf; }
+.json .s { color: #14622f; }
+.json .n { color: #1f4fd8; }
+.json .b, .json .z { color: #8a1c1c; }
+.json .c { color: #8b90a0; }
+.json .leaf { margin-left: .9rem; }
 nav ol { margin: .25rem 0 0; padding-left: 1.4rem; font-size: .85rem; }
 nav a { color: #1f4fd8; }
 footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
@@ -748,6 +1477,136 @@ footer { margin-top: 3rem; color: #5a5f70; font-size: .78rem; }
   pre { white-space: pre-wrap; word-break: break-word; }
   nav { display: none; }
 }
+`.trim();
+
+/**
+ * The JSON explorer (issue #25 criterion 6).
+ *
+ * Inline, and inline only: the engine team opens this file from a directory
+ * with no network, so an external script or a CDN stylesheet would make the
+ * evidence unreadable exactly where it is read. The self-containment test
+ * forbids `script src=`, `link href=`, `@import` and off-file `url(`; an inline
+ * `<script>` is the one mechanism left, and it is the right one here because a
+ * nested-`<details>` tree for an 8,258-tool payload would be megabytes of HTML
+ * on its own.
+ *
+ * Three rules it lives by:
+ *
+ * - **It reads the payload that is already on the page.** Each payload is
+ *   embedded once, as the text of a `<pre>`; this script parses that text. It
+ *   never carries a second copy, and a byte-identical repeat points at the same
+ *   `<pre>` rather than embedding its own.
+ * - **It is lazy twice over.** A payload is parsed the first time a row is
+ *   opened, and each object or array builds its children the first time *it* is
+ *   opened. Opening one row of a 26 MB report must not build a tree for the
+ *   whole document.
+ * - **It is an enhancement, never a dependency.** With scripting off, every
+ *   payload is still there, whole, inside `<details><summary>raw JSON</summary>`
+ *   — this script adds a tree beside it and removes nothing.
+ */
+const EXPLORER = `
+(function () {
+  var cache = {};
+  function payloadOf(id) {
+    if (!(id in cache)) {
+      var host = document.getElementById(id);
+      try {
+        cache[id] = host === null ? undefined : JSON.parse(host.textContent);
+      } catch (error) {
+        cache[id] = undefined;
+      }
+    }
+    return cache[id];
+  }
+  function span(className, text) {
+    var element = document.createElement("span");
+    element.className = className;
+    element.textContent = text;
+    return element;
+  }
+  function count(n, noun) {
+    return n + " " + noun + (n === 1 ? "" : "s");
+  }
+  function scalarText(value) {
+    if (value === null) return "null";
+    if (typeof value === "string") return JSON.stringify(value);
+    return String(value);
+  }
+  function scalarClass(value) {
+    if (value === null) return "z";
+    if (typeof value === "string") return "s";
+    if (typeof value === "number") return "n";
+    return "b";
+  }
+  function keyText(key) {
+    return key === null ? "" : key + ": ";
+  }
+  function node(key, value) {
+    var isArray = Array.isArray(value);
+    if (value === null || typeof value !== "object") {
+      var leaf = document.createElement("div");
+      leaf.className = "leaf";
+      if (key !== null) leaf.appendChild(span("k", keyText(key)));
+      leaf.appendChild(span(scalarClass(value), scalarText(value)));
+      return leaf;
+    }
+    var keys = isArray ? null : Object.keys(value);
+    var size = isArray ? value.length : keys.length;
+    var branch = document.createElement("details");
+    var head = document.createElement("summary");
+    if (key !== null) head.appendChild(span("k", keyText(key)));
+    head.appendChild(
+      span("c", isArray ? "[" + count(size, "item") + "]" : "{" + count(size, "key") + "}")
+    );
+    branch.appendChild(head);
+    var built = false;
+    branch.addEventListener("toggle", function () {
+      if (built || branch.open !== true) return;
+      built = true;
+      for (var i = 0; i < size; i += 1) {
+        var childKey = isArray ? String(i) : keys[i];
+        branch.appendChild(node(childKey, isArray ? value[i] : value[childKey]));
+      }
+    });
+    return branch;
+  }
+  function render(mount) {
+    if (mount.getAttribute("data-rendered") === "yes") return;
+    mount.setAttribute("data-rendered", "yes");
+    var value = payloadOf(mount.getAttribute("data-payload"));
+    if (value === undefined) {
+      mount.appendChild(span("c", "payload could not be parsed - the raw JSON below is the evidence"));
+      return;
+    }
+    // A payload whose large shared object is stored apart is put back together
+    // here, so the tree is the whole payload the gateway sent. The copy is
+    // shallow: the cached own-fields object is shared by every payload that has
+    // the same ones, and must not be mutated.
+    var sharedId = mount.getAttribute("data-shared");
+    if (sharedId !== null && value !== null && typeof value === "object") {
+      var sharedValue = payloadOf(sharedId);
+      if (sharedValue !== undefined) {
+        var merged = {};
+        for (var key in value) merged[key] = value[key];
+        merged[mount.getAttribute("data-shared-key")] = sharedValue;
+        value = merged;
+      }
+    }
+    var tree = node(null, value);
+    if (tree.tagName === "DETAILS") tree.open = true;
+    mount.appendChild(tree);
+  }
+  var rows = document.querySelectorAll("details.event");
+  for (var i = 0; i < rows.length; i += 1) {
+    (function (row) {
+      row.addEventListener("toggle", function () {
+        if (row.open !== true) return;
+        var mounts = row.querySelectorAll(".json");
+        for (var j = 0; j < mounts.length; j += 1) render(mounts[j]);
+      });
+    })(rows[i]);
+  }
+})();
 `.trim();
 
 function statusBadge(status: RunStatus): string {
@@ -955,84 +1814,559 @@ function runToolsListNotice(run: Run): string {
  * top: the secret never reached disk, and a second pass of eliding would
  * destroy the descriptor's one diagnostic — the same digest on every hit means
  * the same value arrived every time. Repeated descriptors are printed in full,
- * hit after hit, for exactly that reason.
+ * hit after hit, for exactly that reason — including when this hit's payload
+ * collapsed into an earlier one. Deduplication is a statement about payload
+ * bodies and about nothing else.
  */
-function headersCell(headers: Record<string, string> | undefined): string {
-  if (headers === undefined) return `<td class="text empty">not recorded</td>`;
+function headersList(headers: Record<string, string> | undefined): string {
+  if (headers === undefined) return `<p class="empty">Headers not recorded for this hit.</p>`;
   const names = Object.keys(headers);
-  if (names.length === 0) return `<td class="text empty">none</td>`;
-  const lines = names
-    .map(
-      (name) =>
-        `<div class="hdr"><code>${escapeHtml(name)}</code>: ` +
-        `<code>${escapeHtml(headers[name]!)}</code></div>`,
-    )
-    .join("");
-  return `<td class="text headers">${lines}</td>`;
-}
-
-function hitNumberCell(value: number | undefined, format: (n: number) => string = String): string {
-  return value === undefined ? unmeasured() : num(format(value));
+  if (names.length === 0) return `<p class="empty">This hit arrived with no headers.</p>`;
+  return (
+    `<div class="headers">` +
+    names
+      .map(
+        (name) =>
+          `<div class="hdr"><code>${escapeHtml(name)}</code>: ` +
+          `<code>${escapeHtml(headers[name]!)}</code></div>`,
+      )
+      .join("") +
+    `</div>`
+  );
 }
 
 /**
- * One row per hook hit: what it carried, how big it was, and what the hook
- * server spent answering it (issue #16 criterion 3). The raw payloads still
- * follow underneath — this table is the shape, not a replacement for the body.
+ * The method that caused this hit (issue #25 criterion 4).
+ *
+ * `not attributed` is styled as an absence, not printed as a method, because it
+ * is the one answer the reader must not read as "some request did this".
  */
-function hitTable(run: Run): string {
-  const rows = run.hookHits
-    .map((hit, index) =>
-      [
-        "<tr>",
-        num(index + 1),
-        `<td class="text">${escapeHtml(hit.receivedAt)}</td>`,
-        hitNumberCell(hit.toolkitCount),
-        hitNumberCell(hit.toolCount),
-        hitNumberCell(hit.versionCount),
-        hitNumberCell(hit.bodyBytes),
-        hitNumberCell(hit.handlingMs, formatMs),
-        headersCell(hit.headers),
-        "</tr>",
-      ].join(""),
-    )
-    .join("\n");
+function causedByCell(method: string | null): string {
+  return method === null
+    ? `<td class="text empty">${NOT_ATTRIBUTED}</td>`
+    : `<td class="text">${escapeHtml(method)}</td>`;
+}
+
+/** `initialize 1 · tools/list 3`, for one run. */
+export function formatMethodSplit(run: Run): string {
+  const entries = methodSplit(run);
+  if (entries.length === 0) return "no requests and no hook hits";
+  return entries.map((entry) => `${entry.method} ${entry.hits}`).join(" · ");
+}
+
+/**
+ * The line a reader decides on before expanding a hook hit's payload: how big
+ * it was, how much it carried, and its digest.
+ *
+ * Counts the run file does not carry read `not recorded` here for the same
+ * reason they do in every other cell: `0 tools` would be a measurement.
+ */
+function payloadSummaryLine(hit: HookHit, placement: PayloadPlacement): string {
+  const plural = (count: number, noun: string): string =>
+    `${count} ${noun}${count === 1 ? "" : "s"}`;
+  const parts = [
+    "payload",
+    hit.bodyBytes === undefined ? "size not recorded" : `${hit.bodyBytes} B`,
+    hit.toolkitCount === undefined
+      ? "toolkits not recorded"
+      : plural(hit.toolkitCount, "toolkit"),
+    hit.toolCount === undefined ? "tools not recorded" : plural(hit.toolCount, "tool"),
+    `sha256 ${placement.digest}`,
+  ];
+  if (placement.sameAs !== undefined) parts.push(`identical to ${placement.sameAs.label}`);
+  return parts.map(escapeHtml).join(" · ");
+}
+
+/**
+ * One hook hit's payload: the explorer's mount point, and the one embedded copy
+ * of the payload that both the explorer and a scriptless reader use.
+ *
+ * The `<pre>` is not a second copy of the data — it *is* the data. The script
+ * reads its `textContent`, parses it, renders the tree next to it and hides it;
+ * with no script it stays exactly where it is, complete, which is what keeps
+ * the evidence from depending on scripting.
+ *
+ * A byte-identical repeat embeds nothing and points its explorer at the copy
+ * the first occurrence embedded, so the reader still expands a full tree
+ * without the document carrying the payload twice.
+ */
+function payloadDetail(hit: HookHit, placement: PayloadPlacement): string {
+  const shared = placement.sharedToolkits;
+  const mount =
+    `<div class="json" data-payload="${escapeHtml(placement.storedAt)}"` +
+    (shared === undefined
+      ? ""
+      : ` data-shared-key="${escapeHtml(shared.key)}" data-shared="${escapeHtml(shared.storeId)}"`) +
+    `></div>`;
+
+  if (placement.sameAs !== undefined && shared === undefined) {
+    return [
+      mount,
+      `<p class="repeat-note">Byte-identical to ` +
+        `<a href="#${escapeHtml(placement.sameAs.anchor)}">` +
+        `${escapeHtml(placement.sameAs.label)}</a>, which carries the one embedded copy. ` +
+        `Compared byte for byte, not by size or by tool count; sha-256 of the payload is ` +
+        `<code>${escapeHtml(placement.digest)}</code>.</p>`,
+    ].join("\n");
+  }
+
+  if (shared === undefined) {
+    return [
+      mount,
+      `<details class="raw"><summary>raw JSON</summary>`,
+      `<pre id="${escapeHtml(placement.anchor)}">${escapeHtml(storedPayload(hit.payload))}</pre>`,
+      `</details>`,
+    ].join("\n");
+  }
+
+  // Stored in two parts, shown as one. Neither part is rewritten: the own
+  // fields are this payload's bytes with the shared key left out, and the
+  // shared object is the gateway's bytes in the store. The explorer above puts
+  // them back together; a reader with no scripting reads them in sequence.
+  const own = payloadText(hit.payload);
+  const ownPart =
+    placement.storedAt === placement.anchor
+      ? `<pre id="${escapeHtml(placement.anchor)}">` +
+        `${escapeHtml(storedText(withoutShared(hit.payload)))}</pre>`
+      : `<p class="repeat-note">This hit’s own fields are byte-identical to those of ` +
+        `<a href="#${escapeHtml(placement.sameAs!.anchor)}">` +
+        `${escapeHtml(placement.sameAs!.label)}</a>.</p>`;
+
+  const sharedPart = shared.emitsStore
+    ? `<pre id="${escapeHtml(shared.storeId)}">${escapeHtml(storedText(sharedToolkitsTextOf(hit.payload)))}</pre>`
+    : `<p class="repeat-note">Byte-identical to ` +
+      `<a href="#${escapeHtml(shared.sameAs!.anchor)}">${escapeHtml(shared.sameAs!.label)}</a>, ` +
+      `which carries the one embedded copy. Compared byte for byte; sha-256 of the ` +
+      `<code>${escapeHtml(shared.key)}</code> object is <code>${escapeHtml(shared.digest)}</code>.</p>`;
 
   return [
-    `<table class="hits">`,
-    `<thead><tr><th>hit</th><th class="text">received at</th><th>toolkits</th><th>tools</th>` +
-      `<th>versions</th><th>bodyBytes</th><th>hook server<br>handling (ms)</th>` +
-      `<th class="text">captured request headers</th></tr></thead>`,
-    `<tbody>\n${rows}\n</tbody>`,
+    mount,
+    `<p class="sub">Stored in two parts because this payload’s ` +
+      `<code>${escapeHtml(shared.key)}</code> object is shared with other hits: its own fields ` +
+      `below, and that object once. Nothing is rewritten and nothing is dropped — the whole ` +
+      `payload is sha-256 <code>${escapeHtml(placement.digest)}</code>, ` +
+      `${Buffer.byteLength(own, "utf8")} B.</p>`,
+    `<details class="raw"><summary>raw JSON — this hit’s own fields</summary>`,
+    ownPart,
+    `</details>`,
+    `<details class="raw"><summary>raw JSON — the shared <code>${escapeHtml(shared.key)}</code> object</summary>`,
+    sharedPart,
+    `</details>`,
+  ].join("\n");
+}
+
+/** The shared object's JSON, for the block that emits the store. */
+function sharedToolkitsTextOf(payload: unknown): string {
+  return payloadText((payload as Record<string, unknown>)[SHARED_KEY]);
+}
+
+/** One `<dt>`/`<dd>` pair, with `not recorded` for anything the run file lacks. */
+function detailRow(term: string, value: string | undefined): string {
+  return `<dt>${escapeHtml(term)}</dt><dd>${
+    value === undefined ? metaUnmeasured() : escapeHtml(value)
+  }</dd>`;
+}
+
+/**
+ * What the run JSON holds about one MCP request (issue #25 criterion 5).
+ *
+ * There is no body, and the row says so in those words. `src/client/request-log.ts`
+ * pipes the response through instead of cloning it, so no MCP request or
+ * response body was ever captured — rendering `{}` here would put an empty
+ * object where a reader expects the payload, which is the plausible-but-wrong
+ * rendering this report exists to avoid. A later slice adds capture; the row is
+ * shaped so a body slots in beside this list when it does.
+ */
+function requestDetail(request: RunRequest, run: Run, file: string): string {
+  return [
+    `<dl class="meta">`,
+    detailRow("method", request.method),
+    detailRow("JSON-RPC id", request.jsonRpcId === undefined ? undefined : String(request.jsonRpcId)),
+    detailRow("sent at", request.sentAt),
+    detailRow("finished at", request.finishedAt),
+    detailRow("HTTP status", request.status === undefined ? undefined : String(request.status)),
+    detailRow(
+      "client-observed round trip",
+      request.durationMs === undefined ? undefined : `${formatMs(request.durationMs)} ms`,
+    ),
+    detailRow("user-id header observed", request.userIdHeader),
+    detailRow("authorization scheme", request.authorizationScheme),
+    detailRow(
+      "response observed",
+      request.responseObserved === undefined ? undefined : request.responseObserved ? "yes" : "no",
+    ),
+    detailRow("cursor followed", request.cursor),
+    detailRow("hookHitsAfter (cumulative)", String(request.hookHitsAfter)),
+    `</dl>`,
+    requestBodyNote(request, run, file),
+  ].join("\n");
+}
+
+/**
+ * The same fact as {@link requestBodyNote}, short enough for the collapsed row.
+ *
+ * A reader scanning summary lines must not be told `body not recorded` about a
+ * request whose result the run file carries.
+ */
+function requestBodyState(request: RunRequest, run: Run): string {
+  return request.method === "tools/list" && Array.isArray(run.toolsListResult)
+    ? "response body recorded for the run"
+    : "body not recorded";
+}
+
+/**
+ * What this request's response body is, in one sentence that has to stay true.
+ *
+ * It was `body not recorded` for every request until #27, and for `initialize`
+ * it still is: `src/client/request-log.ts` pipes the response through instead
+ * of cloning it and keeps no body per request. But #27 made the observer read
+ * `result.tools` off the same frames, so a run file now carries the
+ * `tools/list` result the gateway returned. Saying `body not recorded` on a
+ * `tools/list` row of such a run would be a false claim in an evidence
+ * document, which is worse than an incomplete one.
+ *
+ * The result is assembled **per run**, not per request: a paged `tools/list`
+ * concatenates its pages into one list. A row therefore points at the run's
+ * result and says so, rather than implying it is that row's own page.
+ */
+function requestBodyNote(request: RunRequest, run: Run, file: string): string {
+  const piped =
+    `<code>src/client/request-log.ts</code> pipes the response through rather than cloning it`;
+
+  if (request.method !== "tools/list") {
+    return `<p class="empty">body not recorded — ${piped}, so no MCP body is kept per request.</p>`;
+  }
+  if (run.toolsListResult === undefined) {
+    return (
+      `<p class="empty">body not recorded — ${piped}, and this run file predates ` +
+      `the <code>toolsListResult</code> capture.</p>`
+    );
+  }
+  if (run.toolsListResult === null) {
+    return (
+      `<p class="empty">body not recorded — ${piped}, and this run assembled no ` +
+      `<code>tools/list</code> result at all.</p>`
+    );
+  }
+
+  const tools = run.toolsListResult.length;
+  const requests = run.toolsListRequests;
+  const paged =
+    requests !== undefined && requests > 1
+      ? ` It is the run’s assembled list, concatenated across ${requests} ` +
+        `<code>tools/list</code> requests in page order — not this row’s page alone.`
+      : "";
+  return (
+    `<p>The response body is not kept per request — ${piped} — but the result the gateway ` +
+    `returned <strong>is</strong> recorded for this run: ` +
+    `<a href="#${escapeHtml(toolsListAnchor(file))}">${tools} tool${tools === 1 ? "" : "s"}, ` +
+    `as it came off the wire</a>.${paged}</p>`
+  );
+}
+
+/** A running total over values some records may not carry. */
+interface RunningTotal {
+  sum: number;
+  recorded: number;
+  total: number;
+}
+
+function runningCell(running: RunningTotal): string {
+  // No hits yet is a genuine zero — nothing has been sent — so it is printed as
+  // a number. `not recorded` is reserved for hits that happened and whose size
+  // the run file never measured.
+  if (running.total === 0) return num(0);
+  if (running.recorded === 0) return unmeasured();
+  return num(`${running.sum}${partial(running.recorded, running.total, "hits")}`);
+}
+
+/**
+ * One ordered table per run of everything that crossed a wire, both sides
+ * interleaved (issue #25 criteria 1–5).
+ *
+ * Replaces the request timeline and the hook-hit table this report used to
+ * render side by side. Every number those two carried is still here — the
+ * client-observed round trip, the hook server's handling time, the cumulative
+ * snapshot, the payload shape — but a reader no longer has to correlate two
+ * lists by timestamp to answer the question the whole report is about.
+ *
+ * The two latency numbers keep their own columns and can never land on the same
+ * row: a request row has no hook handling time and a hit row has no client
+ * round trip, so there is nothing for a reader to add together.
+ */
+function wireTable(entry: LoadedRun, placements: PayloadPlacement[]): string {
+  const { file, run } = entry;
+  const events = wireEvents(run);
+  const origin = events[0]?.at;
+
+  let hits = 0;
+  const bytes: RunningTotal = { sum: 0, recorded: 0, total: 0 };
+
+  const rows = events.map((event, order) => {
+    const offset = offsetMs(origin, event.at);
+    const common = [
+      num(order + 1),
+      `<td class="text">${event.side === "client" ? "client → gateway" : "gateway → hook"}</td>`,
+    ];
+    const when = [
+      `<td class="text">${escapeHtml(event.at)}</td>`,
+      offset === null ? unmeasured() : num(`+${formatMs(offset)}`),
+    ];
+
+    if (event.side === "client") {
+      const detail = [
+        `<tr class="detail">`,
+        `<td colspan="10">`,
+        `<details class="event"><summary>${requestBodyState(event.request, run)} · ` +
+          `${escapeHtml(event.request.method)} request · what the run JSON holds</summary>`,
+        requestDetail(event.request, run, file),
+        `</details>`,
+        `</td>`,
+        `</tr>`,
+      ].join("\n");
+      return [
+        `<tr class="event client">`,
+        ...common,
+        `<td class="text">${escapeHtml(event.request.method)}</td>`,
+        `<td class="text empty">—</td>`,
+        ...when,
+        num(hits),
+        runningCell(bytes),
+        event.request.durationMs === undefined
+          ? unmeasured()
+          : num(formatMs(event.request.durationMs)),
+        `<td class="num empty">—</td>`,
+        `</tr>`,
+        detail,
+      ].join("\n");
+    }
+
+    hits += 1;
+    bytes.total += 1;
+    if (event.hit.bodyBytes !== undefined) {
+      bytes.sum += event.hit.bodyBytes;
+      bytes.recorded += 1;
+    }
+    const placement = placements[event.index]!;
+    const detail = [
+      `<tr class="detail">`,
+      `<td colspan="10">`,
+      `<details class="event" id="${escapeHtml(placement.anchor)}--row">` +
+        `<summary>${payloadSummaryLine(event.hit, placement)}</summary>`,
+      payloadDetail(event.hit, placement),
+      `<h5>captured request headers</h5>`,
+      headersList(event.hit.headers),
+      `</details>`,
+      `</td>`,
+      `</tr>`,
+    ].join("\n");
+
+    return [
+      `<tr class="event hook">`,
+      ...common,
+      `<td class="text">POST /access</td>`,
+      causedByCell(event.causedBy),
+      ...when,
+      num(hits),
+      runningCell(bytes),
+      `<td class="num empty">—</td>`,
+      event.hit.handlingMs === undefined ? unmeasured() : num(formatMs(event.hit.handlingMs)),
+      `</tr>`,
+      detail,
+    ].join("\n");
+  });
+
+  const header =
+    `<thead><tr><th>#</th><th class="text">side</th><th class="text">what</th>` +
+    `<th class="text">caused by</th><th class="text">at</th><th>+ms from<br>first event</th>` +
+    `<th>hook hits<br>(cumulative)</th><th>bytes to hook<br>(cumulative)</th>` +
+    `<th>client-observed<br>round trip (ms)</th><th>hook server<br>handling (ms)</th>` +
+    `</tr></thead>`;
+
+  return [
+    `<table class="wire" id="${escapeHtml(file)}--wire">`,
+    header,
+    `<tbody>\n${rows.join("\n")}\n</tbody>`,
     `</table>`,
   ].join("\n");
 }
 
-function timelineTable(run: Run): string {
-  const deltas = hitsPerRequest(run);
-  const rows = run.requests
-    .map((request, index) =>
-      [
-        "<tr>",
-        num(request.id),
-        `<td class="text">${escapeHtml(request.method)}</td>`,
-        `<td class="text">${escapeHtml(request.sentAt)}</td>`,
-        num(request.hookHitsAfter),
-        num(deltas[index] ?? 0),
-        request.durationMs === undefined ? unmeasured() : num(formatMs(request.durationMs)),
-        "</tr>",
-      ].join(""),
-    )
-    .join("\n");
+/**
+ * What the gateway returned for `tools/list`, embedded once (#27, decision 18).
+ *
+ * The other half of the comparison this report exists to make: `hookHits` is
+ * what the gateway told the hook, this is what the same gateway told the
+ * client. It goes through the same store as the hook payloads, so a result
+ * repeated across repetitions of one gateway is embedded once, and through the
+ * same compact-above-the-threshold path, because it is not guaranteed small.
+ *
+ * Three states, three different sentences. Absent is a pre-#27 run file and
+ * says nothing; `null` is "no result was ever assembled"; `[]` is the real
+ * measurement "the gateway returned an empty list", which is what a hook that
+ * denied everything produces and must never read as "not recorded".
+ */
+function toolsListResultBlock(entry: LoadedRun, placement: PayloadPlacement | null): string {
+  const { file, run } = entry;
+  const heading = `<h4>tools/list result</h4>`;
+
+  if (run.toolsListResult === undefined) {
+    return [
+      heading,
+      `<p class="empty">not recorded — this run file predates the ` +
+        `<code>toolsListResult</code> capture.</p>`,
+    ].join("\n");
+  }
+  if (run.toolsListResult === null) {
+    return [
+      heading,
+      `<p class="empty">No <code>tools/list</code> result was assembled in this run.</p>`,
+    ].join("\n");
+  }
+
+  const tools = run.toolsListResult.length;
+  const requests = run.toolsListRequests;
+  const paged =
+    requests !== undefined && requests > 1
+      ? `<p class="sub">Assembled across ${requests} <code>tools/list</code> requests, in page ` +
+        `order: one list, not one page.</p>`
+      : "";
+  const empty =
+    tools === 0
+      ? `<p class="sub">The gateway returned an <strong>empty list</strong>. That is a ` +
+        `measurement, not a missing one — it is what a hook denying everything produces.</p>`
+      : "";
+
+  const summary = [
+    "tools/list result",
+    `${tools} tool${tools === 1 ? "" : "s"}`,
+    `${Buffer.byteLength(payloadTextOf(run.toolsListResult), "utf8")} B`,
+    `sha256 ${placement!.digest}`,
+    ...(placement!.sameAs === undefined ? [] : [`identical to ${placement!.sameAs.label}`]),
+  ]
+    .map(escapeHtml)
+    .join(" \u00b7 ");
+
+  const body =
+    placement!.sameAs === undefined
+      ? [
+          `<details class="raw"><summary>raw JSON</summary>`,
+          `<pre id="${escapeHtml(placement!.anchor)}">` +
+            `${escapeHtml(storedPayload(run.toolsListResult))}</pre>`,
+          `</details>`,
+        ].join("\n")
+      : `<p class="repeat-note">Byte-identical to ` +
+        `<a href="#${escapeHtml(placement!.sameAs.anchor)}">` +
+        `${escapeHtml(placement!.sameAs.label)}</a>, which carries the one embedded copy. ` +
+        `Compared byte for byte; sha-256 of the result is ` +
+        `<code>${escapeHtml(placement!.digest)}</code>.</p>`;
 
   return [
-    `<table class="timeline">`,
-    `<thead><tr><th>id</th><th class="text">method</th><th class="text">sent at</th>` +
-      `<th>hookHitsAfter<br>(cumulative)</th><th>hook hits<br>(this request)</th>` +
-      `<th>client-observed<br>round trip (ms)</th></tr></thead>`,
-    `<tbody>\n${rows}\n</tbody>`,
-    `</table>`,
-  ].join("\n");
+    heading,
+    paged,
+    empty,
+    `<details class="event" id="${escapeHtml(toolsListAnchor(file))}">`,
+    `<summary>${summary}</summary>`,
+    `<div class="json" data-payload="${escapeHtml(placement!.storedAt)}"></div>`,
+    body,
+    `</details>`,
+  ]
+    .filter((part) => part !== "")
+    .join("\n");
+}
+
+/**
+ * How the tools the gateway listed but never showed the hook are stated.
+ *
+ * Four states, and collapsing any pair of them is the bug this whole project is
+ * an instrument for. `null` is the dangerous one: it means *we cannot say*,
+ * because the run observed no hook hits or assembled no result, and printing it
+ * as "none" would turn an absence into the finding "nothing bypassed the hook".
+ *
+ * A non-empty list is printed as **names**, not a count: an absence is not
+ * evidence, and the engine team opens this file to learn *which* tools were
+ * never submitted to access control.
+ */
+export function toolsNotOfferedText(run: Run): string {
+  const names = run.toolsNotOfferedToHook;
+  if (names === undefined) {
+    return '<span class="empty">not recorded</span>';
+  }
+  if (names === null) {
+    const because =
+      run.hookHits.length === 0
+        ? "this run observed no hook hits"
+        : "this run assembled no tools/list result";
+    return `<span class="empty">cannot say — ${escapeHtml(because)}</span>`;
+  }
+  if (names.length === 0) {
+    return "none " + "—" + " every listed tool appeared in a hook payload";
+  }
+  return (
+    `<strong>${names.length}</strong>: ` +
+    names.map((name) => `<code>${escapeHtml(name)}</code>`).join(", ")
+  );
+}
+
+/**
+ * What the reader is told about the bodies this report holds.
+ *
+ * **The total and the named parts are the same data.** Both come from
+ * {@link BODY_KINDS} by way of `plan.bodies`, so "N bodies — a of these and b of
+ * those" reconciles for every shape, including shapes nobody has built a
+ * fixture for. Two rounds of review found this sentence wrong in two different
+ * ways — `tools/list` results counted as hook payloads, then shared `toolkits`
+ * objects counted as nothing — and both times the cause was a sentence written
+ * by hand next to a total accumulated separately. A kind that is counted is
+ * named because the same table supplies both, and a kind that cannot be named
+ * cannot exist: {@link BodyKind} is that table's key set.
+ */
+export function payloadDedupeNote(plan: PayloadPlan): string {
+  if (plan.occurrences === 0) return `<p class="sub">No payloads in this report.</p>`;
+
+  const plural = (count: number, one: string, many: string): string =>
+    `${count} ${count === 1 ? one : many}`;
+
+  // Every kind present, in the table's own order. Nothing is enumerated here
+  // by hand, so a kind added to the table joins the sentence with it.
+  const named = BODY_KIND_ORDER.filter((kind) => plan.bodies[kind].occurrences > 0).map((kind) =>
+    plural(plan.bodies[kind].occurrences, BODY_KINDS[kind].one, BODY_KINDS[kind].many),
+  );
+  const parts =
+    named.length === 1
+      ? named[0]!
+      : `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]!}`;
+
+  const head =
+    `This report embeds ${plural(plan.occurrences, "body", "bodies")} — ${parts}.`;
+
+  const body =
+    plan.repeats === 0
+      ? `<p class="sub">${head} No two of them are byte-identical, so every one is embedded ` +
+        `in full.</p>`
+      : `<p class="sub">${head} <strong>${plan.repeats}</strong> of them are byte-identical ` +
+        `repeats of an earlier body; ` +
+        `${plural(plan.distinct, "distinct body is", "distinct bodies are")} embedded once ` +
+        `each, and every repeat shows its digest and links the one that carries the copy. The ` +
+        `comparison is over the bytes, not over <code>bodyBytes</code> or the toolkit and tool ` +
+        `counts: a body that differs anywhere is embedded in full, so nothing a hit carried can ` +
+        `be hidden by this.</p>`;
+
+  const toolkits = plan.bodies["shared-toolkits"];
+  if (toolkits.occurrences === 0) return body;
+
+  // Derived from the same tally rather than tracked beside it: a reference that
+  // found an earlier copy is a repeat, so the rest are the stores.
+  const stores = toolkits.occurrences - toolkits.repeats;
+  return (
+    body +
+    `\n<p class="sub">${plural(toolkits.occurrences, "hook payload", "hook payloads")} ` +
+    `${toolkits.occurrences === 1 ? "carries" : "carry"} a large <code>toolkits</code> object ` +
+    `that another payload carries too. Those payloads are <strong>not</strong> identical — ` +
+    `they differ elsewhere, in the live evidence only in <code>user_id</code> — so nothing ` +
+    `is collapsed: ${plural(stores, "object is", "objects are")} stored once and referenced, ` +
+    `and each payload still shows its own fields. Equality is computed over the object’s ` +
+    `bytes, the same as for a whole body.</p>`
+  );
 }
 
 /** `not recorded` as a `<dd>` value, kept distinct from a measured value of 0. */
@@ -1040,7 +2374,11 @@ function metaUnmeasured(): string {
   return '<span class="empty">not recorded</span>';
 }
 
-function runSection(entry: LoadedRun): string {
+function runSection(
+  entry: LoadedRun,
+  placements: PayloadPlacement[],
+  toolsListPlacement: PayloadPlacement | null,
+): string {
   const { file, run } = entry;
   const profile = profileHits(run.hookHits);
   const meta: [string, string][] = [
@@ -1086,19 +2424,21 @@ function runSection(entry: LoadedRun): string {
           ),
     ],
     ["tool set across hits", escapeHtml(samenessText(profile.sameness, profile.hits))],
+    // Issue #25 criterion 3: the split is here, in the run, so a reader sees
+    // "initialize 1 · tools/list 3" without counting rows or going back to the
+    // summary table — which aggregates across the whole revision anyway.
+    ["hook hits by method", escapeHtml(formatMethodSplit(run))],
+    // #27's derived finding: tools the gateway listed without ever submitting
+    // them to access control. Four states, never collapsed — see
+    // `toolsNotOfferedText`.
+    ["tools not offered to hook", toolsNotOfferedText(run)],
     ["error", run.error === null ? '<span class="empty">none</span>' : escapeHtml(run.error)],
   ];
 
-  const payloads =
-    run.hookHits.length === 0
-      ? `<p class="empty">No hook hits recorded for this run.</p>`
-      : run.hookHits
-          .map(
-            (hit, index) =>
-              `<h4>hit ${index + 1} — received at ${escapeHtml(hit.receivedAt)}</h4>\n` +
-              `<pre>${escapeHtml(JSON.stringify(hit.payload, null, 2))}</pre>`,
-          )
-          .join("\n");
+  const timeline =
+    run.requests.length === 0 && run.hookHits.length === 0
+      ? `<p class="empty">Nothing crossed a wire in this run.</p>`
+      : wireTable(entry, placements);
 
   return [
     `<section class="run" id="${escapeHtml(file)}">`,
@@ -1107,13 +2447,14 @@ function runSection(entry: LoadedRun): string {
     `<dl class="meta">`,
     ...meta.map(([term, value]) => `<dt>${term}</dt><dd>${value}</dd>`),
     `</dl>`,
-    `<h4>request timeline</h4>`,
-    timelineTable(run),
-    ...(run.hookHits.length === 0
-      ? []
-      : [`<h4>hook hits (${run.hookHits.length})</h4>`, hitTable(run)]),
-    `<h4>raw hook payloads (${run.hookHits.length})</h4>`,
-    payloads,
+    `<h4>wire timeline (${run.requests.length} requests, ${run.hookHits.length} hook hits)</h4>`,
+    `<p class="sub">Every request the client sent and every hit the counter received, in one` +
+      ` sequence, oldest first. Each row expands: a hook hit shows its payload and its headers,` +
+      ` an MCP request shows what the run JSON holds for it. Expanding needs no network, and no` +
+      ` scripting — the explorer is an enhancement over a plain <code>&lt;pre&gt;</code> that is` +
+      ` already there.</p>`,
+    timeline,
+    toolsListResultBlock(entry, toolsListPlacement),
     `</section>`,
   ].join("\n");
 }
@@ -1128,6 +2469,7 @@ export interface RenderOptions {
 /** Renders the whole document. No external assets — see the file header. */
 export function renderHtml(loaded: LoadedRun[], options: RenderOptions): string {
   const summaries = summarize(loaded);
+  const plan = planPayloads(loaded);
   const generatedAt = options.generatedAt ?? new Date().toISOString();
 
   const toc = loaded
@@ -1187,13 +2529,17 @@ latency is after, and one blended figure would hide it.
 </p>
 
 <h2>Runs</h2>
+${payloadDedupeNote(plan)}
 <nav><ol>
 ${toc}
 </ol></nav>
 
-${loaded.map(runSection).join("\n\n")}
+${loaded.map((entry, index) => runSection(entry, plan.perRun[index]!, plan.toolsListPerRun[index] ?? null)).join("\n\n")}
 
 <footer>Generated by <code>bun run report</code>. Print to PDF from the browser.</footer>
+<script>
+${EXPLORER}
+</script>
 </body>
 </html>
 `;

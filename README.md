@@ -44,8 +44,9 @@ probe ──MCP over Streamable HTTP──▶ Arcade gateway ──POST /access�
   consulted at all.
 - **Report** (`bun run report`) reads `results/*.json` and writes a
   self-contained `results/report.html`: requests sent versus hook hits, what
-  each hit carried and what it cost, per revision and per run, with the raw
-  hook payloads attached. `--in <dir>` and `--out <file>` point it elsewhere.
+  each hit carried and what it cost, per revision and per run, with **every
+  body that crossed a wire attached** — the MCP request and reply frames, the
+  payload the gateway sent the hook, and the answer the hook sent back. `--in <dir>` and `--out <file>` point it elsewhere.
   Hook hits for a method are the difference between consecutive
   `hookHitsAfter` snapshots, and runs whose status is not `ok` are counted in
   the version-mismatch and error columns but kept out of min/max/mean. With no
@@ -184,10 +185,24 @@ That matters in three places a count alone would mislead you:
   `tools/list` pages for you, so one call can be three requests. `requests[]`
   has a row per request with its own hook snapshot, and `toolsListRequests` and
   `cursorFollowed` say so outright.
+- **Nothing is cloned or buffered to get any of this.** The wrapper pipes the
+  response body through to the transport and watches it go past; a cloned branch
+  nobody drains stalls the branch the transport is reading and the session goes
+  silent on the *next* request. Each chunk is handed on before it is looked at,
+  so a chunked or streamed body terminates exactly as it would with no wrapper
+  at all.
 - **Latency is measured to the reply, not to the response headers.** A hook
   that filters a tool list has to answer before the list can come back, so its
   round trip is on the critical path; `durationMs` per request is where the
   cost of that shows up against the hook server's own handling time.
+- **Both MCP frames are kept, not just their metadata.** `requestFrame` is the
+  JSON-RPC request the probe put on the wire and `responseFrame` is the reply
+  that came back, each whole, on the row it belongs to. The reply is read off
+  the wire rather than rebuilt from what the client handed back, because the two
+  are not the same message: the JSON-RPC envelope never reaches the caller, and
+  each tool entry arrives trimmed to the fields the spec names. `responseFrame`
+  is **`null`, never `{}`**, when the stream ended without a reply carrying that
+  request's id — the same condition `responseObserved: false` reports.
 - **The tool list is recorded, not just counted.** `toolsListResult` is the
   `tools/list` result as the gateway put it on the wire — whole, in order,
   across every page, and including fields the MCP spec does not name, which the
@@ -294,7 +309,9 @@ decision 17). `/hits` and each JSONL line hold the same record:
   "versionCount": 5,
   "bodyBytes": 243,
   "handlingMs": 0.428,
-  "payload": { "user_id": "probe-demo-1", "toolkits": { "Slack": { "tools": { "PostMessage": [ { "version": "1.0.0" }, { "version": "2.0.0" } ] } } } }
+  "payload": { "user_id": "probe-demo-1", "toolkits": { "Gmail": { "tools": { "SendEmail": [ { "version": "1.0.0" } ] } }, "Slack": { "tools": { "PostMessage": [ { "version": "1.0.0" }, { "version": "2.0.0" } ] } } } },
+  "responseStatus": 200,
+  "responseBody": { "deny": { "Gmail": { "tools": { "SendEmail": [ { "version": "1.0.0" } ] } } } }
 }
 ```
 
@@ -308,9 +325,23 @@ decision 17). `/hits` and each JSONL line hold the same record:
 | `bodyBytes`    | Byte length of the raw request body, measured before parsing. |
 | `handlingMs`   | The server's *own* handling time: received to response ready. Not client-observed latency — the report shows the two separately. |
 | `payload`      | The body exactly as the gateway sent it, unfiltered — Gmail included. |
+| `responseStatus` | The HTTP status this hook answered with. Recorded, not assumed: a hit only exists on the path that answers 200, and a recorded value is something a reader can check. |
+| `responseBody` | The `AccessHookResult` this hook sent back. The same object it serialised, so `JSON.stringify(responseBody)` reproduces the response byte for byte. |
 
 The counts describe what arrived, not what went back: a Gmail toolkit the
 policy names in its `deny` is still counted in the profile.
+
+A hook that records what it was asked and not what it answered **cannot show
+that the deny it believes it issued was issued** — until #21 that was provable
+only by a `curl` run by hand. The answer is on the record now, so the evidence
+file itself carries it. A rejected request is still not a hit (decision 7): a
+401 records no payload, no profile and no answer.
+
+`{}` is a body and is recorded as one. It is row three of the table above —
+neither `only` nor `deny`, which the engine reads as *no change* — and it is
+both the right answer to a request carrying no Gmail and the exact shape of the
+fail-open. It is never written or rendered as "not recorded"; the payload beside
+it says which of the two it was.
 
 ### Credential headers are redacted at capture
 
@@ -423,12 +454,28 @@ would invent an attribution the data does not support.
 
 ### Per-row detail
 
-Every row expands, collapsed by default. A hook hit shows its payload and every
-captured request header; an MCP request shows what the run JSON holds — method,
-JSON-RPC id, status, round trip, the user-id header observed — and says **`body
-not recorded`**, because `src/client/request-log.ts` pipes the response through
-rather than cloning it and no MCP body was ever captured. An empty object is
-never rendered as though it were the payload.
+Every row expands, collapsed by default, and between them the four directions
+are all on the page:
+
+| Row | Direction | What it expands to |
+| --- | --------- | ------------------ |
+| MCP request | probe → gateway | The JSON-RPC request frame, whole |
+| MCP request | gateway → probe | The JSON-RPC reply frame, whole |
+| hook hit | gateway → hook | The payload and every captured request header |
+| hook hit | hook → gateway | The status and the body this hook answered with |
+
+An MCP request row also shows what the run JSON holds about it — method,
+JSON-RPC id, status, round trip, the user-id header observed — and a
+`tools/list` row links the run's assembled result, which is a different body
+from its own frame: the frame is **this request's page**, the result is the
+whole list the client assembled across every page.
+
+A direction a run file does not carry says so in words. A run written before
+this capture existed renders exactly as it did, with `body not recorded` on its
+rows and `not recorded` where the hook's answer would be. An empty object is
+never rendered as though it were the body, and a reply that was never seen reads
+as **no response frame observed** — a measurement, the same one
+`response observed: no` reports — not as `{}`.
 
 Credential headers arrive already redacted by the counter and are printed
 exactly as stored, on every hit — a repeated `Bearer <redacted len=43
@@ -445,6 +492,11 @@ document. The script is **inline**: the engine team opens this file from a
 directory with no network, so nothing is fetched. With scripting off, every
 payload is still there, whole, inside `<details><summary>raw JSON</summary>` —
 the explorer is an enhancement over evidence that is already on the page.
+
+Every body goes through the same store, whichever of the four directions it came
+from, and the sentence at the top of the Runs section totals them by kind —
+`4 hook payloads, 4 hook responses, 4 MCP request frames, 4 MCP response frames
+and 2 tools/list results`. Nothing is truncated or sampled to make that fit.
 
 Each distinct payload is embedded **once**: later hits carrying the same bytes
 show their sha-256 and name the hit that carries the copy. The comparison is
